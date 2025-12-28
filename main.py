@@ -159,14 +159,19 @@ async def fetch_from_pdl(params: dict) -> list:
             timeout=30.0
         )
 
-    if response.status_code != 200:
+    result = response.json()
+    
+    # Handle PDL responses
+    if response.status_code == 200:
+        return result.get("data", [])
+    elif response.status_code == 404:
+        # No results found - return empty list instead of error
+        return []
+    else:
         raise HTTPException(
             status_code=response.status_code,
             detail=f"PDL API error: {response.text}"
         )
-
-    result = response.json()
-    return result.get("data", [])
 
 
 # =============================================================================
