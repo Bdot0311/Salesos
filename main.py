@@ -71,12 +71,12 @@ async def init_db():
 # =============================================================================
 
 class SearchRequest(BaseModel):
-    job_title: Optional[str] = None
-    location: Optional[str] = None
-    industry: Optional[str] = None
-    company: Optional[str] = None
-    company_size: Optional[str] = None
-    seniority: Optional[str] = None
+    job_title: Optional[str] = None  # e.g., "software engineer", "ceo", "data scientist"
+    location: Optional[str] = None  # City name, e.g., "san francisco", "new york", "austin"
+    industry: Optional[str] = None  # PDL canonical industry, e.g., "computer software", "financial services"
+    company: Optional[str] = None  # Company name, e.g., "google", "microsoft", "amazon"
+    company_size: Optional[str] = None  # "1-10", "11-50", "51-200", "201-500", "501-1000", "1001-5000", "5001-10000", "10001+"
+    seniority: Optional[str] = None  # "cxo", "owner", "vp", "director", "partner", "senior", "manager", "entry", "training", "unpaid"
     limit: int = 10
 
     class Config:
@@ -104,21 +104,37 @@ async def fetch_from_pdl(params: dict) -> list:
     pdl_url = "https://api.peopledatalabs.com/v5/person/search"
     
     # Build Elasticsearch query from our parameters
+    # PDL field reference: https://docs.peopledatalabs.com/docs/fields
     must_clauses = []
     
     if params.get("job_title"):
+        # job_title: The person's current job title (String)
         must_clauses.append({"match": {"job_title": params["job_title"]}})
+    
     if params.get("location"):
-        # Use location_locality for city-level search
+        # location_locality: City (String) - e.g., "san francisco"
         must_clauses.append({"match": {"location_locality": params["location"]}})
+    
     if params.get("industry"):
-        must_clauses.append({"term": {"industry": params["industry"]}})
+        # industry: Canonical industry enum (String) - must match exactly
+        # e.g., "computer software", "financial services", "marketing and advertising"
+        must_clauses.append({"term": {"industry": params["industry"].lower()}})
+    
     if params.get("company"):
+        # job_company_name: Current company name (String)
         must_clauses.append({"match": {"job_company_name": params["company"]}})
+    
     if params.get("company_size"):
+        # job_company_size: Canonical size enum (String)
+        # Valid values: "1-10", "11-50", "51-200", "201-500", "501-1000", 
+        # "1001-5000", "5001-10000", "10001+"
         must_clauses.append({"term": {"job_company_size": params["company_size"]}})
+    
     if params.get("seniority"):
-        must_clauses.append({"term": {"job_title_levels": params["seniority"]}})
+        # job_title_levels: Array of canonical levels
+        # Valid values: "cxo", "owner", "vp", "director", "partner", 
+        # "senior", "manager", "entry", "training", "unpaid"
+        must_clauses.append({"term": {"job_title_levels": params["seniority"].lower()}})
 
     if not must_clauses:
         raise HTTPException(status_code=400, detail="At least one search parameter required")
