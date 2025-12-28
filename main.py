@@ -109,17 +109,8 @@ async def fetch_from_pdl(params: dict) -> list:
     if params.get("job_title"):
         must_clauses.append({"match": {"job_title": params["job_title"]}})
     if params.get("location"):
-        # Search across multiple location fields (city, metro, region)
-        must_clauses.append({
-            "bool": {
-                "should": [
-                    {"match": {"location_locality": params["location"]}},
-                    {"match": {"location_metro": params["location"]}},
-                    {"match": {"location_region": params["location"]}}
-                ],
-                "minimum_should_match": 1
-            }
-        })
+        # Use location_locality for city-level search
+        must_clauses.append({"match": {"location_locality": params["location"]}})
     if params.get("industry"):
         must_clauses.append({"term": {"industry": params["industry"]}})
     if params.get("company"):
