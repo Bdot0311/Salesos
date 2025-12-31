@@ -237,8 +237,8 @@ async def search_leads(request: SearchRequest):
     4. Cache the results
     5. Return the results
     """
-    # Convert request to dict, excluding None values
-    params = {k: v for k, v in request.model_dump().items() if v is not None}
+    # Convert request to dict, excluding None AND empty string values
+    params = {k: v for k, v in request.model_dump().items() if v is not None and v != ""}
     search_hash = generate_search_hash(params)
 
     async with async_session() as session:
