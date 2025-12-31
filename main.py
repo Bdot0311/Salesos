@@ -84,14 +84,35 @@ class SearchRequest(BaseModel):
 
 
 class SearchResponse(BaseModel):
+    success: bool = True
     source: str  # "cache" or "api"
+    from_cache: bool = False
     count: int
-    data: list
+    total: int
+    leads: list  # Changed from 'data' to 'leads' for Edge Function compatibility
+    data: list  # Keep for backwards compatibility
 
 
 # =============================================================================
 # Helper Functions
 # =============================================================================
+
+def transform_pdl_lead(lead: dict) -> dict:
+    """Transform PDL lead data to ScoredLead format expected by frontend."""
+    return {
+        "job_title": lead.get("job_title", ""),
+        "company_name": lead.get("job_company_name", ""),
+        "company_domain": lead.get("job_company_website", "") or lead.get("job_company_linkedin_url", ""),
+        "business_email": lead.get("work_email") or (lead.get("emails", [{}])[0].get("address") if lead.get("emails") else None),
+        "contact_name": lead.get("full_name", ""),
+        "industry": lead.get("industry", "") or lead.get("job_company_industry", ""),
+        "company_size": lead.get("job_company_size", ""),
+        "country": lead.get("location_country", "") or lead.get("location_name", ""),
+        "linkedin_url": lead.get("linkedin_url", ""),
+        # Raw PDL data for reference
+        "raw_data": lead
+    }
+
 
 def generate_search_hash(params: dict) -> str:
     """Generate a consistent hash for search parameters."""
@@ -229,29 +250,41 @@ async def search_leads(request: SearchRequest):
         if cached:
             # Step 2: Return from cache
             data = json.loads(cached.results)
+            leads = [transform_pdl_lead(lead) if "job_title" in lead and "full_name" not in lead.get("contact_name", "") else lead for lead in data]
             return SearchResponse(
+                success=True,
                 source="cache",
-                count=len(data),
+                from_cache=True,
+                count=len(leads),
+                total=len(leads),
+                leads=leads,
                 data=data
             )
 
         # Step 3: Fetch from PDL API
-        leads = await fetch_from_pdl(params)
+        raw_leads = await fetch_from_pdl(params)
+        
+        # Transform leads to expected format
+        leads = [transform_pdl_lead(lead) for lead in raw_leads]
 
-        # Step 4: Cache the results
+        # Step 4: Cache the results (store raw PDL data)
         new_cache = CachedSearch(
             search_hash=search_hash,
             search_params=json.dumps(params),
-            results=json.dumps(leads)
+            results=json.dumps(raw_leads)
         )
         session.add(new_cache)
         await session.commit()
 
         # Step 5: Return new results
         return SearchResponse(
+            success=True,
             source="api",
+            from_cache=False,
             count=len(leads),
-            data=leads
+            total=len(leads),
+            leads=leads,
+            data=raw_leads
         )
 
 
@@ -266,13 +299,91 @@ async def clear_cache():
 
 @app.get("/cache/stats")
 async def cache_stats():
-    """Get cache statistics."""
+    """Get cache statistics and recent searches."""
     async with async_session() as session:
-        from sqlalchemy import func
-        stmt = select(func.count()).select_from(CachedSearch)
+        from sqlalchemy import func, desc
+        
+        # Get count
+        count_stmt = select(func.count()).select_from(CachedSearch)
+        count_result = await session.execute(count_stmt)
+        count = count_result.scalar()
+        
+        # Get recent searches (last 10)
+        recent_stmt = select(CachedSearch).order_by(desc(CachedSearch.created_at)).limit(10)
+        recent_result = await session.execute(recent_stmt)
+        recent = recent_result.scalars().all()
+        
+        recent_searches = []
+        for search in recent:
+            params = json.loads(search.search_params)
+            results = json.loads(search.results)
+            recent_searches.append({
+                "search_hash": search.search_hash,
+                "params": params,
+                "result_count": len(results),
+                "created_at": search.created_at.isoformat() if search.created_at else None
+            })
+        
+    return {
+        "cached_searches": count,
+        "recent_searches": recent_searches
+    }
+
+
+@app.get("/cache/search/{search_hash}")
+async def get_cached_search(search_hash: str):
+    """Retrieve a specific cached search by hash."""
+    async with async_session() as session:
+        stmt = select(CachedSearch).where(CachedSearch.search_hash == search_hash)
         result = await session.execute(stmt)
-        count = result.scalar()
-    return {"cached_searches": count}
+        cached = result.scalar_one_or_none()
+        
+        if not cached:
+            raise HTTPException(status_code=404, detail="Cached search not found")
+        
+        data = json.loads(cached.results)
+        leads = [transform_pdl_lead(lead) for lead in data]
+        
+        return {
+            "success": True,
+            "from_cache": True,
+            "search_params": json.loads(cached.search_params),
+            "leads": leads,
+            "data": data,
+            "count": len(leads),
+            "total": len(leads),
+            "created_at": cached.created_at.isoformat() if cached.created_at else None
+        }
+
+
+@app.get("/cache/all")
+async def get_all_cached_leads():
+    """Retrieve all cached leads (for fallback when PDL credits exhausted)."""
+    async with async_session() as session:
+        stmt = select(CachedSearch).order_by(CachedSearch.created_at.desc())
+        result = await session.execute(stmt)
+        all_cached = result.scalars().all()
+        
+        all_leads = []
+        seen_contacts = set()
+        
+        for cached in all_cached:
+            data = json.loads(cached.results)
+            for lead in data:
+                # Deduplicate by full_name + company
+                key = f"{lead.get('full_name', '')}-{lead.get('job_company_name', '')}"
+                if key not in seen_contacts:
+                    seen_contacts.add(key)
+                    all_leads.append(transform_pdl_lead(lead))
+        
+        return {
+            "success": True,
+            "from_cache": True,
+            "leads": all_leads,
+            "count": len(all_leads),
+            "total": len(all_leads),
+            "message": "All cached leads retrieved"
+        }
 
 
 # =============================================================================
