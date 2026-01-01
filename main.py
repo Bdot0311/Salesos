@@ -133,13 +133,21 @@ async def fetch_from_pdl(params: dict) -> list:
         must_clauses.append({"match": {"job_title": params["job_title"]}})
     
     if params.get("location"):
-        # location_locality: City (String) - e.g., "san francisco"
-        must_clauses.append({"match": {"location_locality": params["location"]}})
+        # Search both city (location_locality) and region/state (location_region)
+        must_clauses.append({
+            "bool": {
+                "should": [
+                    {"match": {"location_locality": params["location"]}},
+                    {"match": {"location_region": params["location"]}},
+                    {"match": {"location_country": params["location"]}}
+                ]
+            }
+        })
     
     if params.get("industry"):
-        # industry: Canonical industry enum (String) - must match exactly
-        # e.g., "computer software", "financial services", "marketing and advertising"
-        must_clauses.append({"term": {"industry": params["industry"].lower()}})
+        # industry: Use match for fuzzy matching since users may not know exact PDL values
+        # PDL canonical values: "computer software", "financial services", "hospital & health care", etc.
+        must_clauses.append({"match": {"industry": params["industry"].lower()}})
     
     if params.get("company"):
         # job_company_name: Current company name (String)
@@ -149,13 +157,15 @@ async def fetch_from_pdl(params: dict) -> list:
         # job_company_size: Canonical size enum (String)
         # Valid values: "1-10", "11-50", "51-200", "201-500", "501-1000", 
         # "1001-5000", "5001-10000", "10001+"
-        must_clauses.append({"term": {"job_company_size": params["company_size"]}})
+        # Use match to be more flexible with user input
+        must_clauses.append({"match": {"job_company_size": params["company_size"]}})
     
     if params.get("seniority"):
         # job_title_levels: Array of canonical levels
         # Valid values: "cxo", "owner", "vp", "director", "partner", 
         # "senior", "manager", "entry", "training", "unpaid"
-        must_clauses.append({"term": {"job_title_levels": params["seniority"].lower()}})
+        # Use match for flexibility
+        must_clauses.append({"match": {"job_title_levels": params["seniority"].lower()}})
 
     if not must_clauses:
         raise HTTPException(status_code=400, detail="At least one search parameter required")
@@ -305,6 +315,26 @@ async def clear_cache():
         await session.execute(CachedSearch.__table__.delete())
         await session.commit()
     return {"message": "Cache cleared"}
+
+
+@app.delete("/cache/empty")
+async def clear_empty_cache():
+    """Clear only cached searches with 0 results."""
+    async with async_session() as session:
+        # Get all cached searches
+        stmt = select(CachedSearch)
+        result = await session.execute(stmt)
+        all_cached = result.scalars().all()
+        
+        deleted = 0
+        for cached in all_cached:
+            results = json.loads(cached.results)
+            if len(results) == 0:
+                await session.delete(cached)
+                deleted += 1
+        
+        await session.commit()
+    return {"message": f"Cleared {deleted} empty cached searches"}
 
 
 @app.get("/debug")
