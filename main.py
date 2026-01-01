@@ -239,7 +239,14 @@ async def search_leads(request: SearchRequest):
     """
     # Convert request to dict, excluding None AND empty string values
     params = {k: v for k, v in request.model_dump().items() if v is not None and v != ""}
+    
+    # Log incoming request for debugging
+    print(f"=== SEARCH REQUEST ===")
+    print(f"Raw request: {request.model_dump()}")
+    print(f"Filtered params: {params}")
+    
     search_hash = generate_search_hash(params)
+    print(f"Search hash: {search_hash}")
 
     async with async_session() as session:
         # Step 1: Check local DB
@@ -249,6 +256,7 @@ async def search_leads(request: SearchRequest):
 
         if cached:
             # Step 2: Return from cache
+            print(f"Cache HIT for hash: {search_hash}")
             data = json.loads(cached.results)
             leads = [transform_pdl_lead(lead) if "job_title" in lead and "full_name" not in lead.get("contact_name", "") else lead for lead in data]
             return SearchResponse(
@@ -262,7 +270,9 @@ async def search_leads(request: SearchRequest):
             )
 
         # Step 3: Fetch from PDL API
+        print(f"Cache MISS - calling PDL API with params: {params}")
         raw_leads = await fetch_from_pdl(params)
+        print(f"PDL returned {len(raw_leads)} leads")
         
         # Transform leads to expected format
         leads = [transform_pdl_lead(lead) for lead in raw_leads]
@@ -295,6 +305,35 @@ async def clear_cache():
         await session.execute(CachedSearch.__table__.delete())
         await session.commit()
     return {"message": "Cache cleared"}
+
+
+@app.get("/debug")
+async def debug_info():
+    """Debug endpoint to see current state."""
+    async with async_session() as session:
+        from sqlalchemy import func
+        
+        # Get all cached searches
+        stmt = select(CachedSearch)
+        result = await session.execute(stmt)
+        all_cached = result.scalars().all()
+        
+        searches = []
+        for cached in all_cached:
+            params = json.loads(cached.search_params)
+            results = json.loads(cached.results)
+            searches.append({
+                "hash": cached.search_hash,
+                "params": params,
+                "result_count": len(results),
+                "sample_lead": results[0] if results else None,
+                "created_at": cached.created_at.isoformat() if cached.created_at else None
+            })
+        
+    return {
+        "total_cached_searches": len(searches),
+        "searches": searches
+    }
 
 
 @app.get("/cache/stats")
