@@ -133,8 +133,9 @@ async def fetch_from_pdl(params: dict) -> list:
         must_clauses.append({"match": {"job_title": params["job_title"]}})
     
     if params.get("location"):
-        # location_name contains full strings like "san francisco, california, united states"
-        must_clauses.append({"match": {"location_name": params["location"]}})
+        # location_locality: City name (e.g., "san francisco", "new york")
+        # This field works for city-level searches
+        must_clauses.append({"match": {"location_locality": params["location"]}})
     
     if params.get("industry"):
         # industry: Use match for fuzzy matching since users may not know exact PDL values
