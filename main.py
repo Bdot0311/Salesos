@@ -29,6 +29,16 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
 
+    @property
+    def async_database_url(self) -> str:
+        """Ensure the database URL uses the asyncpg driver."""
+        url = self.database_url
+        if url.startswith("postgres://"):
+            url = url.replace("postgres://", "postgresql+asyncpg://", 1)
+        elif url.startswith("postgresql://"):
+            url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
+        return url
+
 
 settings = Settings()
 
@@ -56,7 +66,7 @@ class CachedSearch(Base):
 # Database Setup
 # =============================================================================
 
-engine = create_async_engine(settings.database_url, echo=False)
+engine = create_async_engine(settings.async_database_url, echo=False)
 async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 
@@ -219,7 +229,11 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def startup():
-    await init_db()
+    try:
+        await init_db()
+    except Exception as e:
+        print(f"WARNING: Database initialization failed: {e}")
+        print("App will continue starting — DB will be retried on first request.")
 
 
 @app.get("/health")
