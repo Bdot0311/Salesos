@@ -30,6 +30,10 @@ class Settings(BaseSettings):
         env_file = ".env"
 
     @property
+    def clean_pdl_api_key(self) -> str:
+        return self.pdl_api_key.strip()
+
+    @property
     def async_database_url(self) -> str:
         """Ensure the database URL uses the asyncpg driver."""
         url = self.database_url
@@ -186,7 +190,7 @@ async def fetch_from_pdl(params: dict) -> list:
         response = await client.post(
             pdl_url,
             headers={
-                "X-Api-Key": settings.pdl_api_key,
+                "X-Api-Key": settings.clean_pdl_api_key,
                 "Content-Type": "application/json"
             },
             json=payload,
