@@ -5,9 +5,10 @@ A FastAPI application that caches Lusha API results to reduce costs.
 
 import hashlib
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
+import anthropic
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,6 +26,7 @@ from sqlalchemy.orm import DeclarativeBase
 class Settings(BaseSettings):
     database_url: str
     lusha_api_key: str
+    anthropic_api_key: str
 
     class Config:
         env_file = ".env"
@@ -47,8 +49,8 @@ settings = Settings()
 # Lusha Filter Mappings
 # =============================================================================
 
-# PDL seniority string -> Lusha numeric string
-PDL_TO_LUSHA_SENIORITY = {
+# Seniority string -> Lusha numeric string
+SENIORITY_MAP = {
     "entry":    "1",
     "training": "1",
     "junior":   "2",
@@ -62,8 +64,8 @@ PDL_TO_LUSHA_SENIORITY = {
     "owner":    "7",
 }
 
-# PDL company size string -> Lusha employeesRange object
-PDL_TO_LUSHA_COMPANY_SIZE = {
+# Company size string -> Lusha sizes object
+COMPANY_SIZE_MAP = {
     "1-10":       {"min": 1,     "max": 10},
     "11-50":      {"min": 11,    "max": 50},
     "51-200":     {"min": 51,    "max": 200},
@@ -73,6 +75,9 @@ PDL_TO_LUSHA_COMPANY_SIZE = {
     "5001-10000": {"min": 5001,  "max": 10000},
     "10001+":     {"min": 10001, "max": None},
 }
+
+# Valid Lusha signal names
+VALID_SIGNALS = {"promotion", "companyChange", "allSignals"}
 
 
 # =============================================================================
@@ -113,13 +118,35 @@ async def init_db():
 # =============================================================================
 
 class SearchRequest(BaseModel):
-    job_title: Optional[str] = None   # e.g., "software engineer", "ceo", "data scientist"
-    location: Optional[str] = None    # City name, e.g., "san francisco", "new york"
-    industry: Optional[str] = None    # e.g., "computer software", "financial services"
-    company: Optional[str] = None     # Company name, e.g., "google", "microsoft"
-    company_size: Optional[str] = None  # "1-10", "11-50", "51-200", "201-500", "501-1000", "1001-5000", "5001-10000", "10001+"
-    seniority: Optional[str] = None   # "entry", "junior", "senior", "manager", "director", "vp", "c_suite", "owner"
+    # Basic filters
+    job_title: Optional[str] = None       # e.g., "CTO", "VP of Sales"
+    departments: Optional[list[str]] = None  # e.g., ["engineering", "sales"]
+    seniority: Optional[str] = None       # entry/junior/senior/manager/director/vp/c_suite/owner
+    location: Optional[str] = None        # City name, e.g., "san francisco"
+    company: Optional[str] = None         # Specific company name
+    company_size: Optional[str] = None    # "1-10", "11-50", "51-200", etc.
+
+    # Niche / industry filters
+    industry: Optional[str] = None        # Keyword search on company industry
+    technologies: Optional[list[str]] = None  # e.g., ["Salesforce", "HubSpot", "AWS"]
+    keywords: Optional[str] = None        # Free-text keyword search
+
+    # Buyer intent
+    intent_topics: Optional[list[str]] = None  # e.g., ["cybersecurity", "HR software"]
+
+    # Revenue range
+    revenue_min: Optional[int] = None     # Annual revenue minimum in USD
+    revenue_max: Optional[int] = None     # Annual revenue maximum in USD
+
+    # Career signals
+    signals: Optional[list[str]] = None   # ["promotion", "companyChange", "allSignals"]
+    signals_since_days: int = 90          # How far back to look for signals
+
     limit: int = 10
+
+
+class ICPParseRequest(BaseModel):
+    text: str  # Plain-English ICP description
 
 
 class SearchResponse(BaseModel):
@@ -128,8 +155,8 @@ class SearchResponse(BaseModel):
     from_cache: bool = False
     count: int
     total: int
-    leads: list  # Transformed lead format for frontend
-    data: list   # Raw Lusha data for reference
+    leads: list
+    data: list
 
 
 # =============================================================================
@@ -164,8 +191,9 @@ def transform_lusha_contact(contact: dict, search_params: dict = None) -> dict:
         "company_domain": data.get("companyWebsite"),
         "business_email": work_email,
         "linkedin_url": linkedin_url,
-        # Lusha returns these as input filters, not response fields — carry forward from search params
         "industry": search_params.get("industry"),
+        "technologies": search_params.get("technologies"),
+        "intent_topics": search_params.get("intent_topics"),
         "company_size": search_params.get("company_size"),
         "country": search_params.get("location"),
         "raw_data": contact,
@@ -186,7 +214,12 @@ async def fetch_from_lusha(params: dict) -> list:
       1. POST /prospecting/contact/search  -> returns contact IDs + requestId
       2. POST /prospecting/contact/enrich  -> returns full profiles for those IDs
     """
-    if not any(params.get(k) for k in ("job_title", "location", "industry", "company", "company_size", "seniority")):
+    searchable_fields = (
+        "job_title", "departments", "location", "industry", "company",
+        "company_size", "seniority", "technologies", "intent_topics",
+        "keywords", "revenue_min", "revenue_max", "signals",
+    )
+    if not any(params.get(k) for k in searchable_fields):
         raise HTTPException(status_code=400, detail="At least one search parameter required")
 
     headers = {
@@ -196,36 +229,64 @@ async def fetch_from_lusha(params: dict) -> list:
 
     # --- Contact-level filters ---
     contact_include: dict = {
-        "existing_data_points": ["work_email"],  # only return contacts that have a work email
+        "existing_data_points": ["work_email"],
     }
 
     if params.get("job_title"):
         contact_include["jobTitles"] = [params["job_title"]]
 
+    if params.get("departments"):
+        contact_include["departments"] = params["departments"]
+
     if params.get("seniority"):
-        lusha_level = PDL_TO_LUSHA_SENIORITY.get(params["seniority"].lower())
+        lusha_level = SENIORITY_MAP.get(params["seniority"].lower())
         if lusha_level:
             contact_include["seniority"] = [lusha_level]
 
     if params.get("location"):
         contact_include["locations"] = [{"city": params["location"]}]
 
+    if params.get("keywords"):
+        contact_include["searchText"] = params["keywords"]
+
+    if params.get("signals"):
+        valid = [s for s in params["signals"] if s in VALID_SIGNALS]
+        if valid:
+            since_days = params.get("signals_since_days", 90)
+            start_date = (datetime.utcnow() - timedelta(days=since_days)).strftime("%Y-%m-%d")
+            contact_include["signals"] = {"names": valid, "startDate": start_date}
+
     # --- Company-level filters ---
     company_include: dict = {}
 
     if params.get("company"):
-        company_include["name"] = [params["company"]]
+        company_include["names"] = [params["company"]]
 
     if params.get("industry"):
-        company_include["mainIndustries"] = [params["industry"]]
+        # Use searchText for flexible industry matching (IDs required for mainIndustriesIds)
+        company_include["searchText"] = params["industry"]
 
     if params.get("company_size"):
-        size_range = PDL_TO_LUSHA_COMPANY_SIZE.get(params["company_size"])
+        size_range = COMPANY_SIZE_MAP.get(params["company_size"])
         if size_range:
-            company_include["employeesRange"] = size_range
+            company_include["sizes"] = [size_range]
+
+    if params.get("technologies"):
+        company_include["technologies"] = params["technologies"]
+
+    if params.get("intent_topics"):
+        company_include["intentTopics"] = params["intent_topics"]
+
+    if params.get("revenue_min") or params.get("revenue_max"):
+        revenue = {}
+        if params.get("revenue_min"):
+            revenue["min"] = params["revenue_min"]
+        if params.get("revenue_max"):
+            revenue["max"] = params["revenue_max"]
+        company_include["revenues"] = [revenue]
 
     search_body: dict = {
-        "pages": {"page": 0, "size": max(min(params.get("limit", 10), 40), 10)},  # Lusha min=10, max=40
+        "pages": {"page": 0, "size": max(min(params.get("limit", 10), 40), 10)},
         "filters": {"contacts": {"include": contact_include}},
     }
     if company_include:
@@ -280,7 +341,7 @@ async def fetch_from_lusha(params: dict) -> list:
 app = FastAPI(
     title="Cache-First Lead Generation Proxy",
     description="Proxy that caches Lusha API results to reduce costs",
-    version="2.0.0"
+    version="3.0.0"
 )
 
 app.add_middleware(
@@ -303,9 +364,69 @@ async def startup():
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint."""
     return {"status": "healthy"}
 
+
+# =============================================================================
+# ICP Parser Endpoint
+# =============================================================================
+
+@app.post("/parse-icp")
+async def parse_icp(request: ICPParseRequest):
+    """
+    Parse a plain-English ICP description into structured Lusha search filters.
+
+    Example input:
+      "CTOs at fintech startups using Salesforce, 50-200 employees in NYC,
+       showing intent to buy cybersecurity tools"
+
+    Returns structured filters ready to pass directly into POST /search.
+    """
+    client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+
+    prompt = f"""You are an ICP (Ideal Customer Profile) parser for a B2B lead generation platform.
+
+Parse the following description into structured search filters. Return ONLY valid JSON with these fields (omit fields not mentioned or not clearly implied):
+
+{{
+  "job_title": "string — specific job title, e.g. CTO, VP of Sales",
+  "departments": ["array of strings — e.g. engineering, sales, marketing, finance, product, hr, legal, operations, executive"],
+  "seniority": "one of: entry, junior, senior, manager, director, vp, c_suite, owner",
+  "location": "city name string, e.g. San Francisco",
+  "company": "specific company name if mentioned",
+  "company_size": "one of: 1-10, 11-50, 51-200, 201-500, 501-1000, 1001-5000, 5001-10000, 10001+",
+  "industry": "industry keyword string, e.g. fintech, saas, healthcare, retail",
+  "technologies": ["array of tech stack strings, e.g. Salesforce, HubSpot, AWS, Stripe"],
+  "keywords": "additional free-text search terms",
+  "intent_topics": ["array of strings describing what they want to buy or solve, e.g. cybersecurity, HR software, data analytics"],
+  "revenue_min": integer in USD,
+  "revenue_max": integer in USD,
+  "signals": ["subset of: promotion, companyChange, allSignals — only if career signals are mentioned"]
+}}
+
+ICP Description: {request.text}
+
+Return only the JSON object, no explanation, no markdown fences."""
+
+    message = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=1024,
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    raw = message.content[0].text.strip()
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=500, detail=f"ICP parser returned invalid JSON: {raw}")
+
+    return {"success": True, "filters": parsed}
+
+
+# =============================================================================
+# Search Endpoint
+# =============================================================================
 
 @app.post("/search", response_model=SearchResponse)
 async def search_leads(request: SearchRequest):
@@ -319,10 +440,9 @@ async def search_leads(request: SearchRequest):
     4. Cache the raw results
     5. Return transformed results
     """
-    params = {k: v for k, v in request.model_dump().items() if v is not None and v != ""}
+    params = {k: v for k, v in request.model_dump().items() if v is not None and v != "" and v != []}
 
     print(f"=== SEARCH REQUEST ===")
-    print(f"Raw request: {request.model_dump()}")
     print(f"Filtered params: {params}")
 
     search_hash = generate_search_hash(params)
@@ -335,7 +455,6 @@ async def search_leads(request: SearchRequest):
         cached = result.scalar_one_or_none()
 
         if cached:
-            # Step 2: Return from cache
             print(f"Cache HIT for hash: {search_hash}")
             data = json.loads(cached.results)
             leads = [transform_lusha_contact(lead, params) for lead in data]
@@ -346,7 +465,7 @@ async def search_leads(request: SearchRequest):
                 count=len(leads),
                 total=len(leads),
                 leads=leads,
-                data=data
+                data=data,
             )
 
         # Step 3: Fetch from Lusha API
@@ -354,19 +473,17 @@ async def search_leads(request: SearchRequest):
         raw_leads = await fetch_from_lusha(params)
         print(f"Lusha returned {len(raw_leads)} leads")
 
-        # Transform leads to expected format
         leads = [transform_lusha_contact(lead, params) for lead in raw_leads]
 
-        # Step 4: Cache the raw Lusha results
+        # Step 4: Cache the raw results
         new_cache = CachedSearch(
             search_hash=search_hash,
             search_params=json.dumps(params),
-            results=json.dumps(raw_leads)
+            results=json.dumps(raw_leads),
         )
         session.add(new_cache)
         await session.commit()
 
-        # Step 5: Return new results
         return SearchResponse(
             success=True,
             source="api",
@@ -374,13 +491,17 @@ async def search_leads(request: SearchRequest):
             count=len(leads),
             total=len(leads),
             leads=leads,
-            data=raw_leads
+            data=raw_leads,
         )
 
 
+# =============================================================================
+# Cache Management Endpoints
+# =============================================================================
+
 @app.delete("/cache")
 async def clear_cache():
-    """Clear all cached searches (admin endpoint)."""
+    """Clear all cached searches."""
     async with async_session() as session:
         await session.execute(CachedSearch.__table__.delete())
         await session.commit()
@@ -406,32 +527,6 @@ async def clear_empty_cache():
     return {"message": f"Cleared {deleted} empty cached searches"}
 
 
-@app.get("/debug")
-async def debug_info():
-    """Debug endpoint to see current state."""
-    async with async_session() as session:
-        stmt = select(CachedSearch)
-        result = await session.execute(stmt)
-        all_cached = result.scalars().all()
-
-        searches = []
-        for cached in all_cached:
-            params = json.loads(cached.search_params)
-            results = json.loads(cached.results)
-            searches.append({
-                "hash": cached.search_hash,
-                "params": params,
-                "result_count": len(results),
-                "sample_lead": results[0] if results else None,
-                "created_at": cached.created_at.isoformat() if cached.created_at else None
-            })
-
-    return {
-        "total_cached_searches": len(searches),
-        "searches": searches
-    }
-
-
 @app.get("/cache/stats")
 async def cache_stats():
     """Get cache statistics and recent searches."""
@@ -454,45 +549,15 @@ async def cache_stats():
                 "search_hash": search.search_hash,
                 "params": params,
                 "result_count": len(results),
-                "created_at": search.created_at.isoformat() if search.created_at else None
+                "created_at": search.created_at.isoformat() if search.created_at else None,
             })
 
-    return {
-        "cached_searches": count,
-        "recent_searches": recent_searches
-    }
-
-
-@app.get("/cache/search/{search_hash}")
-async def get_cached_search(search_hash: str):
-    """Retrieve a specific cached search by hash."""
-    async with async_session() as session:
-        stmt = select(CachedSearch).where(CachedSearch.search_hash == search_hash)
-        result = await session.execute(stmt)
-        cached = result.scalar_one_or_none()
-
-        if not cached:
-            raise HTTPException(status_code=404, detail="Cached search not found")
-
-        data = json.loads(cached.results)
-        search_params = json.loads(cached.search_params)
-        leads = [transform_lusha_contact(lead, search_params) for lead in data]
-
-        return {
-            "success": True,
-            "from_cache": True,
-            "search_params": search_params,
-            "leads": leads,
-            "data": data,
-            "count": len(leads),
-            "total": len(leads),
-            "created_at": cached.created_at.isoformat() if cached.created_at else None
-        }
+    return {"cached_searches": count, "recent_searches": recent_searches}
 
 
 @app.get("/cache/all")
 async def get_all_cached_leads():
-    """Retrieve all cached leads (for fallback when Lusha credits are exhausted)."""
+    """Retrieve all cached leads (fallback when Lusha credits are exhausted)."""
     async with async_session() as session:
         stmt = select(CachedSearch).order_by(CachedSearch.created_at.desc())
         result = await session.execute(stmt)
@@ -519,8 +584,58 @@ async def get_all_cached_leads():
             "leads": all_leads,
             "count": len(all_leads),
             "total": len(all_leads),
-            "message": "All cached leads retrieved"
+            "message": "All cached leads retrieved",
         }
+
+
+@app.get("/cache/search/{search_hash}")
+async def get_cached_search(search_hash: str):
+    """Retrieve a specific cached search by hash."""
+    async with async_session() as session:
+        stmt = select(CachedSearch).where(CachedSearch.search_hash == search_hash)
+        result = await session.execute(stmt)
+        cached = result.scalar_one_or_none()
+
+        if not cached:
+            raise HTTPException(status_code=404, detail="Cached search not found")
+
+        data = json.loads(cached.results)
+        search_params = json.loads(cached.search_params)
+        leads = [transform_lusha_contact(lead, search_params) for lead in data]
+
+        return {
+            "success": True,
+            "from_cache": True,
+            "search_params": search_params,
+            "leads": leads,
+            "data": data,
+            "count": len(leads),
+            "total": len(leads),
+            "created_at": cached.created_at.isoformat() if cached.created_at else None,
+        }
+
+
+@app.get("/debug")
+async def debug_info():
+    """Debug endpoint to see current cache state."""
+    async with async_session() as session:
+        stmt = select(CachedSearch)
+        result = await session.execute(stmt)
+        all_cached = result.scalars().all()
+
+        searches = []
+        for cached in all_cached:
+            params = json.loads(cached.search_params)
+            results = json.loads(cached.results)
+            searches.append({
+                "hash": cached.search_hash,
+                "params": params,
+                "result_count": len(results),
+                "sample_lead": results[0] if results else None,
+                "created_at": cached.created_at.isoformat() if cached.created_at else None,
+            })
+
+    return {"total_cached_searches": len(searches), "searches": searches}
 
 
 # =============================================================================
