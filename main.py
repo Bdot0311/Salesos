@@ -118,6 +118,9 @@ async def init_db():
 # =============================================================================
 
 class SearchRequest(BaseModel):
+    # Plain-text ICP query (auto-parsed if no structured filters provided)
+    query: Optional[str] = None           # e.g., "CTOs at fintech startups in NYC using Salesforce"
+
     # Basic filters
     job_title: Optional[str] = None       # e.g., "CTO", "VP of Sales"
     departments: Optional[list[str]] = None  # e.g., ["engineering", "sales"]
@@ -444,6 +447,23 @@ async def search_leads(request: SearchRequest):
 
     print(f"=== SEARCH REQUEST ===")
     print(f"Filtered params: {params}")
+
+    # If only a plain-text query was provided, auto-parse it into structured filters
+    structured_fields = {
+        "job_title", "departments", "seniority", "location", "company",
+        "company_size", "industry", "technologies", "keywords",
+        "intent_topics", "revenue_min", "revenue_max", "signals",
+    }
+    if params.get("query") and not any(params.get(f) for f in structured_fields):
+        print(f"Auto-parsing query via ICP parser: {params['query']}")
+        parsed = await parse_icp(ICPParseRequest(text=params["query"]))
+        parsed_filters = parsed.get("filters", {})
+        # Merge parsed filters in, keep limit and signals_since_days
+        for k, v in parsed_filters.items():
+            if v is not None and v != "" and v != []:
+                params[k] = v
+        params.pop("query", None)
+        print(f"Parsed into: {params}")
 
     search_hash = generate_search_hash(params)
     print(f"Search hash: {search_hash}")
