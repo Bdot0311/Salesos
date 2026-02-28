@@ -218,7 +218,7 @@ async def load_industry_map():
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(
-                "https://api.lusha.com/prospecting/filters/companies/industries",
+                "https://api.lusha.com/prospecting/filters/companies/industries_labels",
                 headers={"api_key": settings.lusha_api_key},
             )
         if resp.status_code == 200:
@@ -410,7 +410,7 @@ async def fetch_from_lusha(params: dict) -> list:
 
         if search_resp.status_code == 404:
             return []
-        if search_resp.status_code != 200:
+        if search_resp.status_code not in (200, 201):
             raise HTTPException(
                 status_code=search_resp.status_code,
                 detail=f"Lusha search error: {search_resp.text}",
