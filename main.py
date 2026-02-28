@@ -348,6 +348,8 @@ async def fetch_from_lusha(params: dict) -> list:
     if company_include:
         search_body["filters"]["companies"] = {"include": company_include}
 
+    print(f"Lusha request body: {json.dumps(search_body)}")
+
     async with httpx.AsyncClient(timeout=30.0) as client:
         # Step 1: Search — get matching contact IDs
         search_resp = await client.post(
@@ -355,6 +357,9 @@ async def fetch_from_lusha(params: dict) -> list:
             headers=headers,
             json=search_body,
         )
+
+        print(f"Lusha response status: {search_resp.status_code}")
+        print(f"Lusha response body: {search_resp.text}")
 
         if search_resp.status_code == 404:
             return []
