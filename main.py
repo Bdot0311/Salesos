@@ -12,7 +12,7 @@ import anthropic
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from pydantic_settings import BaseSettings
 from sqlalchemy import Column, String, Text, DateTime, select
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
@@ -26,7 +26,7 @@ from sqlalchemy.orm import DeclarativeBase
 class Settings(BaseSettings):
     database_url: str
     lusha_api_key: str
-    anthropic_api_key: str
+    anthropic_api_key: Optional[str] = None
 
     class Config:
         env_file = ".env"
@@ -79,6 +79,42 @@ COMPANY_SIZE_MAP = {
 # Valid Lusha signal names
 VALID_SIGNALS = {"promotion", "companyChange", "allSignals"}
 
+# Location type detection
+_CONTINENTS = {"europe", "eu", "north america", "south america", "asia", "africa",
+               "oceania", "middle east", "latam", "latin america", "apac", "asia pacific"}
+_COUNTRIES = {"united states", "us", "usa", "united kingdom", "uk", "canada",
+              "australia", "germany", "france", "india", "china", "japan",
+              "brazil", "israel", "singapore", "netherlands", "spain", "italy",
+              "sweden", "norway", "denmark", "finland", "mexico", "south korea",
+              "new zealand", "ireland", "switzerland", "austria", "belgium",
+              "portugal", "poland", "czech republic", "ukraine", "russia"}
+_US_STATES = {"alabama", "alaska", "arizona", "arkansas", "california", "colorado",
+              "connecticut", "delaware", "florida", "georgia", "hawaii", "idaho",
+              "illinois", "indiana", "iowa", "kansas", "kentucky", "louisiana",
+              "maine", "maryland", "massachusetts", "michigan", "minnesota",
+              "mississippi", "missouri", "montana", "nebraska", "nevada",
+              "new hampshire", "new jersey", "new mexico", "new york",
+              "north carolina", "north dakota", "ohio", "oklahoma", "oregon",
+              "pennsylvania", "rhode island", "south carolina", "south dakota",
+              "tennessee", "texas", "utah", "vermont", "virginia", "washington",
+              "west virginia", "wisconsin", "wyoming"}
+
+
+def parse_location(location: str) -> dict:
+    """Detect whether a location string is a city, state, country, or continent."""
+    loc = location.strip()
+    loc_lower = loc.lower()
+    if loc_lower in _CONTINENTS:
+        continent = "Europe" if loc_lower in ("europe", "eu") else loc
+        return {"continent": continent}
+    if loc_lower in _COUNTRIES:
+        canonical = "United States" if loc_lower in ("us", "usa") else \
+                    "United Kingdom" if loc_lower in ("uk",) else loc
+        return {"country": canonical}
+    if loc_lower in _US_STATES:
+        return {"state": loc, "country": "United States"}
+    return {"city": loc}
+
 
 # =============================================================================
 # Database Models
@@ -119,33 +155,50 @@ async def init_db():
 
 class SearchRequest(BaseModel):
     # Plain-text ICP query (auto-parsed if no structured filters provided)
-    query: Optional[str] = None           # e.g., "CTOs at fintech startups in NYC using Salesforce"
+    query: Optional[str] = None
 
     # Basic filters
-    job_title: Optional[str] = None       # e.g., "CTO", "VP of Sales"
-    departments: Optional[list[str]] = None  # e.g., ["engineering", "sales"]
-    seniority: Optional[str] = None       # entry/junior/senior/manager/director/vp/c_suite/owner
-    location: Optional[str] = None        # City name, e.g., "san francisco"
-    company: Optional[str] = None         # Specific company name
-    company_size: Optional[str] = None    # "1-10", "11-50", "51-200", etc.
+    job_title: Optional[str] = None
+    departments: Optional[list[str]] = None
+    seniority: Optional[str] = None
+    location: Optional[str] = None
+    company: Optional[str] = None
+    company_size: Optional[str] = None
 
     # Niche / industry filters
-    industry: Optional[str] = None        # Keyword search on company industry
-    technologies: Optional[list[str]] = None  # e.g., ["Salesforce", "HubSpot", "AWS"]
-    keywords: Optional[str] = None        # Free-text keyword search
+    industry: Optional[str] = None
+    technologies: Optional[list[str]] = None
+    keywords: Optional[str] = None
 
     # Buyer intent
-    intent_topics: Optional[list[str]] = None  # e.g., ["cybersecurity", "HR software"]
+    intent_topics: Optional[list[str]] = None
 
     # Revenue range
-    revenue_min: Optional[int] = None     # Annual revenue minimum in USD
-    revenue_max: Optional[int] = None     # Annual revenue maximum in USD
+    revenue_min: Optional[int] = None
+    revenue_max: Optional[int] = None
 
     # Career signals
-    signals: Optional[list[str]] = None   # ["promotion", "companyChange", "allSignals"]
-    signals_since_days: int = 90          # How far back to look for signals
+    signals: Optional[list[str]] = None
+    signals_since_days: int = 90
 
     limit: int = 10
+
+    # Coerce string fields that Lovable may accidentally send as arrays
+    @field_validator("keywords", "seniority", "job_title", "location",
+                     "company", "industry", "company_size", "query", mode="before")
+    @classmethod
+    def coerce_str(cls, v):
+        if isinstance(v, list):
+            return ", ".join(str(x) for x in v) if v else None
+        return v
+
+    # Coerce list fields that may be sent as comma-separated strings
+    @field_validator("technologies", "departments", "intent_topics", "signals", mode="before")
+    @classmethod
+    def coerce_list(cls, v):
+        if isinstance(v, str):
+            return [x.strip() for x in v.split(",") if x.strip()]
+        return v
 
 
 class ICPParseRequest(BaseModel):
@@ -247,7 +300,7 @@ async def fetch_from_lusha(params: dict) -> list:
             contact_include["seniority"] = [lusha_level]
 
     if params.get("location"):
-        contact_include["locations"] = [{"city": params["location"]}]
+        contact_include["locations"] = [parse_location(params["location"])]
 
     if params.get("keywords"):
         contact_include["searchText"] = params["keywords"]
@@ -385,6 +438,9 @@ async def parse_icp(request: ICPParseRequest):
 
     Returns structured filters ready to pass directly into POST /search.
     """
+    if not settings.anthropic_api_key:
+        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured on server")
+
     client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
 
     prompt = f"""You are an ICP (Ideal Customer Profile) parser for a B2B lead generation platform.
@@ -455,10 +511,11 @@ async def search_leads(request: SearchRequest):
         "intent_topics", "revenue_min", "revenue_max", "signals",
     }
     if params.get("query") and not any(params.get(f) for f in structured_fields):
+        if not settings.anthropic_api_key:
+            raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured — cannot parse plain-text query")
         print(f"Auto-parsing query via ICP parser: {params['query']}")
         parsed = await parse_icp(ICPParseRequest(text=params["query"]))
         parsed_filters = parsed.get("filters", {})
-        # Merge parsed filters in, keep limit and signals_since_days
         for k, v in parsed_filters.items():
             if v is not None and v != "" and v != []:
                 params[k] = v
