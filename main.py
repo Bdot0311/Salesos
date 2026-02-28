@@ -205,6 +205,49 @@ class ICPParseRequest(BaseModel):
     text: str  # Plain-English ICP description
 
 
+# =============================================================================
+# Lusha Industry ID Cache
+# =============================================================================
+
+_industry_map: dict[str, int] = {}  # normalized name -> Lusha industry ID
+
+
+async def load_industry_map():
+    """Fetch Lusha's industry list and build a name->id lookup."""
+    global _industry_map
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                "https://api.lusha.com/prospecting/filters/companies/industries",
+                headers={"api_key": settings.lusha_api_key},
+            )
+        if resp.status_code == 200:
+            data = resp.json()
+            # Response is typically a list of {id, name} or nested structure
+            items = data if isinstance(data, list) else data.get("data", [])
+            _industry_map = {item["name"].lower(): item["id"] for item in items if "id" in item and "name" in item}
+            print(f"Loaded {len(_industry_map)} Lusha industries")
+        else:
+            print(f"WARNING: Could not load Lusha industries: {resp.status_code} {resp.text}")
+    except Exception as e:
+        print(f"WARNING: Industry map load failed: {e}")
+
+
+def resolve_industry_id(industry: str) -> int | None:
+    """Find the best matching Lusha industry ID for a given string."""
+    if not _industry_map:
+        return None
+    query = industry.lower().strip()
+    # Exact match first
+    if query in _industry_map:
+        return _industry_map[query]
+    # Partial match — find first industry name that contains the query or vice versa
+    for name, iid in _industry_map.items():
+        if query in name or name in query:
+            return iid
+    return None
+
+
 class SearchResponse(BaseModel):
     success: bool = True
     source: str  # "cache" or "api"
@@ -319,8 +362,12 @@ async def fetch_from_lusha(params: dict) -> list:
         company_include["names"] = [params["company"]]
 
     if params.get("industry"):
-        # Use searchText for flexible industry matching (IDs required for mainIndustriesIds)
-        company_include["searchText"] = params["industry"]
+        industry_id = resolve_industry_id(params["industry"])
+        if industry_id:
+            company_include["mainIndustriesIds"] = [industry_id]
+            print(f"Resolved industry '{params['industry']}' -> ID {industry_id}")
+        else:
+            print(f"WARNING: Could not resolve industry ID for '{params['industry']}' — skipping filter")
 
     if params.get("company_size"):
         size_range = COMPANY_SIZE_MAP.get(params["company_size"])
@@ -421,6 +468,7 @@ async def startup():
     except Exception as e:
         print(f"WARNING: Database initialization failed: {e}")
         print("App will continue starting — DB will be retried on first request.")
+    await load_industry_map()
 
 
 @app.get("/health")
