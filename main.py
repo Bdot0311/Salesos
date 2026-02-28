@@ -433,7 +433,10 @@ async def fetch_from_lusha(params: dict) -> list:
             },
         )
 
-        if enrich_resp.status_code != 200:
+        print(f"Lusha enrich status: {enrich_resp.status_code}")
+        print(f"Lusha enrich body: {enrich_resp.text[:500]}")
+
+        if enrich_resp.status_code not in (200, 201):
             raise HTTPException(
                 status_code=enrich_resp.status_code,
                 detail=f"Lusha enrich error: {enrich_resp.text}",
