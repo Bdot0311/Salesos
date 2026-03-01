@@ -276,10 +276,12 @@ def transform_lusha_contact(contact: dict, search_params: dict = None) -> dict:
         emails[0]["email"] if emails else None,
     )
 
-    # Extract LinkedIn URL from socialLinks array
+    # Extract LinkedIn URL from socialLinks array (strings or {url} objects)
     social_links = data.get("socialLinks", [])
     linkedin_url = next(
-        (s["url"] for s in social_links if "linkedin" in s.get("url", "").lower()),
+        (s if isinstance(s, str) else s.get("url", "")
+         for s in social_links
+         if "linkedin" in (s if isinstance(s, str) else s.get("url", "")).lower()),
         None,
     )
 
