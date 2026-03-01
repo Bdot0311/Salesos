@@ -3,6 +3,7 @@ Cache-First Lead Generation Proxy
 A FastAPI application that caches Lusha API results to reduce costs.
 """
 
+import asyncio
 import hashlib
 import json
 from datetime import datetime, timedelta
@@ -400,18 +401,27 @@ async def fetch_from_lusha(params: dict) -> list:
     print(f"Lusha request body: {json.dumps(search_body)}")
 
     async with httpx.AsyncClient(timeout=30.0) as client:
-        # Step 1: Search — get matching contact IDs
-        search_resp = await client.post(
-            "https://api.lusha.com/prospecting/contact/search",
-            headers=headers,
-            json=search_body,
-        )
+        # Step 1: Search — with retry on 429
+        search_resp = None
+        for attempt in range(3):
+            search_resp = await client.post(
+                "https://api.lusha.com/prospecting/contact/search",
+                headers=headers,
+                json=search_body,
+            )
+            print(f"Lusha search status: {search_resp.status_code}")
+            if search_resp.status_code != 429:
+                break
+            wait = 2 ** attempt
+            print(f"Lusha 429 rate limit — retrying in {wait}s (attempt {attempt + 1}/3)")
+            await asyncio.sleep(wait)
 
-        print(f"Lusha response status: {search_resp.status_code}")
-        print(f"Lusha response body: {search_resp.text}")
+        print(f"Lusha response body: {search_resp.text[:300]}")
 
         if search_resp.status_code == 404:
             return []
+        if search_resp.status_code == 429:
+            raise HTTPException(status_code=429, detail="Lusha rate limit reached — please try again in a moment")
         if search_resp.status_code not in (200, 201):
             raise HTTPException(
                 status_code=search_resp.status_code,
@@ -425,19 +435,28 @@ async def fetch_from_lusha(params: dict) -> list:
         if not contacts or not request_id:
             return []
 
-        # Step 2: Enrich — get full profiles for the matched contact IDs
-        enrich_resp = await client.post(
-            "https://api.lusha.com/prospecting/contact/enrich",
-            headers=headers,
-            json={
-                "requestId": request_id,
-                "contactIds": [c["contactId"] for c in contacts],
-            },
-        )
+        # Step 2: Enrich — with retry on 429
+        enrich_resp = None
+        for attempt in range(3):
+            enrich_resp = await client.post(
+                "https://api.lusha.com/prospecting/contact/enrich",
+                headers=headers,
+                json={
+                    "requestId": request_id,
+                    "contactIds": [c["contactId"] for c in contacts],
+                },
+            )
+            print(f"Lusha enrich status: {enrich_resp.status_code}")
+            if enrich_resp.status_code != 429:
+                break
+            wait = 2 ** attempt
+            print(f"Lusha enrich 429 — retrying in {wait}s (attempt {attempt + 1}/3)")
+            await asyncio.sleep(wait)
 
-        print(f"Lusha enrich status: {enrich_resp.status_code}")
-        print(f"Lusha enrich body: {enrich_resp.text[:500]}")
+        print(f"Lusha enrich body: {enrich_resp.text[:300]}")
 
+        if enrich_resp.status_code == 429:
+            raise HTTPException(status_code=429, detail="Lusha rate limit reached — please try again in a moment")
         if enrich_resp.status_code not in (200, 201):
             raise HTTPException(
                 status_code=enrich_resp.status_code,
