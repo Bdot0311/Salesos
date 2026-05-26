@@ -1,6 +1,6 @@
 """
 Cache-First Lead Generation Proxy
-A FastAPI application that caches Lusha API results to reduce costs.
+A FastAPI application that caches Seamless.ai API results to reduce costs.
 """
 
 import asyncio
@@ -26,7 +26,7 @@ from sqlalchemy.orm import DeclarativeBase
 
 class Settings(BaseSettings):
     database_url: str
-    lusha_api_key: str
+    seamless_api_key: str
     anthropic_api_key: Optional[str] = None
 
     class Config:
@@ -47,38 +47,38 @@ settings = Settings()
 
 
 # =============================================================================
-# Lusha Filter Mappings
+# Seamless.ai Filter Mappings
 # =============================================================================
 
-# Seniority string -> Lusha numeric string
+# Seniority string -> Seamless.ai seniority label
 SENIORITY_MAP = {
-    "entry":    "1",
-    "training": "1",
-    "junior":   "2",
-    "senior":   "3",
-    "manager":  "4",
-    "director": "5",
-    "partner":  "5",
-    "vp":       "6",
-    "c_suite":  "7",
-    "cxo":      "7",
-    "owner":    "7",
+    "entry":    "Entry Level",
+    "training": "Entry Level",
+    "junior":   "Junior",
+    "senior":   "Senior",
+    "manager":  "Manager",
+    "director": "Director",
+    "partner":  "Director",
+    "vp":       "VP",
+    "c_suite":  "C-Suite",
+    "cxo":      "C-Suite",
+    "owner":    "Owner",
 }
 
-# Company size string -> Lusha sizes object
+# Company size string -> Seamless.ai employee range label
 COMPANY_SIZE_MAP = {
-    "1-10":       {"min": 1,     "max": 10},
-    "11-50":      {"min": 11,    "max": 50},
-    "51-200":     {"min": 51,    "max": 200},
-    "201-500":    {"min": 201,   "max": 500},
-    "501-1000":   {"min": 501,   "max": 1000},
-    "1001-5000":  {"min": 1001,  "max": 5000},
-    "5001-10000": {"min": 5001,  "max": 10000},
-    "10001+":     {"min": 10001, "max": None},
+    "1-10":       "1-10",
+    "11-50":      "11-50",
+    "51-200":     "51-200",
+    "201-500":    "201-500",
+    "501-1000":   "501-1000",
+    "1001-5000":  "1001-5000",
+    "5001-10000": "5001-10000",
+    "10001+":     "10001+",
 }
 
-# Valid Lusha signal names
-VALID_SIGNALS = {"promotion", "companyChange", "allSignals"}
+# Valid Seamless.ai signal names
+VALID_SIGNALS = {"promotion", "job_change", "all_signals"}
 
 # Location type detection
 _CONTINENTS = {"europe", "eu", "north america", "south america", "asia", "africa",
@@ -206,47 +206,9 @@ class ICPParseRequest(BaseModel):
     text: str  # Plain-English ICP description
 
 
-# =============================================================================
-# Lusha Industry ID Cache
-# =============================================================================
-
-_industry_map: dict[str, int] = {}  # normalized name -> Lusha industry ID
-
-
 async def load_industry_map():
-    """Fetch Lusha's industry list and build a name->id lookup."""
-    global _industry_map
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(
-                "https://api.lusha.com/prospecting/filters/companies/industries_labels",
-                headers={"api_key": settings.lusha_api_key},
-            )
-        if resp.status_code == 200:
-            data = resp.json()
-            # Response is typically a list of {id, name} or nested structure
-            items = data if isinstance(data, list) else data.get("data", [])
-            _industry_map = {item["name"].lower(): item["id"] for item in items if "id" in item and "name" in item}
-            print(f"Loaded {len(_industry_map)} Lusha industries")
-        else:
-            print(f"WARNING: Could not load Lusha industries: {resp.status_code} {resp.text}")
-    except Exception as e:
-        print(f"WARNING: Industry map load failed: {e}")
-
-
-def resolve_industry_id(industry: str) -> int | None:
-    """Find the best matching Lusha industry ID for a given string."""
-    if not _industry_map:
-        return None
-    query = industry.lower().strip()
-    # Exact match first
-    if query in _industry_map:
-        return _industry_map[query]
-    # Partial match — find first industry name that contains the query or vice versa
-    for name, iid in _industry_map.items():
-        if query in name or name in query:
-            return iid
-    return None
+    """No-op: Seamless.ai accepts industry as a plain string, no ID lookup needed."""
+    pass
 
 
 class SearchResponse(BaseModel):
@@ -263,36 +225,19 @@ class SearchResponse(BaseModel):
 # Helper Functions
 # =============================================================================
 
-def transform_lusha_contact(contact: dict, search_params: dict = None) -> dict:
-    """Transform a Lusha enriched contact object to the internal lead format."""
-    data = contact.get("data", {})
+def transform_seamless_contact(contact: dict, search_params: dict = None) -> dict:
+    """Transform a Seamless.ai contact object to the internal lead format."""
     search_params = search_params or {}
 
-    full_name = f"{data.get('firstName', '')} {data.get('lastName', '')}".strip() or None
-
-    # Prefer work email; fall back to first available address
-    emails = data.get("emailAddresses", [])
-    work_email = next(
-        (e["email"] for e in emails if e.get("emailType") == "work"),
-        emails[0]["email"] if emails else None,
-    )
-
-    # Extract LinkedIn URL from socialLinks array (strings or {url} objects)
-    social_links = data.get("socialLinks", [])
-    linkedin_url = next(
-        (s if isinstance(s, str) else s.get("url", "")
-         for s in social_links
-         if "linkedin" in (s if isinstance(s, str) else s.get("url", "")).lower()),
-        None,
-    )
+    full_name = f"{contact.get('first_name', '')} {contact.get('last_name', '')}".strip() or None
 
     return {
         "contact_name": full_name,
-        "job_title": data.get("jobTitle"),
-        "company_name": data.get("companyName"),
-        "company_domain": data.get("companyWebsite"),
-        "business_email": work_email,
-        "linkedin_url": linkedin_url,
+        "job_title": contact.get("title"),
+        "company_name": contact.get("company_name"),
+        "company_domain": contact.get("company_website"),
+        "business_email": contact.get("email"),
+        "linkedin_url": contact.get("linkedin_url"),
         "industry": search_params.get("industry"),
         "technologies": search_params.get("technologies"),
         "intent_topics": search_params.get("intent_topics"),
@@ -308,13 +253,12 @@ def generate_search_hash(params: dict) -> str:
     return hashlib.sha256(sorted_params.encode()).hexdigest()
 
 
-async def fetch_from_lusha(params: dict) -> list:
+async def fetch_from_seamless(params: dict) -> list:
     """
-    Call Lusha Prospecting API to search for and enrich leads.
+    Call Seamless.ai Contacts API to search for leads.
 
-    Two-step workflow:
-      1. POST /prospecting/contact/search  -> returns contact IDs + requestId
-      2. POST /prospecting/contact/enrich  -> returns full profiles for those IDs
+    Single-step workflow:
+      POST /v1/contacts/search -> returns enriched contact profiles directly
     """
     searchable_fields = (
         "job_title", "departments", "location", "industry", "company",
@@ -325,145 +269,104 @@ async def fetch_from_lusha(params: dict) -> list:
         raise HTTPException(status_code=400, detail="At least one search parameter required")
 
     headers = {
-        "api_key": settings.lusha_api_key,
+        "Authorization": f"Bearer {settings.seamless_api_key}",
         "Content-Type": "application/json",
     }
 
-    # --- Contact-level filters ---
-    contact_include: dict = {
-        "existing_data_points": ["work_email"],
-    }
+    # Build criteria array
+    criteria: list[dict] = []
 
     if params.get("job_title"):
-        contact_include["jobTitles"] = [params["job_title"]]
+        criteria.append({"name": "job_title", "value": [params["job_title"]]})
 
     if params.get("departments"):
-        contact_include["departments"] = params["departments"]
+        criteria.append({"name": "department", "value": params["departments"]})
 
     if params.get("seniority"):
-        lusha_level = SENIORITY_MAP.get(params["seniority"].lower())
-        if lusha_level:
-            contact_include["seniority"] = [lusha_level]
+        level = SENIORITY_MAP.get(params["seniority"].lower())
+        if level:
+            criteria.append({"name": "seniority", "value": [level]})
 
     if params.get("location"):
-        contact_include["locations"] = [parse_location(params["location"])]
+        loc = parse_location(params["location"])
+        if "city" in loc:
+            criteria.append({"name": "city", "value": [loc["city"]]})
+        elif "state" in loc:
+            criteria.append({"name": "state", "value": [loc["state"]]})
+        elif "country" in loc:
+            criteria.append({"name": "country", "value": [loc["country"]]})
+        elif "continent" in loc:
+            criteria.append({"name": "continent", "value": [loc["continent"]]})
 
     if params.get("keywords"):
-        contact_include["searchText"] = params["keywords"]
+        criteria.append({"name": "keywords", "value": [params["keywords"]]})
+
+    if params.get("company"):
+        criteria.append({"name": "company_name", "value": [params["company"]]})
+
+    if params.get("industry"):
+        criteria.append({"name": "industry", "value": [params["industry"]]})
+
+    if params.get("company_size"):
+        size = COMPANY_SIZE_MAP.get(params["company_size"])
+        if size:
+            criteria.append({"name": "employee_count", "value": [size]})
+
+    if params.get("technologies"):
+        criteria.append({"name": "technologies", "value": params["technologies"]})
+
+    if params.get("intent_topics"):
+        criteria.append({"name": "intent_topics", "value": params["intent_topics"]})
+
+    if params.get("revenue_min") or params.get("revenue_max"):
+        revenue_filter: dict = {}
+        if params.get("revenue_min"):
+            revenue_filter["min"] = params["revenue_min"]
+        if params.get("revenue_max"):
+            revenue_filter["max"] = params["revenue_max"]
+        criteria.append({"name": "revenue", "value": [revenue_filter]})
 
     if params.get("signals"):
         valid = [s for s in params["signals"] if s in VALID_SIGNALS]
         if valid:
-            since_days = params.get("signals_since_days", 90)
-            start_date = (datetime.utcnow() - timedelta(days=since_days)).strftime("%Y-%m-%d")
-            contact_include["signals"] = {"names": valid, "startDate": start_date}
-
-    # --- Company-level filters ---
-    company_include: dict = {}
-
-    if params.get("company"):
-        company_include["names"] = [params["company"]]
-
-    if params.get("industry"):
-        industry_id = resolve_industry_id(params["industry"])
-        if industry_id:
-            company_include["mainIndustriesIds"] = [industry_id]
-            print(f"Resolved industry '{params['industry']}' -> ID {industry_id}")
-        else:
-            print(f"WARNING: Could not resolve industry ID for '{params['industry']}' — skipping filter")
-
-    if params.get("company_size"):
-        size_range = COMPANY_SIZE_MAP.get(params["company_size"])
-        if size_range:
-            company_include["sizes"] = [size_range]
-
-    if params.get("technologies"):
-        company_include["technologies"] = params["technologies"]
-
-    if params.get("intent_topics"):
-        company_include["intentTopics"] = params["intent_topics"]
-
-    if params.get("revenue_min") or params.get("revenue_max"):
-        revenue = {}
-        if params.get("revenue_min"):
-            revenue["min"] = params["revenue_min"]
-        if params.get("revenue_max"):
-            revenue["max"] = params["revenue_max"]
-        company_include["revenues"] = [revenue]
+            criteria.append({"name": "signals", "value": valid})
 
     search_body: dict = {
-        "pages": {"page": 0, "size": max(min(params.get("limit", 10), 40), 10)},
-        "filters": {"contacts": {"include": contact_include}},
+        "page": 1,
+        "page_size": max(min(params.get("limit", 10), 100), 10),
+        "criteria": criteria,
     }
-    if company_include:
-        search_body["filters"]["companies"] = {"include": company_include}
 
-    print(f"Lusha request body: {json.dumps(search_body)}")
+    print(f"Seamless.ai request body: {json.dumps(search_body)}")
 
     async with httpx.AsyncClient(timeout=30.0) as client:
-        # Step 1: Search — with retry on 429
-        search_resp = None
+        resp = None
         for attempt in range(3):
-            search_resp = await client.post(
-                "https://api.lusha.com/prospecting/contact/search",
+            resp = await client.post(
+                "https://api.seamless.ai/v1/contacts/search",
                 headers=headers,
                 json=search_body,
             )
-            print(f"Lusha search status: {search_resp.status_code}")
-            if search_resp.status_code != 429:
+            print(f"Seamless.ai search status: {resp.status_code}")
+            if resp.status_code != 429:
                 break
             wait = 2 ** attempt
-            print(f"Lusha 429 rate limit — retrying in {wait}s (attempt {attempt + 1}/3)")
+            print(f"Seamless.ai 429 rate limit — retrying in {wait}s (attempt {attempt + 1}/3)")
             await asyncio.sleep(wait)
 
-        print(f"Lusha response body: {search_resp.text[:300]}")
+        print(f"Seamless.ai response body: {resp.text[:300]}")
 
-        if search_resp.status_code == 404:
+        if resp.status_code == 404:
             return []
-        if search_resp.status_code == 429:
-            raise HTTPException(status_code=429, detail="Lusha rate limit reached — please try again in a moment")
-        if search_resp.status_code not in (200, 201):
+        if resp.status_code == 429:
+            raise HTTPException(status_code=429, detail="Seamless.ai rate limit reached — please try again in a moment")
+        if resp.status_code not in (200, 201):
             raise HTTPException(
-                status_code=search_resp.status_code,
-                detail=f"Lusha search error: {search_resp.text}",
+                status_code=resp.status_code,
+                detail=f"Seamless.ai search error: {resp.text}",
             )
 
-        search_data = search_resp.json()
-        request_id = search_data.get("requestId")
-        contacts = search_data.get("data", [])
-
-        if not contacts or not request_id:
-            return []
-
-        # Step 2: Enrich — with retry on 429
-        enrich_resp = None
-        for attempt in range(3):
-            enrich_resp = await client.post(
-                "https://api.lusha.com/prospecting/contact/enrich",
-                headers=headers,
-                json={
-                    "requestId": request_id,
-                    "contactIds": [c["contactId"] for c in contacts],
-                },
-            )
-            print(f"Lusha enrich status: {enrich_resp.status_code}")
-            if enrich_resp.status_code != 429:
-                break
-            wait = 2 ** attempt
-            print(f"Lusha enrich 429 — retrying in {wait}s (attempt {attempt + 1}/3)")
-            await asyncio.sleep(wait)
-
-        print(f"Lusha enrich body: {enrich_resp.text[:300]}")
-
-        if enrich_resp.status_code == 429:
-            raise HTTPException(status_code=429, detail="Lusha rate limit reached — please try again in a moment")
-        if enrich_resp.status_code not in (200, 201):
-            raise HTTPException(
-                status_code=enrich_resp.status_code,
-                detail=f"Lusha enrich error: {enrich_resp.text}",
-            )
-
-        return enrich_resp.json().get("contacts", [])
+        return resp.json().get("contacts", [])
 
 
 # =============================================================================
@@ -472,7 +375,7 @@ async def fetch_from_lusha(params: dict) -> list:
 
 app = FastAPI(
     title="Cache-First Lead Generation Proxy",
-    description="Proxy that caches Lusha API results to reduce costs",
+    description="Proxy that caches Seamless.ai API results to reduce costs",
     version="3.0.0"
 )
 
@@ -507,7 +410,7 @@ async def health_check():
 @app.post("/parse-icp")
 async def parse_icp(request: ICPParseRequest):
     """
-    Parse a plain-English ICP description into structured Lusha search filters.
+    Parse a plain-English ICP description into structured Seamless.ai search filters.
 
     Example input:
       "CTOs at fintech startups using Salesforce, 50-200 employees in NYC,
@@ -572,7 +475,7 @@ async def search_leads(request: SearchRequest):
     Flow:
     1. Check local DB for cached results
     2. If found, return from cache
-    3. If not found, fetch from Lusha API (search + enrich)
+    3. If not found, fetch from Seamless.ai API
     4. Cache the raw results
     5. Return transformed results
     """
@@ -611,7 +514,7 @@ async def search_leads(request: SearchRequest):
         if cached:
             print(f"Cache HIT for hash: {search_hash}")
             data = json.loads(cached.results)
-            leads = [transform_lusha_contact(lead, params) for lead in data]
+            leads = [transform_seamless_contact(lead, params) for lead in data]
             return SearchResponse(
                 success=True,
                 source="cache",
@@ -622,12 +525,12 @@ async def search_leads(request: SearchRequest):
                 data=data,
             )
 
-        # Step 3: Fetch from Lusha API
-        print(f"Cache MISS - calling Lusha API with params: {params}")
-        raw_leads = await fetch_from_lusha(params)
-        print(f"Lusha returned {len(raw_leads)} leads")
+        # Step 3: Fetch from Seamless.ai API
+        print(f"Cache MISS - calling Seamless.ai API with params: {params}")
+        raw_leads = await fetch_from_seamless(params)
+        print(f"Seamless.ai returned {len(raw_leads)} leads")
 
-        leads = [transform_lusha_contact(lead, params) for lead in raw_leads]
+        leads = [transform_seamless_contact(lead, params) for lead in raw_leads]
 
         # Step 4: Cache the raw results
         new_cache = CachedSearch(
@@ -711,7 +614,7 @@ async def cache_stats():
 
 @app.get("/cache/all")
 async def get_all_cached_leads():
-    """Retrieve all cached leads (fallback when Lusha credits are exhausted)."""
+    """Retrieve all cached leads (fallback when Seamless.ai credits are exhausted)."""
     async with async_session() as session:
         stmt = select(CachedSearch).order_by(CachedSearch.created_at.desc())
         result = await session.execute(stmt)
@@ -730,7 +633,7 @@ async def get_all_cached_leads():
                 key = f"{full_name}-{company}"
                 if key not in seen_contacts:
                     seen_contacts.add(key)
-                    all_leads.append(transform_lusha_contact(contact, search_params))
+                    all_leads.append(transform_seamless_contact(contact, search_params))
 
         return {
             "success": True,
@@ -755,7 +658,7 @@ async def get_cached_search(search_hash: str):
 
         data = json.loads(cached.results)
         search_params = json.loads(cached.search_params)
-        leads = [transform_lusha_contact(lead, search_params) for lead in data]
+        leads = [transform_seamless_contact(lead, search_params) for lead in data]
 
         return {
             "success": True,
