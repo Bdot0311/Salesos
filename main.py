@@ -194,6 +194,10 @@ class SearchRequest(BaseModel):
     # Career change signal
     job_change_days: Optional[int] = None   # e.g. 90 — contacts who changed jobs in last N days
 
+    # Legacy signals field (mapped to job_change_days if present)
+    signals: Optional[list[str]] = None
+    signals_since_days: int = 90
+
     limit: int = 10
 
     @field_validator("keywords", "seniority", "job_title", "location", "company_location",
@@ -298,6 +302,11 @@ async def fetch_from_prospeo(params: dict) -> list:
       1. POST /search-person  — find contacts with buyer intent + standard filters
       2. POST /enrich-person  — enrich each result by person_id (concurrent)
     """
+    # Map legacy signals list to job_change_days
+    if params.get("signals") and not params.get("job_change_days"):
+        if any(s in ("job_change", "promotion", "companyChange") for s in params["signals"]):
+            params["job_change_days"] = params.get("signals_since_days", 90)
+
     searchable_fields = (
         "job_title", "departments", "location", "company_location", "industry",
         "company", "company_domain", "company_size", "seniority", "technologies",
@@ -529,7 +538,8 @@ async def parse_icp(request: ICPParseRequest):
     Returns structured filters ready to pass directly into POST /search.
     """
     if not settings.anthropic_api_key:
-        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured on server")
+        # No LLM available — return the raw text as a keyword fallback
+        return {"success": True, "filters": {"keywords": request.text}}
 
     client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
 
@@ -604,16 +614,30 @@ async def search_leads(request: SearchRequest):
         "company", "company_domain", "company_size", "industry", "technologies",
         "keywords", "intent_topics", "revenue_min", "revenue_max", "job_change_days",
     }
-    if params.get("query") and not any(params.get(f) for f in structured_fields):
-        if not settings.anthropic_api_key:
-            raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured — cannot parse plain-text query")
-        print(f"Auto-parsing query: {params['query']}")
-        parsed = await parse_icp(ICPParseRequest(text=params["query"]))
-        for k, v in parsed.get("filters", {}).items():
+    raw_query = params.pop("query", None)
+    if raw_query and not any(params.get(f) for f in structured_fields):
+        parsed_filters: dict = {}
+
+        if settings.anthropic_api_key:
+            try:
+                print(f"Auto-parsing query via ICP parser: {raw_query}")
+                icp_result = await parse_icp(ICPParseRequest(text=raw_query))
+                parsed_filters = icp_result.get("filters", {})
+                print(f"ICP parser returned: {parsed_filters}")
+            except Exception as e:
+                print(f"WARNING: ICP parser failed ({e}) — falling back to keyword search")
+
+        # Merge parsed filters into params
+        for k, v in parsed_filters.items():
             if v is not None and v != "" and v != []:
                 params[k] = v
-        params.pop("query", None)
-        print(f"Parsed into: {params}")
+
+        # If parsing produced nothing useful, use the raw query as a keyword search
+        if not any(params.get(f) for f in structured_fields):
+            print(f"ICP parse yielded no filters — using raw query as keyword search")
+            params["keywords"] = raw_query
+
+        print(f"Final params after query resolution: {params}")
 
     search_hash = generate_search_hash(params)
     print(f"Search hash: {search_hash}")
