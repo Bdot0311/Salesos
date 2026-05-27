@@ -9,7 +9,8 @@ import json
 from datetime import datetime
 from typing import Optional
 
-import anthropic
+import re
+
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -341,7 +342,7 @@ async def fetch_from_prospeo(params: dict) -> list:
         if level:
             filters["person_seniority"] = {"include": [level]}
 
-    # Person location
+    # Person location — stored separately; added to filters and dropped on rejection
     if params.get("location"):
         filters["person_location_search"] = {
             "include": [normalize_location(params["location"])]
@@ -362,7 +363,7 @@ async def fetch_from_prospeo(params: dict) -> list:
             company_filter["websites"] = {"include": [params["company_domain"]]}
         filters["company"] = company_filter
 
-    # Industry
+    # Industry — stored separately; dropped on rejection
     if params.get("industry"):
         filters["company_industry"] = {"include": [params["industry"]]}
 
@@ -372,17 +373,13 @@ async def fetch_from_prospeo(params: dict) -> list:
         if ranges:
             filters["company_headcount_range"] = {"include": ranges}
 
-    # Technologies (buyer signal + stack filter)
+    # Technologies
     if params.get("technologies"):
         filters["company_technology"] = {"include": params["technologies"][:20]}
 
     # Free-text keyword search
     if params.get("keywords"):
         filters["person_name_or_job_title"] = params["keywords"]
-
-    # Revenue range → custom headcount proxy (Prospeo doesn't have a direct
-    # revenue filter; store it for enrichment-time filtering)
-    # We pass it through but don't add it to Prospeo filters directly.
 
     # ---- Buyer Intent: company_news ----
     if params.get("intent_topics"):
@@ -400,42 +397,75 @@ async def fetch_from_prospeo(params: dict) -> list:
     if params.get("job_change_days"):
         filters["person_job_change"] = {"days": params["job_change_days"]}
 
-    # Require contacts to have email available
-    filters["person_contact_details"] = {"email": True}
+    # NOTE: person_contact_details omitted — Prospeo rejects our format;
+    # email presence is enforced at enrich time via only_verified_email.
 
-    search_body = {
-        "filters": filters,
-        "page": 1,
-    }
+    # Filters that can be safely dropped and retried if Prospeo rejects them
+    DROPPABLE_FILTERS = [
+        ("location",         ["person_location_search"]),
+        ("company_location", ["company_location_search"]),
+        ("industry",         ["company_industry"]),
+        ("technologies",     ["company_technology"]),
+        ("intent_topics",    ["company_news"]),
+    ]
+
+    search_body = {"filters": filters, "page": 1}
 
     print(f"Prospeo search body: {json.dumps(search_body)}")
 
     async with httpx.AsyncClient(timeout=30.0) as client:
 
-        # ---- Step 1: Search ----
+        # ---- Step 1: Search with auto-retry on INVALID_FILTERS ----
+        # On each rejection we parse the error message, drop the offending
+        # filter key(s), and retry — up to len(DROPPABLE_FILTERS) extra times.
         search_resp = None
-        for attempt in range(3):
-            search_resp = await client.post(
-                f"{PROSPEO_BASE}/search-person",
-                headers=headers,
-                json=search_body,
-            )
-            print(f"Prospeo search status: {search_resp.status_code}")
-            if search_resp.status_code != 429:
-                break
-            wait = 2 ** attempt
-            print(f"Rate limited — retrying in {wait}s (attempt {attempt + 1}/3)")
-            await asyncio.sleep(wait)
+        for _drop_attempt in range(len(DROPPABLE_FILTERS) + 1):
+            for attempt in range(3):
+                search_resp = await client.post(
+                    f"{PROSPEO_BASE}/search-person",
+                    headers=headers,
+                    json=search_body,
+                )
+                print(f"Prospeo search status: {search_resp.status_code}")
+                if search_resp.status_code != 429:
+                    break
+                wait = 2 ** attempt
+                print(f"Rate limited — retrying in {wait}s (attempt {attempt + 1}/3)")
+                await asyncio.sleep(wait)
 
-        print(f"Prospeo search response: {search_resp.text[:400]}")
+            print(f"Prospeo search response: {search_resp.text[:400]}")
 
-        if search_resp.status_code == 429:
-            raise HTTPException(status_code=429, detail="Prospeo rate limit reached — please try again in a moment")
-        if search_resp.status_code not in (200, 201):
-            raise HTTPException(
-                status_code=search_resp.status_code,
-                detail=f"Prospeo search error: {search_resp.text}",
-            )
+            if search_resp.status_code == 429:
+                raise HTTPException(status_code=429, detail="Prospeo rate limit reached — please try again in a moment")
+
+            if search_resp.status_code == 400:
+                err = search_resp.json()
+                if err.get("error_code") == "INVALID_FILTERS":
+                    err_msg = err.get("filter_error", "").lower()
+                    dropped = False
+                    for param_key, filter_keys in DROPPABLE_FILTERS:
+                        if any(fk.replace("_", " ") in err_msg or param_key in err_msg
+                               for fk in filter_keys):
+                            for fk in filter_keys:
+                                if fk in search_body["filters"]:
+                                    print(f"Dropping invalid filter '{fk}': {err_msg}")
+                                    del search_body["filters"][fk]
+                                    dropped = True
+                            if dropped:
+                                break
+                    if dropped:
+                        continue  # retry with the bad filter removed
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Prospeo search error: {search_resp.text}",
+                )
+
+            if search_resp.status_code not in (200, 201):
+                raise HTTPException(
+                    status_code=search_resp.status_code,
+                    detail=f"Prospeo search error: {search_resp.text}",
+                )
+            break  # success
 
         search_data = search_resp.json()
         if search_data.get("error"):
