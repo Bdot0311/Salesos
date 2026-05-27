@@ -319,26 +319,6 @@ async def resolve_location(raw: str, headers: dict, client: httpx.AsyncClient) -
     return None
 
 
-async def resolve_job_title(raw: str, headers: dict, client: httpx.AsyncClient) -> str | None:
-    """
-    Call Prospeo Search Suggestions to get a valid job title string.
-    Returns the best match or None if unresolvable.
-    """
-    try:
-        r = await client.post(
-            f"{PROSPEO_BASE}/search-suggestions",
-            headers=headers,
-            json={"job_title_search": raw},
-        )
-        if r.status_code == 200:
-            suggestions = r.json().get("job_title_suggestions") or []
-            if suggestions:
-                best = suggestions[0]
-                print(f"Resolved job title '{raw}' → '{best}'")
-                return best
-    except Exception as e:
-        print(f"Job title suggestion failed for '{raw}': {e}")
-    return None
 
 
 async def fetch_from_prospeo(params: dict) -> list:
@@ -383,21 +363,14 @@ async def fetch_from_prospeo(params: dict) -> list:
         if params.get("company_location"):
             resolved_company_location = await resolve_location(params["company_location"], headers, client)
 
-        resolved_job_title: str | None = None
-        if params.get("job_title"):
-            resolved_job_title = await resolve_job_title(params["job_title"], headers, client)
-
         # ------------------------------------------------------------------
         # Build search filters
         # ------------------------------------------------------------------
         filters: dict = {}
 
-        # Job title — use resolved suggestion or fall back to raw as keyword
-        if resolved_job_title:
-            filters["person_job_title"] = {"include": [resolved_job_title]}
-        elif params.get("job_title"):
-            # Couldn't resolve — add raw title as keyword search instead
-            filters["person_name_or_job_title"] = params["job_title"]
+        # Job title — pass raw, Prospeo accepts free text here
+        if params.get("job_title"):
+            filters["person_job_title"] = {"include": [params["job_title"]]}
 
         # Department
         if params.get("departments"):
@@ -486,6 +459,10 @@ async def fetch_from_prospeo(params: dict) -> list:
         if search_resp.status_code == 429:
             raise HTTPException(status_code=429, detail="Prospeo rate limit reached — please try again in a moment")
         if search_resp.status_code not in (200, 201):
+            body = search_resp.json() if search_resp.text else {}
+            # NO_RESULTS is not an error — just means 0 matches
+            if body.get("error_code") == "NO_RESULTS":
+                return []
             raise HTTPException(
                 status_code=search_resp.status_code,
                 detail=f"Prospeo search error: {search_resp.text}",
@@ -516,10 +493,7 @@ async def fetch_from_prospeo(params: dict) -> list:
                 r = await client.post(
                     f"{PROSPEO_BASE}/enrich-person",
                     headers=headers,
-                    json={
-                        "data": {"person_id": person_id},
-                        "only_verified_email": True,
-                    },
+                    json={"data": {"person_id": person_id}},
                 )
                 print(f"Prospeo enrich status ({person_id}): {r.status_code}")
                 if r.status_code == 429:
