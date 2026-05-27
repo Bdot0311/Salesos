@@ -297,11 +297,59 @@ def generate_search_hash(params: dict) -> str:
 # Prospeo Two-Step Workflow: Search → Enrich
 # =============================================================================
 
+async def resolve_location(raw: str, headers: dict, client: httpx.AsyncClient) -> str | None:
+    """
+    Call Prospeo Search Suggestions to get a valid location string.
+    Returns the best match or None if unresolvable.
+    """
+    try:
+        r = await client.post(
+            f"{PROSPEO_BASE}/search-suggestions",
+            headers=headers,
+            json={"location_search": raw},
+        )
+        if r.status_code == 200:
+            suggestions = r.json().get("location_suggestions") or []
+            if suggestions:
+                best = suggestions[0]["name"]
+                print(f"Resolved location '{raw}' → '{best}'")
+                return best
+    except Exception as e:
+        print(f"Location suggestion failed for '{raw}': {e}")
+    return None
+
+
+async def resolve_job_title(raw: str, headers: dict, client: httpx.AsyncClient) -> str | None:
+    """
+    Call Prospeo Search Suggestions to get a valid job title string.
+    Returns the best match or None if unresolvable.
+    """
+    try:
+        r = await client.post(
+            f"{PROSPEO_BASE}/search-suggestions",
+            headers=headers,
+            json={"job_title_search": raw},
+        )
+        if r.status_code == 200:
+            suggestions = r.json().get("job_title_suggestions") or []
+            if suggestions:
+                best = suggestions[0]
+                print(f"Resolved job title '{raw}' → '{best}'")
+                return best
+    except Exception as e:
+        print(f"Job title suggestion failed for '{raw}': {e}")
+    return None
+
+
 async def fetch_from_prospeo(params: dict) -> list:
     """
     Two-step Prospeo workflow:
       1. POST /search-person  — find contacts with buyer intent + standard filters
       2. POST /enrich-person  — enrich each result by person_id (concurrent)
+
+    Locations and job titles are resolved via the Suggestions API first so
+    that any free-text input produces valid Prospeo filter values.
+    Industry has no suggestions endpoint — it is passed as a keyword instead.
     """
     # Map legacy signals list to job_change_days
     if params.get("signals") and not params.get("job_change_days"):
@@ -321,151 +369,127 @@ async def fetch_from_prospeo(params: dict) -> list:
         "Content-Type": "application/json",
     }
 
-    # ------------------------------------------------------------------
-    # Step 1: Build search filters
-    # ------------------------------------------------------------------
-    filters: dict = {}
-
-    # Job title free-text
-    if params.get("job_title"):
-        filters["person_job_title"] = {"include": [params["job_title"]]}
-
-    # Department
-    if params.get("departments"):
-        valid_depts = [d for d in params["departments"] if d in VALID_DEPARTMENTS]
-        if valid_depts:
-            filters["person_department"] = {"include": valid_depts}
-
-    # Seniority
-    if params.get("seniority"):
-        level = SENIORITY_MAP.get(params["seniority"].lower())
-        if level:
-            filters["person_seniority"] = {"include": [level]}
-
-    # Person location — stored separately; added to filters and dropped on rejection
-    if params.get("location"):
-        filters["person_location_search"] = {
-            "include": [normalize_location(params["location"])]
-        }
-
-    # Company HQ location
-    if params.get("company_location"):
-        filters["company_location_search"] = {
-            "include": [normalize_location(params["company_location"])]
-        }
-
-    # Company name / domain
-    if params.get("company") or params.get("company_domain"):
-        company_filter: dict = {}
-        if params.get("company"):
-            company_filter["names"] = {"include": [params["company"]]}
-        if params.get("company_domain"):
-            company_filter["websites"] = {"include": [params["company_domain"]]}
-        filters["company"] = company_filter
-
-    # Industry — stored separately; dropped on rejection
-    if params.get("industry"):
-        filters["company_industry"] = {"include": [params["industry"]]}
-
-    # Company headcount
-    if params.get("company_size"):
-        ranges = COMPANY_SIZE_MAP.get(params["company_size"], [])
-        if ranges:
-            filters["company_headcount_range"] = {"include": ranges}
-
-    # Technologies
-    if params.get("technologies"):
-        filters["company_technology"] = {"include": params["technologies"][:20]}
-
-    # Free-text keyword search
-    if params.get("keywords"):
-        filters["person_name_or_job_title"] = params["keywords"]
-
-    # ---- Buyer Intent: company_news ----
-    if params.get("intent_topics"):
-        valid_cats = [t for t in params["intent_topics"] if t in VALID_NEWS_CATEGORIES]
-        if valid_cats:
-            days = params.get("intent_days", 90)
-            if days not in (60, 90, 180, 365):
-                days = 90
-            filters["company_news"] = {
-                "categories": {"include": valid_cats},
-                "days": days,
-            }
-
-    # ---- Career signal: job change ----
-    if params.get("job_change_days"):
-        filters["person_job_change"] = {"days": params["job_change_days"]}
-
-    # NOTE: person_contact_details omitted — Prospeo rejects our format;
-    # email presence is enforced at enrich time via only_verified_email.
-
-    # Filters that can be safely dropped and retried if Prospeo rejects them
-    DROPPABLE_FILTERS = [
-        ("location",         ["person_location_search"]),
-        ("company_location", ["company_location_search"]),
-        ("industry",         ["company_industry"]),
-        ("technologies",     ["company_technology"]),
-        ("intent_topics",    ["company_news"]),
-    ]
-
-    search_body = {"filters": filters, "page": 1}
-
-    print(f"Prospeo search body: {json.dumps(search_body)}")
-
     async with httpx.AsyncClient(timeout=30.0) as client:
 
-        # ---- Step 1: Search with auto-retry on INVALID_FILTERS ----
-        # On each rejection we parse the error message, drop the offending
-        # filter key(s), and retry — up to len(DROPPABLE_FILTERS) extra times.
+        # ------------------------------------------------------------------
+        # Resolve location and job title via Suggestions API before building
+        # filters — this guarantees valid strings for any user input
+        # ------------------------------------------------------------------
+        resolved_location: str | None = None
+        if params.get("location"):
+            resolved_location = await resolve_location(params["location"], headers, client)
+
+        resolved_company_location: str | None = None
+        if params.get("company_location"):
+            resolved_company_location = await resolve_location(params["company_location"], headers, client)
+
+        resolved_job_title: str | None = None
+        if params.get("job_title"):
+            resolved_job_title = await resolve_job_title(params["job_title"], headers, client)
+
+        # ------------------------------------------------------------------
+        # Build search filters
+        # ------------------------------------------------------------------
+        filters: dict = {}
+
+        # Job title — use resolved suggestion or fall back to raw as keyword
+        if resolved_job_title:
+            filters["person_job_title"] = {"include": [resolved_job_title]}
+        elif params.get("job_title"):
+            # Couldn't resolve — add raw title as keyword search instead
+            filters["person_name_or_job_title"] = params["job_title"]
+
+        # Department
+        if params.get("departments"):
+            valid_depts = [d for d in params["departments"] if d in VALID_DEPARTMENTS]
+            if valid_depts:
+                filters["person_department"] = {"include": valid_depts}
+
+        # Seniority
+        if params.get("seniority"):
+            level = SENIORITY_MAP.get(params["seniority"].lower())
+            if level:
+                filters["person_seniority"] = {"include": [level]}
+
+        # Person location — use resolved suggestion; skip if unresolvable
+        if resolved_location:
+            filters["person_location_search"] = {"include": [resolved_location]}
+        elif params.get("location"):
+            print(f"WARNING: Could not resolve location '{params['location']}' — skipping location filter")
+
+        # Company HQ location
+        if resolved_company_location:
+            filters["company_location_search"] = {"include": [resolved_company_location]}
+
+        # Company name / domain
+        if params.get("company") or params.get("company_domain"):
+            company_filter: dict = {}
+            if params.get("company"):
+                company_filter["names"] = {"include": [params["company"]]}
+            if params.get("company_domain"):
+                company_filter["websites"] = {"include": [params["company_domain"]]}
+            filters["company"] = company_filter
+
+        # Industry — no suggestions endpoint exists; use as keyword so it
+        # always works regardless of what the user typed
+        keyword_parts = []
+        if params.get("industry"):
+            keyword_parts.append(params["industry"])
+        if params.get("keywords"):
+            keyword_parts.append(params["keywords"])
+        if keyword_parts:
+            filters["person_name_or_job_title"] = " ".join(keyword_parts)
+
+        # Company headcount
+        if params.get("company_size"):
+            ranges = COMPANY_SIZE_MAP.get(params["company_size"], [])
+            if ranges:
+                filters["company_headcount_range"] = {"include": ranges}
+
+        # Technologies
+        if params.get("technologies"):
+            filters["company_technology"] = {"include": params["technologies"][:20]}
+
+        # Buyer Intent
+        if params.get("intent_topics"):
+            valid_cats = [t for t in params["intent_topics"] if t in VALID_NEWS_CATEGORIES]
+            if valid_cats:
+                days = params.get("intent_days", 90)
+                if days not in (60, 90, 180, 365):
+                    days = 90
+                filters["company_news"] = {"categories": {"include": valid_cats}, "days": days}
+
+        # Career signal
+        if params.get("job_change_days"):
+            filters["person_job_change"] = {"days": params["job_change_days"]}
+
+        search_body = {"filters": filters, "page": 1}
+        print(f"Prospeo search body: {json.dumps(search_body)}")
+
+        # ---- Step 1: Search ----
         search_resp = None
-        for _drop_attempt in range(len(DROPPABLE_FILTERS) + 1):
-            for attempt in range(3):
-                search_resp = await client.post(
-                    f"{PROSPEO_BASE}/search-person",
-                    headers=headers,
-                    json=search_body,
-                )
-                print(f"Prospeo search status: {search_resp.status_code}")
-                if search_resp.status_code != 429:
-                    break
-                wait = 2 ** attempt
-                print(f"Rate limited — retrying in {wait}s (attempt {attempt + 1}/3)")
-                await asyncio.sleep(wait)
+        for attempt in range(3):
+            search_resp = await client.post(
+                f"{PROSPEO_BASE}/search-person",
+                headers=headers,
+                json=search_body,
+            )
+            print(f"Prospeo search status: {search_resp.status_code}")
+            if search_resp.status_code != 429:
+                break
+            wait = 2 ** attempt
+            print(f"Rate limited — retrying in {wait}s (attempt {attempt + 1}/3)")
+            await asyncio.sleep(wait)
 
-            print(f"Prospeo search response: {search_resp.text[:400]}")
+        print(f"Prospeo search response: {search_resp.text[:400]}")
 
-            if search_resp.status_code == 429:
-                raise HTTPException(status_code=429, detail="Prospeo rate limit reached — please try again in a moment")
-
-            if search_resp.status_code == 400:
-                err = search_resp.json()
-                if err.get("error_code") == "INVALID_FILTERS":
-                    err_msg = err.get("filter_error", "").lower()
-                    dropped = False
-                    for param_key, filter_keys in DROPPABLE_FILTERS:
-                        if any(fk.replace("_", " ") in err_msg or param_key in err_msg
-                               for fk in filter_keys):
-                            for fk in filter_keys:
-                                if fk in search_body["filters"]:
-                                    print(f"Dropping invalid filter '{fk}': {err_msg}")
-                                    del search_body["filters"][fk]
-                                    dropped = True
-                            if dropped:
-                                break
-                    if dropped:
-                        continue  # retry with the bad filter removed
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Prospeo search error: {search_resp.text}",
-                )
-
-            if search_resp.status_code not in (200, 201):
-                raise HTTPException(
-                    status_code=search_resp.status_code,
-                    detail=f"Prospeo search error: {search_resp.text}",
-                )
-            break  # success
+        if search_resp.status_code == 429:
+            raise HTTPException(status_code=429, detail="Prospeo rate limit reached — please try again in a moment")
+        if search_resp.status_code not in (200, 201):
+            raise HTTPException(
+                status_code=search_resp.status_code,
+                detail=f"Prospeo search error: {search_resp.text}",
+            )
 
         search_data = search_resp.json()
         if search_data.get("error"):
