@@ -11,6 +11,7 @@ from typing import Optional
 
 import re
 
+import anthropic
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -81,6 +82,110 @@ COMPANY_SIZE_MAP: dict[str, list[str]] = {
     "5001-10000": ["5001-10000"],
     "10001+":     ["10000+"],
 }
+
+# Common user-typed industry terms -> valid Prospeo company_industry enum values.
+# Prospeo's company_industry filter accepts 256 LinkedIn-standard industry strings
+# (e.g. "Software Development"); free-text like "SaaS" is NOT a valid value, so we
+# normalize here. Anything we can't confidently map is dropped rather than guessed,
+# so an unknown industry broadens the search instead of returning zero results.
+INDUSTRY_MAP: dict[str, str] = {
+    "saas":                         "Software Development",
+    "software":                     "Software Development",
+    "software development":         "Software Development",
+    "b2b software":                 "Software Development",
+    "enterprise software":          "Software Development",
+    "cloud":                        "Software Development",
+    "dev tools":                    "Software Development",
+    "developer tools":              "Software Development",
+    "tech":                         "Technology, Information and Internet",
+    "technology":                   "Technology, Information and Internet",
+    "internet":                     "Technology, Information and Internet",
+    "information technology":       "IT Services and IT Consulting",
+    "it":                           "IT Services and IT Consulting",
+    "it services":                  "IT Services and IT Consulting",
+    "it consulting":                "IT Services and IT Consulting",
+    "consulting":                   "Business Consulting and Services",
+    "business consulting":          "Business Consulting and Services",
+    "management consulting":        "Business Consulting and Services",
+    "fintech":                      "Financial Services",
+    "finance":                      "Financial Services",
+    "financial":                    "Financial Services",
+    "financial services":          "Financial Services",
+    "banking":                      "Banking",
+    "insurance":                    "Insurance",
+    "investment":                   "Investment Management",
+    "venture capital":              "Venture Capital and Private Equity",
+    "private equity":               "Venture Capital and Private Equity",
+    "vc":                           "Venture Capital and Private Equity",
+    "healthcare":                   "Hospitals and Health Care",
+    "health care":                  "Hospitals and Health Care",
+    "health":                       "Hospitals and Health Care",
+    "medical":                      "Medical Practices",
+    "biotech":                      "Biotechnology Research",
+    "biotechnology":                "Biotechnology Research",
+    "pharma":                       "Pharmaceutical Manufacturing",
+    "pharmaceutical":               "Pharmaceutical Manufacturing",
+    "marketing":                    "Advertising Services",
+    "advertising":                  "Advertising Services",
+    "digital marketing":            "Advertising Services",
+    "agency":                       "Advertising Services",
+    "ecommerce":                    "Retail",
+    "e-commerce":                   "Retail",
+    "retail":                       "Retail",
+    "real estate":                  "Real Estate",
+    "proptech":                     "Real Estate",
+    "construction":                 "Construction",
+    "manufacturing":                "Manufacturing",
+    "education":                    "Education",
+    "edtech":                       "E-Learning Providers",
+    "e-learning":                   "E-Learning Providers",
+    "staffing":                     "Staffing and Recruiting",
+    "recruiting":                   "Staffing and Recruiting",
+    "hr":                           "Human Resources Services",
+    "human resources":              "Human Resources Services",
+    "telecom":                      "Telecommunications",
+    "telecommunications":           "Telecommunications",
+    "media":                        "Media Production",
+    "entertainment":                "Entertainment Providers",
+    "hospitality":                  "Hospitality",
+    "travel":                       "Travel Arrangements",
+    "logistics":                    "Transportation, Logistics, Supply Chain and Storage",
+    "supply chain":                 "Transportation, Logistics, Supply Chain and Storage",
+    "transportation":               "Transportation, Logistics, Supply Chain and Storage",
+    "automotive":                   "Motor Vehicle Manufacturing",
+    "energy":                       "Utilities",
+    "renewable energy":             "Renewable Energy Semiconductor Manufacturing",
+    "oil and gas":                  "Oil and Gas",
+    "legal":                        "Legal Services",
+    "law":                          "Legal Services",
+    "nonprofit":                    "Non-profit Organizations",
+    "non-profit":                   "Non-profit Organizations",
+    "gaming":                       "Computer Games",
+    "games":                        "Computer Games",
+    "cybersecurity":                "Computer and Network Security",
+    "security":                     "Computer and Network Security",
+    "ai":                           "Software Development",
+    "artificial intelligence":      "Software Development",
+    "data":                         "Data Infrastructure and Analytics",
+    "analytics":                    "Data Infrastructure and Analytics",
+}
+
+
+def normalize_industry(raw: str) -> str | None:
+    """Map a free-text industry term to a valid Prospeo company_industry value.
+
+    Returns the mapped enum string, or None if we can't confidently map it
+    (caller should then drop the industry filter rather than send a bad value).
+    """
+    key = raw.strip().lower()
+    if key in INDUSTRY_MAP:
+        return INDUSTRY_MAP[key]
+    # Try the first comma-separated token (handles "SaaS, fintech" -> "saas")
+    first = key.split(",")[0].strip()
+    if first in INDUSTRY_MAP:
+        return INDUSTRY_MAP[first]
+    return None
+
 
 # Buyer intent news categories supported by Prospeo company_news filter
 VALID_NEWS_CATEGORIES = {
@@ -403,15 +508,25 @@ async def fetch_from_prospeo(params: dict) -> list:
                 company_filter["websites"] = {"include": [params["company_domain"]]}
             filters["company"] = company_filter
 
-        # Industry — no suggestions endpoint exists; use as keyword so it
-        # always works regardless of what the user typed
-        keyword_parts = []
+        # Industry — map to Prospeo's dedicated company_industry filter.
+        # Previously this was jammed into person_name_or_job_title, which forced
+        # the person's NAME or JOB TITLE to contain the industry term (e.g. "SaaS")
+        # — an almost-impossible match that silently zeroed out nearly every search.
+        # We now normalize to a valid enum value; if it can't be mapped, we drop it
+        # (broadens the search) rather than poison it.
         if params.get("industry"):
-            keyword_parts.append(params["industry"])
+            mapped = normalize_industry(params["industry"])
+            if mapped:
+                filters["company_industry"] = {"include": [mapped]}
+                print(f"Industry '{params['industry']}' -> company_industry '{mapped}'")
+            else:
+                print(f"WARNING: Could not map industry '{params['industry']}' to a Prospeo "
+                      f"value — skipping industry filter to keep recall")
+
+        # Keywords — explicit free-text terms still go to person_name_or_job_title.
+        # (Industry no longer leaks in here.)
         if params.get("keywords"):
-            keyword_parts.append(params["keywords"])
-        if keyword_parts:
-            filters["person_name_or_job_title"] = " ".join(keyword_parts)
+            filters["person_name_or_job_title"] = params["keywords"]
 
         # Company headcount
         if params.get("company_size"):
