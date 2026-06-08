@@ -478,6 +478,99 @@ async def health_check():
 # ICP Parser Endpoint
 # =============================================================================
 
+# =============================================================================
+# Enrich Endpoint  (Wiza Individual Reveal)
+# =============================================================================
+
+class EnrichRequest(BaseModel):
+    linkedin_url: Optional[str] = None
+    email: Optional[str] = None
+    full_name: Optional[str] = None
+    company: Optional[str] = None
+    company_domain: Optional[str] = None
+
+
+@app.post("/enrich")
+async def enrich_lead(request: EnrichRequest):
+    """
+    Enrich a single lead via Wiza Individual Reveal.
+    Accepts linkedin_url, email, or full_name + company/domain.
+    Polls until finished (up to 60s) then returns the enriched contact.
+    """
+    headers = {
+        "Authorization": f"Bearer {settings.wiza_api_key}",
+        "Content-Type": "application/json",
+    }
+
+    # Build the individual_reveal payload — Wiza accepts any one identifier
+    if request.linkedin_url:
+        reveal_data = {"linkedin_url": request.linkedin_url}
+    elif request.email:
+        reveal_data = {"email": request.email}
+    elif request.full_name and (request.company or request.company_domain):
+        reveal_data = {"full_name": request.full_name}
+        if request.company:
+            reveal_data["company"] = request.company
+        if request.company_domain:
+            reveal_data["domain"] = request.company_domain
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide linkedin_url, email, or full_name + company/domain"
+        )
+
+    body = {
+        "individual_reveal": reveal_data,
+        "enrichment_level": "partial",
+    }
+
+    print(f"Wiza individual reveal request: {json.dumps(body)}")
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        # Start the reveal
+        start_resp = await client.post(
+            f"{WIZA_BASE}/individual_reveals",
+            headers=headers,
+            json=body,
+        )
+        print(f"Wiza reveal start status: {start_resp.status_code} {start_resp.text[:200]}")
+
+        if start_resp.status_code == 429:
+            raise HTTPException(status_code=429, detail="Wiza rate limit — try again in a moment")
+        if start_resp.status_code not in (200, 201):
+            raise HTTPException(
+                status_code=start_resp.status_code,
+                detail=f"Wiza enrich error: {start_resp.text}",
+            )
+
+        reveal_id = start_resp.json().get("data", {}).get("id")
+        if not reveal_id:
+            raise HTTPException(status_code=500, detail="Wiza returned no reveal ID")
+
+        # Poll until complete
+        for attempt in range(20):
+            await asyncio.sleep(3.0)
+            poll_resp = await client.get(
+                f"{WIZA_BASE}/individual_reveals/{reveal_id}",
+                headers=headers,
+            )
+            if poll_resp.status_code not in (200, 201):
+                break
+            data = poll_resp.json().get("data", {})
+            print(f"Wiza reveal poll #{attempt + 1}: status={data.get('status')}")
+            if data.get("is_complete") or data.get("status") in ("finished", "failed"):
+                contact = {k: v for k, v in data.items()
+                           if k not in ("id", "status", "is_complete", "enrichment_level",
+                                        "email_credits", "phone_credits", "export_credits", "api_credits")}
+                return {
+                    "success": True,
+                    "enrichment_status": "complete" if data.get("status") != "failed" else "failed",
+                    "lead": transform_wiza_contact(contact),
+                }
+
+        raise HTTPException(status_code=504, detail="Wiza enrichment timed out")
+
+
 @app.post("/parse-icp")
 async def parse_icp(request: ICPParseRequest):
     """Parse a plain-English ICP description into structured Wiza search filters."""
