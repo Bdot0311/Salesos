@@ -91,9 +91,43 @@ INTENT_TO_FUNDING = {
 }
 
 
-def f(value: str, flag: str = "i") -> dict:
-    """Wiza filter value wrapper — f='i' include, f='e' exclude."""
-    return {"v": value, "f": flag}
+def f(value: str, flag: str = "i", bucket: str = None) -> dict:
+    """Wiza filter value wrapper — f='i' include, f='e' exclude, b=bucket type."""
+    d = {"v": value, "f": flag}
+    if bucket:
+        d["b"] = bucket
+    return d
+
+
+def location_filter(value: str, flag: str = "i") -> dict:
+    """Build a Wiza location filter with the required 'b' (bucket) field."""
+    loc = value.strip().lower()
+    # Detect bucket type from the value
+    if loc in _COUNTRIES:
+        bucket = "country"
+    elif loc in _US_STATES or (len(loc) == 2 and loc.isalpha()):
+        bucket = "state"
+    else:
+        bucket = "city"
+    return f(value, flag, bucket)
+
+
+_COUNTRIES = {"united states", "us", "usa", "united kingdom", "uk", "canada",
+              "australia", "germany", "france", "india", "china", "japan",
+              "brazil", "israel", "singapore", "netherlands", "spain", "italy",
+              "sweden", "norway", "denmark", "finland", "mexico", "south korea",
+              "new zealand", "ireland", "switzerland", "austria", "belgium",
+              "portugal", "poland", "czech republic", "ukraine", "russia"}
+_US_STATES = {"alabama", "alaska", "arizona", "arkansas", "california", "colorado",
+              "connecticut", "delaware", "florida", "georgia", "hawaii", "idaho",
+              "illinois", "indiana", "iowa", "kansas", "kentucky", "louisiana",
+              "maine", "maryland", "massachusetts", "michigan", "minnesota",
+              "mississippi", "missouri", "montana", "nebraska", "nevada",
+              "new hampshire", "new jersey", "new mexico", "new york",
+              "north carolina", "north dakota", "ohio", "oklahoma", "oregon",
+              "pennsylvania", "rhode island", "south carolina", "south dakota",
+              "tennessee", "texas", "utah", "vermont", "virginia", "washington",
+              "west virginia", "wisconsin", "wyoming"}
 
 
 # =============================================================================
@@ -297,10 +331,10 @@ async def fetch_from_wiza(params: dict) -> list:
             fil["job_role"] = [f(d) for d in p["departments"]]
 
         if p.get("location"):
-            fil["location"] = [f(p["location"])]
+            fil["location"] = [location_filter(p["location"])]
 
         if p.get("company_location"):
-            fil["company_location"] = [f(p["company_location"])]
+            fil["company_location"] = [location_filter(p["company_location"])]
 
         if p.get("company"):
             fil["job_company"] = [f(p["company"])]
