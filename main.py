@@ -273,108 +273,136 @@ async def fetch_from_wiza(params: dict) -> list:
     }
 
     # ------------------------------------------------------------------
-    # Build filters
+    # Build filters — ordered from most to least specific so that if Wiza
+    # rejects a filter we can progressively drop and retry
     # ------------------------------------------------------------------
-    filters: dict = {}
+    def build_filters(p: dict) -> dict:
+        fil: dict = {}
 
-    if params.get("job_title"):
-        filters["job_title"] = [f(params["job_title"])]
+        # Job title — free text, Wiza accepts anything here
+        if p.get("job_title"):
+            fil["job_title"] = [f(p["job_title"])]
 
-    if params.get("seniority"):
-        level = SENIORITY_MAP.get(params["seniority"].lower())
-        if level:
-            filters["job_title_level"] = [level]
+        # Keywords merged into job_title search (Wiza has no generic keyword field)
+        if p.get("keywords"):
+            fil["job_title"] = fil.get("job_title", []) + [f(p["keywords"])]
 
-    if params.get("departments"):
-        filters["job_role"] = [f(d) for d in params["departments"]]
+        # Seniority — only add if we have a known Wiza level
+        if p.get("seniority"):
+            level = SENIORITY_MAP.get(p["seniority"].lower())
+            if level:
+                fil["job_title_level"] = [level]
 
-    if params.get("location"):
-        filters["location"] = [f(params["location"])]
+        if p.get("departments"):
+            fil["job_role"] = [f(d) for d in p["departments"]]
 
-    if params.get("company_location"):
-        filters["company_location"] = [f(params["company_location"])]
+        if p.get("location"):
+            fil["location"] = [f(p["location"])]
 
-    if params.get("company"):
-        filters["job_company"] = [f(params["company"])]
+        if p.get("company_location"):
+            fil["company_location"] = [f(p["company_location"])]
 
-    if params.get("industry"):
-        filters["company_industry"] = [f(params["industry"])]
+        if p.get("company"):
+            fil["job_company"] = [f(p["company"])]
 
-    if params.get("company_size"):
-        sizes = COMPANY_SIZE_MAP.get(params["company_size"], [])
-        if sizes:
-            filters["company_size"] = sizes
+        if p.get("industry"):
+            fil["company_industry"] = [f(p["industry"])]
 
-    if params.get("technologies"):
-        filters["skill"] = [f(t) for t in params["technologies"]]
+        if p.get("company_size"):
+            sizes = COMPANY_SIZE_MAP.get(p["company_size"], [])
+            if sizes:
+                fil["company_size"] = sizes
 
-    if params.get("keywords"):
-        # Wiza doesn't have a generic keyword field — apply to job title search
-        existing = filters.get("job_title", [])
-        filters["job_title"] = existing + [f(params["keywords"])]
+        if p.get("technologies"):
+            fil["skill"] = [f(t) for t in p["technologies"]]
 
-    # Buyer intent via funding signals
-    if params.get("intent_topics"):
-        funding_stages = []
-        for topic in params["intent_topics"]:
-            funding_stages.extend(INTENT_TO_FUNDING.get(topic, []))
-        if funding_stages:
-            filters["funding_stage"] = list(set(funding_stages))
+        if p.get("intent_topics"):
+            stages = []
+            for topic in p["intent_topics"]:
+                stages.extend(INTENT_TO_FUNDING.get(topic, []))
+            if stages:
+                fil["funding_stage"] = list(set(stages))
 
-    # Revenue range
-    if params.get("revenue_min"):
-        filters["revenue"] = filters.get("revenue", {})
-        filters["revenue"]["min"] = params["revenue_min"]
-    if params.get("revenue_max"):
-        filters["revenue"] = filters.get("revenue", {})
-        filters["revenue"]["max"] = params["revenue_max"]
+        if p.get("revenue_min") or p.get("revenue_max"):
+            rev: dict = {}
+            if p.get("revenue_min"):
+                rev["min"] = p["revenue_min"]
+            if p.get("revenue_max"):
+                rev["max"] = p["revenue_max"]
+            fil["revenue"] = rev
+
+        return fil
+
+    # Filters to drop one-by-one if Wiza rejects the request
+    DROPPABLE = ["job_title_level", "job_role", "skill", "funding_stage",
+                 "company_size", "revenue", "company_industry", "company_location"]
 
     limit = max(min(params.get("limit", 10), 100), 1)
     list_name = f"salesos-{generate_search_hash(params)[:8]}-{int(datetime.utcnow().timestamp())}"
 
-    body = {
-        "list": {
-            "name": list_name,
-            "max_profiles": limit,
-            "enrichment_level": "partial",
-            "email_options": {
-                "accept_work": True,
-                "accept_personal": False,
-                "accept_generic": False,
+    def make_body(fil: dict) -> dict:
+        return {
+            "list": {
+                "name": list_name,
+                "max_profiles": limit,
+                "enrichment_level": "partial",
+                "email_options": {
+                    "accept_work": True,
+                    "accept_personal": False,
+                    "accept_generic": False,
+                },
+                "skip_duplicates": True,
             },
-            "skip_duplicates": True,
-        },
-        "filters": filters,
-    }
+            "filters": fil,
+        }
 
-    print(f"Wiza create_prospect_list body: {json.dumps(body)}")
+    filters = build_filters(params)
+    print(f"Wiza initial filters: {json.dumps(filters)}")
 
     async with httpx.AsyncClient(timeout=60.0) as client:
 
-        # ---- Step 1: Create prospect list ----
+        # ---- Step 1: Create prospect list (with progressive filter fallback) ----
         create_resp = None
-        for attempt in range(3):
-            create_resp = await client.post(
-                f"{WIZA_BASE}/prospects/create_prospect_list",
-                headers=headers,
-                json=body,
-            )
-            print(f"Wiza create status: {create_resp.status_code}")
-            if create_resp.status_code != 429:
-                break
-            wait = 2 ** attempt
-            print(f"Rate limited — retrying in {wait}s")
-            await asyncio.sleep(wait)
+        for _drop_attempt in range(len(DROPPABLE) + 1):
+            body = make_body(filters)
+            print(f"Wiza create_prospect_list body: {json.dumps(body)}")
 
-        print(f"Wiza create response: {create_resp.text[:400]}")
+            for attempt in range(3):
+                create_resp = await client.post(
+                    f"{WIZA_BASE}/prospects/create_prospect_list",
+                    headers=headers,
+                    json=body,
+                )
+                print(f"Wiza create status: {create_resp.status_code}")
+                if create_resp.status_code != 429:
+                    break
+                wait = 2 ** attempt
+                print(f"Rate limited — retrying in {wait}s")
+                await asyncio.sleep(wait)
 
-        if create_resp.status_code == 429:
-            raise HTTPException(status_code=429, detail="Wiza rate limit reached — please try again in a moment")
-        if create_resp.status_code not in (200, 201):
-            raise HTTPException(
-                status_code=create_resp.status_code,
-                detail=f"Wiza list creation error: {create_resp.text}",
-            )
+            print(f"Wiza create response: {create_resp.text[:500]}")
+
+            if create_resp.status_code == 429:
+                raise HTTPException(status_code=429, detail="Wiza rate limit reached — please try again in a moment")
+
+            if create_resp.status_code in (200, 201):
+                break  # success
+
+            # On error try dropping a filter and retry
+            err_text = create_resp.text.lower()
+            dropped = False
+            for key in DROPPABLE:
+                if key in filters and (key in err_text or "invalid" in err_text or "parameter" in err_text):
+                    print(f"Dropping filter '{key}' and retrying")
+                    del filters[key]
+                    dropped = True
+                    break
+            if not dropped:
+                # Nothing left to drop — bail with the error
+                raise HTTPException(
+                    status_code=create_resp.status_code,
+                    detail=f"Wiza list creation error: {create_resp.text}",
+                )
 
         list_id = create_resp.json().get("data", {}).get("id")
         if not list_id:
