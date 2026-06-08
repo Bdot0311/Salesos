@@ -1,6 +1,6 @@
 """
 Cache-First Lead Generation Proxy
-A FastAPI application that caches Prospeo API results to reduce costs.
+A FastAPI application that caches Wiza API results to reduce costs.
 """
 
 import asyncio
@@ -8,8 +8,6 @@ import hashlib
 import json
 from datetime import datetime
 from typing import Optional
-
-import re
 
 import anthropic
 import httpx
@@ -28,7 +26,7 @@ from sqlalchemy.orm import DeclarativeBase
 
 class Settings(BaseSettings):
     database_url: str
-    prospeo_api_key: str
+    wiza_api_key: str
     anthropic_api_key: Optional[str] = None
 
     class Config:
@@ -46,189 +44,56 @@ class Settings(BaseSettings):
 
 settings = Settings()
 
-PROSPEO_BASE = "https://api.prospeo.io"
+WIZA_BASE = "https://wiza.co/api"
 
 
 # =============================================================================
-# Prospeo Filter Mappings
+# Wiza Filter Mappings
 # =============================================================================
 
-# Our seniority keys -> Prospeo seniority enum values
+# Our seniority keys -> Wiza job_title_level values
 SENIORITY_MAP = {
-    "entry":    "Entry",
-    "training": "Entry",
-    "intern":   "Intern",
-    "junior":   "Entry",
-    "senior":   "Senior",
-    "manager":  "Manager",
-    "head":     "Head",
-    "director": "Director",
-    "partner":  "Partner",
-    "vp":       "Vice President",
-    "c_suite":  "C-Suite",
-    "cxo":      "C-Suite",
-    "owner":    "Founder/Owner",
-    "founder":  "Founder/Owner",
+    "entry":    "entry",
+    "training": "entry",
+    "intern":   "entry",
+    "junior":   "junior",
+    "senior":   "senior",
+    "manager":  "manager",
+    "head":     "manager",
+    "director": "director",
+    "partner":  "director",
+    "vp":       "vp",
+    "c_suite":  "c_suite",
+    "cxo":      "c_suite",
+    "owner":    "owner",
+    "founder":  "owner",
 }
 
-# Our size keys -> Prospeo headcount_range values (one-to-many for broad bands)
-COMPANY_SIZE_MAP: dict[str, list[str]] = {
+# Our size keys -> Wiza company_size values (Wiza uses same range strings)
+COMPANY_SIZE_MAP = {
     "1-10":       ["1-10"],
-    "11-50":      ["11-20", "21-50"],
-    "51-200":     ["51-100", "101-200"],
+    "11-50":      ["11-50"],
+    "51-200":     ["51-200"],
     "201-500":    ["201-500"],
     "501-1000":   ["501-1000"],
-    "1001-5000":  ["1001-2000", "2001-5000"],
+    "1001-5000":  ["1001-5000"],
     "5001-10000": ["5001-10000"],
-    "10001+":     ["10000+"],
+    "10001+":     ["10001+"],
 }
 
-# Common user-typed industry terms -> valid Prospeo company_industry enum values.
-# Prospeo's company_industry filter accepts 256 LinkedIn-standard industry strings
-# (e.g. "Software Development"); free-text like "SaaS" is NOT a valid value, so we
-# normalize here. Anything we can't confidently map is dropped rather than guessed,
-# so an unknown industry broadens the search instead of returning zero results.
-INDUSTRY_MAP: dict[str, str] = {
-    "saas":                         "Software Development",
-    "software":                     "Software Development",
-    "software development":         "Software Development",
-    "b2b software":                 "Software Development",
-    "enterprise software":          "Software Development",
-    "cloud":                        "Software Development",
-    "dev tools":                    "Software Development",
-    "developer tools":              "Software Development",
-    "tech":                         "Technology, Information and Internet",
-    "technology":                   "Technology, Information and Internet",
-    "internet":                     "Technology, Information and Internet",
-    "information technology":       "IT Services and IT Consulting",
-    "it":                           "IT Services and IT Consulting",
-    "it services":                  "IT Services and IT Consulting",
-    "it consulting":                "IT Services and IT Consulting",
-    "consulting":                   "Business Consulting and Services",
-    "business consulting":          "Business Consulting and Services",
-    "management consulting":        "Business Consulting and Services",
-    "fintech":                      "Financial Services",
-    "finance":                      "Financial Services",
-    "financial":                    "Financial Services",
-    "financial services":          "Financial Services",
-    "banking":                      "Banking",
-    "insurance":                    "Insurance",
-    "investment":                   "Investment Management",
-    "venture capital":              "Venture Capital and Private Equity",
-    "private equity":               "Venture Capital and Private Equity",
-    "vc":                           "Venture Capital and Private Equity",
-    "healthcare":                   "Hospitals and Health Care",
-    "health care":                  "Hospitals and Health Care",
-    "health":                       "Hospitals and Health Care",
-    "medical":                      "Medical Practices",
-    "biotech":                      "Biotechnology Research",
-    "biotechnology":                "Biotechnology Research",
-    "pharma":                       "Pharmaceutical Manufacturing",
-    "pharmaceutical":               "Pharmaceutical Manufacturing",
-    "marketing":                    "Advertising Services",
-    "advertising":                  "Advertising Services",
-    "digital marketing":            "Advertising Services",
-    "agency":                       "Advertising Services",
-    "ecommerce":                    "Retail",
-    "e-commerce":                   "Retail",
-    "retail":                       "Retail",
-    "real estate":                  "Real Estate",
-    "proptech":                     "Real Estate",
-    "construction":                 "Construction",
-    "manufacturing":                "Manufacturing",
-    "education":                    "Education",
-    "edtech":                       "E-Learning Providers",
-    "e-learning":                   "E-Learning Providers",
-    "staffing":                     "Staffing and Recruiting",
-    "recruiting":                   "Staffing and Recruiting",
-    "hr":                           "Human Resources Services",
-    "human resources":              "Human Resources Services",
-    "telecom":                      "Telecommunications",
-    "telecommunications":           "Telecommunications",
-    "media":                        "Media Production",
-    "entertainment":                "Entertainment Providers",
-    "hospitality":                  "Hospitality",
-    "travel":                       "Travel Arrangements",
-    "logistics":                    "Transportation, Logistics, Supply Chain and Storage",
-    "supply chain":                 "Transportation, Logistics, Supply Chain and Storage",
-    "transportation":               "Transportation, Logistics, Supply Chain and Storage",
-    "automotive":                   "Motor Vehicle Manufacturing",
-    "energy":                       "Utilities",
-    "renewable energy":             "Renewable Energy Semiconductor Manufacturing",
-    "oil and gas":                  "Oil and Gas",
-    "legal":                        "Legal Services",
-    "law":                          "Legal Services",
-    "nonprofit":                    "Non-profit Organizations",
-    "non-profit":                   "Non-profit Organizations",
-    "gaming":                       "Computer Games",
-    "games":                        "Computer Games",
-    "cybersecurity":                "Computer and Network Security",
-    "security":                     "Computer and Network Security",
-    "ai":                           "Software Development",
-    "artificial intelligence":      "Software Development",
-    "data":                         "Data Infrastructure and Analytics",
-    "analytics":                    "Data Infrastructure and Analytics",
+# Buyer intent -> Wiza funding_stage values
+INTENT_TO_FUNDING = {
+    "Funding":    ["seed", "series_a", "series_b", "series_c", "series_d",
+                   "series_e", "series_f", "angel", "pre_seed"],
+    "IPO":        ["ipo"],
+    "Mergers":    ["private_equity", "post_ipo_equity"],
+    "Investment": ["seed", "series_a", "series_b", "angel"],
 }
 
 
-def normalize_industry(raw: str) -> str | None:
-    """Map a free-text industry term to a valid Prospeo company_industry value.
-
-    Returns the mapped enum string, or None if we can't confidently map it
-    (caller should then drop the industry filter rather than send a bad value).
-    """
-    key = raw.strip().lower()
-    if key in INDUSTRY_MAP:
-        return INDUSTRY_MAP[key]
-    # Try the first comma-separated token (handles "SaaS, fintech" -> "saas")
-    first = key.split(",")[0].strip()
-    if first in INDUSTRY_MAP:
-        return INDUSTRY_MAP[first]
-    return None
-
-
-# Buyer intent news categories supported by Prospeo company_news filter
-VALID_NEWS_CATEGORIES = {
-    "Mergers", "Funding", "Product Launch", "Hiring", "Partnership",
-    "Expansion", "Award", "Leadership Change", "IPO",
-}
-
-# Prospeo department enum values
-VALID_DEPARTMENTS = {
-    "C-Suite", "Consulting", "Design", "Education & Coaching",
-    "Engineering & Technical", "Finance", "Human Resources",
-    "Information Technology", "Legal", "Marketing", "Medical & Health",
-    "Operations", "Product", "Sales",
-}
-
-# Location type detection
-_COUNTRIES = {"united states", "us", "usa", "united kingdom", "uk", "canada",
-              "australia", "germany", "france", "india", "china", "japan",
-              "brazil", "israel", "singapore", "netherlands", "spain", "italy",
-              "sweden", "norway", "denmark", "finland", "mexico", "south korea",
-              "new zealand", "ireland", "switzerland", "austria", "belgium",
-              "portugal", "poland", "czech republic", "ukraine", "russia"}
-_US_STATES = {"alabama", "alaska", "arizona", "arkansas", "california", "colorado",
-              "connecticut", "delaware", "florida", "georgia", "hawaii", "idaho",
-              "illinois", "indiana", "iowa", "kansas", "kentucky", "louisiana",
-              "maine", "maryland", "massachusetts", "michigan", "minnesota",
-              "mississippi", "missouri", "montana", "nebraska", "nevada",
-              "new hampshire", "new jersey", "new mexico", "new york",
-              "north carolina", "north dakota", "ohio", "oklahoma", "oregon",
-              "pennsylvania", "rhode island", "south carolina", "south dakota",
-              "tennessee", "texas", "utah", "vermont", "virginia", "washington",
-              "west virginia", "wisconsin", "wyoming"}
-
-
-def normalize_location(location: str) -> str:
-    """Return canonical location string for Prospeo include/exclude arrays."""
-    loc = location.strip()
-    loc_lower = loc.lower()
-    if loc_lower in ("us", "usa"):
-        return "United States"
-    if loc_lower == "uk":
-        return "United Kingdom"
-    return loc.title() if loc_lower in _US_STATES else loc
+def f(value: str, flag: str = "i") -> dict:
+    """Wiza filter value wrapper — f='i' include, f='e' exclude."""
+    return {"v": value, "f": flag}
 
 
 # =============================================================================
@@ -240,7 +105,6 @@ class Base(DeclarativeBase):
 
 
 class CachedSearch(Base):
-    """Stores search parameters and their hash for quick lookup."""
     __tablename__ = "cached_searches"
 
     search_hash = Column(String(64), primary_key=True)
@@ -268,15 +132,14 @@ async def init_db():
 # =============================================================================
 
 class SearchRequest(BaseModel):
-    # Plain-text ICP query (auto-parsed if no structured filters provided)
     query: Optional[str] = None
 
     # Contact filters
     job_title: Optional[str] = None
     departments: Optional[list[str]] = None
     seniority: Optional[str] = None
-    location: Optional[str] = None          # person location
-    company_location: Optional[str] = None  # company HQ location
+    location: Optional[str] = None
+    company_location: Optional[str] = None
 
     # Company filters
     company: Optional[str] = None
@@ -286,23 +149,21 @@ class SearchRequest(BaseModel):
     technologies: Optional[list[str]] = None
     keywords: Optional[str] = None
 
-    # Buyer intent — news/event categories that signal purchase readiness
-    # Valid values: Mergers, Funding, Product Launch, Hiring, Partnership,
-    #               Expansion, Award, Leadership Change, IPO
+    # Buyer intent — maps to Wiza funding signals
+    # Values: Funding, IPO, Mergers, Investment
     intent_topics: Optional[list[str]] = None
-    # How far back to look for intent events (60, 90, 180, or 365 days)
-    intent_days: int = 90
 
     # Revenue range (USD)
     revenue_min: Optional[int] = None
     revenue_max: Optional[int] = None
 
     # Career change signal
-    job_change_days: Optional[int] = None   # e.g. 90 — contacts who changed jobs in last N days
+    job_change_days: Optional[int] = None
 
-    # Legacy signals field (mapped to job_change_days if present)
+    # Legacy fields for backwards compatibility
     signals: Optional[list[str]] = None
     signals_since_days: int = 90
+    intent_days: int = 90
 
     limit: int = 10
 
@@ -314,7 +175,7 @@ class SearchRequest(BaseModel):
             return ", ".join(str(x) for x in v) if v else None
         return v
 
-    @field_validator("technologies", "departments", "intent_topics", mode="before")
+    @field_validator("technologies", "departments", "intent_topics", "signals", mode="before")
     @classmethod
     def coerce_list(cls, v):
         if isinstance(v, str):
@@ -340,57 +201,41 @@ class SearchResponse(BaseModel):
 # Transform
 # =============================================================================
 
-def transform_prospeo_contact(record: dict, search_params: dict = None) -> dict:
-    """Transform a Prospeo enriched record into the internal lead format."""
+def transform_wiza_contact(contact: dict, search_params: dict = None) -> dict:
+    """Transform a Wiza contact object to the internal lead format."""
     search_params = search_params or {}
 
-    person = record.get("person", record)
-    company = record.get("company", {})
+    emails = contact.get("emails") or []
+    primary_email = (
+        next((e["email"] for e in emails if e.get("type") == "work"), None)
+        or (emails[0]["email"] if emails else None)
+        or contact.get("email")
+    )
 
-    email_obj = person.get("email") or {}
-    email = email_obj.get("email") if isinstance(email_obj, dict) else email_obj
-
-    mobile_obj = person.get("mobile") or {}
-    mobile = mobile_obj.get("mobile") if isinstance(mobile_obj, dict) else mobile_obj
-
-    loc = person.get("location") or {}
-
-    # Pull the current job title from job_history if top-level missing
-    job_title = person.get("current_job_title")
-    if not job_title:
-        for job in (person.get("job_history") or []):
-            if job.get("current"):
-                job_title = job.get("title")
-                break
-
-    # Funding / buyer intent context
-    funding = company.get("funding") or {}
-    news = record.get("news") or []
+    phones = contact.get("phones") or []
+    primary_phone = (
+        phones[0].get("pretty_number") or phones[0].get("number")
+        if phones else contact.get("mobile_phone") or contact.get("phone_number")
+    )
 
     return {
-        "contact_name": person.get("full_name"),
-        "first_name": person.get("first_name"),
-        "last_name": person.get("last_name"),
-        "job_title": job_title,
-        "linkedin_url": person.get("linkedin_url"),
-        "business_email": email,
-        "email_status": email_obj.get("status") if isinstance(email_obj, dict) else None,
-        "phone": mobile,
-        "location_city": loc.get("city"),
-        "location_state": loc.get("state"),
-        "location_country": loc.get("country"),
-        "company_name": company.get("name"),
-        "company_domain": company.get("domain") or company.get("website"),
-        "company_linkedin_url": company.get("linkedin_url"),
-        "industry": company.get("industry") or search_params.get("industry"),
-        "company_size": company.get("employee_range") or search_params.get("company_size"),
-        "company_revenue_range": company.get("revenue_range"),
+        "contact_name": contact.get("full_name"),
+        "first_name": contact.get("first_name"),
+        "last_name": contact.get("last_name"),
+        "job_title": contact.get("title"),
+        "linkedin_url": contact.get("linkedin"),
+        "business_email": primary_email,
+        "email_status": contact.get("email_status"),
+        "phone": primary_phone,
+        "location": contact.get("location"),
+        "company_name": contact.get("name"),
+        "company_domain": contact.get("domain"),
+        "industry": contact.get("industry") or search_params.get("industry"),
+        "company_size": contact.get("size") or search_params.get("company_size"),
+        "company_revenue": contact.get("revenue"),
+        "company_funding": contact.get("funding"),
         "technologies": search_params.get("technologies"),
-        "funding_stage": funding.get("last_funding_type"),
-        "funding_total": funding.get("total_funding_amount"),
-        "intent_signals": news or None,
-        "skills": person.get("skills"),
-        "raw_data": record,
+        "raw_data": contact,
     }
 
 
@@ -399,44 +244,17 @@ def generate_search_hash(params: dict) -> str:
 
 
 # =============================================================================
-# Prospeo Two-Step Workflow: Search → Enrich
+# Wiza Workflow: Create List → Poll → Fetch Contacts
 # =============================================================================
 
-async def resolve_location(raw: str, headers: dict, client: httpx.AsyncClient) -> str | None:
+async def fetch_from_wiza(params: dict) -> list:
     """
-    Call Prospeo Search Suggestions to get a valid location string.
-    Returns the best match or None if unresolvable.
+    Wiza three-step workflow:
+      1. POST /prospects/create_prospect_list  — create enrichment job with filters
+      2. GET  /lists/{id}                      — poll until finished_at is set
+      3. GET  /lists/{id}/contacts             — fetch enriched contacts
     """
-    try:
-        r = await client.post(
-            f"{PROSPEO_BASE}/search-suggestions",
-            headers=headers,
-            json={"location_search": raw},
-        )
-        if r.status_code == 200:
-            suggestions = r.json().get("location_suggestions") or []
-            if suggestions:
-                best = suggestions[0]["name"]
-                print(f"Resolved location '{raw}' → '{best}'")
-                return best
-    except Exception as e:
-        print(f"Location suggestion failed for '{raw}': {e}")
-    return None
-
-
-
-
-async def fetch_from_prospeo(params: dict) -> list:
-    """
-    Two-step Prospeo workflow:
-      1. POST /search-person  — find contacts with buyer intent + standard filters
-      2. POST /enrich-person  — enrich each result by person_id (concurrent)
-
-    Locations and job titles are resolved via the Suggestions API first so
-    that any free-text input produces valid Prospeo filter values.
-    Industry has no suggestions endpoint — it is passed as a keyword instead.
-    """
-    # Map legacy signals list to job_change_days
+    # Map legacy signals to job_change_days
     if params.get("signals") and not params.get("job_change_days"):
         if any(s in ("job_change", "promotion", "companyChange") for s in params["signals"]):
             params["job_change_days"] = params.get("signals_since_days", 90)
@@ -450,186 +268,177 @@ async def fetch_from_prospeo(params: dict) -> list:
         raise HTTPException(status_code=400, detail="At least one search parameter required")
 
     headers = {
-        "X-KEY": settings.prospeo_api_key,
+        "Authorization": f"Bearer {settings.wiza_api_key}",
         "Content-Type": "application/json",
     }
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    # ------------------------------------------------------------------
+    # Build filters
+    # ------------------------------------------------------------------
+    filters: dict = {}
 
-        # ------------------------------------------------------------------
-        # Resolve location and job title via Suggestions API before building
-        # filters — this guarantees valid strings for any user input
-        # ------------------------------------------------------------------
-        resolved_location: str | None = None
-        if params.get("location"):
-            resolved_location = await resolve_location(params["location"], headers, client)
+    if params.get("job_title"):
+        filters["job_title"] = [f(params["job_title"])]
 
-        resolved_company_location: str | None = None
-        if params.get("company_location"):
-            resolved_company_location = await resolve_location(params["company_location"], headers, client)
+    if params.get("seniority"):
+        level = SENIORITY_MAP.get(params["seniority"].lower())
+        if level:
+            filters["job_title_level"] = [level]
 
-        # ------------------------------------------------------------------
-        # Build search filters
-        # ------------------------------------------------------------------
-        filters: dict = {}
+    if params.get("departments"):
+        filters["job_role"] = [f(d) for d in params["departments"]]
 
-        # Job title — pass raw, Prospeo accepts free text here
-        if params.get("job_title"):
-            filters["person_job_title"] = {"include": [params["job_title"]]}
+    if params.get("location"):
+        filters["location"] = [f(params["location"])]
 
-        # Department
-        if params.get("departments"):
-            valid_depts = [d for d in params["departments"] if d in VALID_DEPARTMENTS]
-            if valid_depts:
-                filters["person_department"] = {"include": valid_depts}
+    if params.get("company_location"):
+        filters["company_location"] = [f(params["company_location"])]
 
-        # Seniority
-        if params.get("seniority"):
-            level = SENIORITY_MAP.get(params["seniority"].lower())
-            if level:
-                filters["person_seniority"] = {"include": [level]}
+    if params.get("company"):
+        filters["job_company"] = [f(params["company"])]
 
-        # Person location — use resolved suggestion; skip if unresolvable
-        if resolved_location:
-            filters["person_location_search"] = {"include": [resolved_location]}
-        elif params.get("location"):
-            print(f"WARNING: Could not resolve location '{params['location']}' — skipping location filter")
+    if params.get("industry"):
+        filters["company_industry"] = [f(params["industry"])]
 
-        # Company HQ location
-        if resolved_company_location:
-            filters["company_location_search"] = {"include": [resolved_company_location]}
+    if params.get("company_size"):
+        sizes = COMPANY_SIZE_MAP.get(params["company_size"], [])
+        if sizes:
+            filters["company_size"] = sizes
 
-        # Company name / domain
-        if params.get("company") or params.get("company_domain"):
-            company_filter: dict = {}
-            if params.get("company"):
-                company_filter["names"] = {"include": [params["company"]]}
-            if params.get("company_domain"):
-                company_filter["websites"] = {"include": [params["company_domain"]]}
-            filters["company"] = company_filter
+    if params.get("technologies"):
+        filters["skill"] = [f(t) for t in params["technologies"]]
 
-        # Industry — map to Prospeo's dedicated company_industry filter.
-        # Previously this was jammed into person_name_or_job_title, which forced
-        # the person's NAME or JOB TITLE to contain the industry term (e.g. "SaaS")
-        # — an almost-impossible match that silently zeroed out nearly every search.
-        # We now normalize to a valid enum value; if it can't be mapped, we drop it
-        # (broadens the search) rather than poison it.
-        if params.get("industry"):
-            mapped = normalize_industry(params["industry"])
-            if mapped:
-                filters["company_industry"] = {"include": [mapped]}
-                print(f"Industry '{params['industry']}' -> company_industry '{mapped}'")
-            else:
-                print(f"WARNING: Could not map industry '{params['industry']}' to a Prospeo "
-                      f"value — skipping industry filter to keep recall")
+    if params.get("keywords"):
+        # Wiza doesn't have a generic keyword field — apply to job title search
+        existing = filters.get("job_title", [])
+        filters["job_title"] = existing + [f(params["keywords"])]
 
-        # Keywords — explicit free-text terms still go to person_name_or_job_title.
-        # (Industry no longer leaks in here.)
-        if params.get("keywords"):
-            filters["person_name_or_job_title"] = params["keywords"]
+    # Buyer intent via funding signals
+    if params.get("intent_topics"):
+        funding_stages = []
+        for topic in params["intent_topics"]:
+            funding_stages.extend(INTENT_TO_FUNDING.get(topic, []))
+        if funding_stages:
+            filters["funding_stage"] = list(set(funding_stages))
 
-        # Company headcount
-        if params.get("company_size"):
-            ranges = COMPANY_SIZE_MAP.get(params["company_size"], [])
-            if ranges:
-                filters["company_headcount_range"] = {"include": ranges}
+    # Revenue range
+    if params.get("revenue_min"):
+        filters["revenue"] = filters.get("revenue", {})
+        filters["revenue"]["min"] = params["revenue_min"]
+    if params.get("revenue_max"):
+        filters["revenue"] = filters.get("revenue", {})
+        filters["revenue"]["max"] = params["revenue_max"]
 
-        # Technologies
-        if params.get("technologies"):
-            filters["company_technology"] = {"include": params["technologies"][:20]}
+    limit = max(min(params.get("limit", 10), 100), 1)
+    list_name = f"salesos-{generate_search_hash(params)[:8]}-{int(datetime.utcnow().timestamp())}"
 
-        # Buyer Intent
-        if params.get("intent_topics"):
-            valid_cats = [t for t in params["intent_topics"] if t in VALID_NEWS_CATEGORIES]
-            if valid_cats:
-                days = params.get("intent_days", 90)
-                if days not in (60, 90, 180, 365):
-                    days = 90
-                filters["company_news"] = {"categories": {"include": valid_cats}, "days": days}
+    body = {
+        "list": {
+            "name": list_name,
+            "max_profiles": limit,
+            "enrichment_level": "partial",
+            "email_options": {
+                "accept_work": True,
+                "accept_personal": False,
+                "accept_generic": False,
+            },
+            "skip_duplicates": True,
+        },
+        "filters": filters,
+    }
 
-        # Career signal
-        if params.get("job_change_days"):
-            filters["person_job_change"] = {"days": params["job_change_days"]}
+    print(f"Wiza create_prospect_list body: {json.dumps(body)}")
 
-        search_body = {"filters": filters, "page": 1}
-        print(f"Prospeo search body: {json.dumps(search_body)}")
+    async with httpx.AsyncClient(timeout=60.0) as client:
 
-        # ---- Step 1: Search ----
-        search_resp = None
+        # ---- Step 1: Create prospect list ----
+        create_resp = None
         for attempt in range(3):
-            search_resp = await client.post(
-                f"{PROSPEO_BASE}/search-person",
+            create_resp = await client.post(
+                f"{WIZA_BASE}/prospects/create_prospect_list",
                 headers=headers,
-                json=search_body,
+                json=body,
             )
-            print(f"Prospeo search status: {search_resp.status_code}")
-            if search_resp.status_code != 429:
+            print(f"Wiza create status: {create_resp.status_code}")
+            if create_resp.status_code != 429:
                 break
             wait = 2 ** attempt
-            print(f"Rate limited — retrying in {wait}s (attempt {attempt + 1}/3)")
+            print(f"Rate limited — retrying in {wait}s")
             await asyncio.sleep(wait)
 
-        print(f"Prospeo search response: {search_resp.text[:400]}")
+        print(f"Wiza create response: {create_resp.text[:400]}")
 
-        if search_resp.status_code == 429:
-            raise HTTPException(status_code=429, detail="Prospeo rate limit reached — please try again in a moment")
-        if search_resp.status_code not in (200, 201):
-            body = search_resp.json() if search_resp.text else {}
-            # NO_RESULTS is not an error — just means 0 matches
-            if body.get("error_code") == "NO_RESULTS":
-                return []
+        if create_resp.status_code == 429:
+            raise HTTPException(status_code=429, detail="Wiza rate limit reached — please try again in a moment")
+        if create_resp.status_code not in (200, 201):
             raise HTTPException(
-                status_code=search_resp.status_code,
-                detail=f"Prospeo search error: {search_resp.text}",
+                status_code=create_resp.status_code,
+                detail=f"Wiza list creation error: {create_resp.text}",
             )
 
-        search_data = search_resp.json()
-        if search_data.get("error"):
+        list_id = create_resp.json().get("data", {}).get("id")
+        if not list_id:
+            print("Wiza returned no list ID")
             return []
 
-        results = search_data.get("results", [])
-        print(f"Prospeo search returned {len(results)} results")
+        print(f"Wiza list created: id={list_id}")
 
-        if not results:
-            return []
+        # ---- Step 2: Poll until finished ----
+        max_polls = 30
+        poll_delay = 5.0
 
-        # Trim to requested limit before enriching (costs credits per enrich)
-        limit = min(params.get("limit", 10), len(results))
-        results = results[:limit]
+        for poll_num in range(max_polls):
+            await asyncio.sleep(poll_delay)
 
-        # ---- Step 2: Enrich each person concurrently ----
-        async def enrich_one(person_record: dict) -> dict | None:
-            person = person_record.get("person", {})
-            person_id = person.get("person_id")
-            if not person_id:
-                return person_record  # return search data as-is if no ID
+            poll_resp = await client.get(
+                f"{WIZA_BASE}/lists/{list_id}",
+                headers=headers,
+            )
+            print(f"Wiza poll #{poll_num + 1} status: {poll_resp.status_code}")
 
-            for attempt in range(3):
-                r = await client.post(
-                    f"{PROSPEO_BASE}/enrich-person",
-                    headers=headers,
-                    json={"data": {"person_id": person_id}},
-                )
-                print(f"Prospeo enrich status ({person_id}): {r.status_code}")
-                if r.status_code == 429:
-                    wait = 2 ** attempt
-                    print(f"Rate limited on enrich — retrying in {wait}s")
-                    await asyncio.sleep(wait)
-                    continue
-                if r.status_code in (200, 201):
-                    enriched = r.json()
-                    if not enriched.get("error"):
-                        # Merge company data from search result into enriched record
-                        if "company" not in enriched and "company" in person_record:
-                            enriched["company"] = person_record["company"]
-                        return enriched
+            if poll_resp.status_code not in (200, 201):
+                print(f"Wiza poll error: {poll_resp.text[:200]}")
                 break
-            # Enrichment failed — fall back to search-only record
-            return person_record
 
-        # Run all enrichments concurrently (Prospeo is synchronous, no polling needed)
-        enriched_results = await asyncio.gather(*[enrich_one(r) for r in results])
-        return [r for r in enriched_results if r is not None]
+            list_data = poll_resp.json().get("data", {})
+            finished_at = list_data.get("finished_at")
+            list_status = list_data.get("status", "")
+
+            print(f"Wiza list status: {list_status}, finished_at: {finished_at}")
+
+            if finished_at or list_status in ("complete", "finished", "done"):
+                print(f"Wiza list finished after {poll_num + 1} poll(s)")
+                break
+
+            if list_status in ("failed", "error"):
+                print(f"Wiza list failed: {list_data}")
+                return []
+
+            poll_delay = min(poll_delay * 1.2, 15.0)
+
+        # ---- Step 3: Fetch contacts ----
+        contacts_resp = await client.get(
+            f"{WIZA_BASE}/lists/{list_id}/contacts",
+            headers=headers,
+            params={"segment": "valid"},
+        )
+        print(f"Wiza contacts status: {contacts_resp.status_code}")
+        print(f"Wiza contacts response: {contacts_resp.text[:400]}")
+
+        if contacts_resp.status_code not in (200, 201):
+            # Try fetching all contacts if "valid" segment returns nothing
+            contacts_resp = await client.get(
+                f"{WIZA_BASE}/lists/{list_id}/contacts",
+                headers=headers,
+                params={"segment": "people"},
+            )
+
+        if contacts_resp.status_code not in (200, 201):
+            return []
+
+        contacts = contacts_resp.json().get("data", [])
+        print(f"Wiza returned {len(contacts)} contacts")
+        return contacts
 
 
 # =============================================================================
@@ -638,8 +447,8 @@ async def fetch_from_prospeo(params: dict) -> list:
 
 app = FastAPI(
     title="Cache-First Lead Generation Proxy",
-    description="Proxy that caches Prospeo API results to reduce costs",
-    version="5.0.0"
+    description="Proxy that caches Wiza API results to reduce costs",
+    version="6.0.0"
 )
 
 app.add_middleware(
@@ -657,7 +466,7 @@ async def startup():
         await init_db()
     except Exception as e:
         print(f"WARNING: Database initialization failed: {e}")
-        print("App will continue starting — DB will be retried on first request.")
+        print("App will continue — DB retried on first request.")
 
 
 @app.get("/health")
@@ -671,42 +480,32 @@ async def health_check():
 
 @app.post("/parse-icp")
 async def parse_icp(request: ICPParseRequest):
-    """
-    Parse a plain-English ICP description into structured Prospeo search filters.
-
-    Example input:
-      "CTOs at fintech startups using Salesforce, 50-200 employees in NYC,
-       companies that recently got funding or had a leadership change"
-
-    Returns structured filters ready to pass directly into POST /search.
-    """
+    """Parse a plain-English ICP description into structured Wiza search filters."""
     if not settings.anthropic_api_key:
-        # No LLM available — return the raw text as a keyword fallback
         return {"success": True, "filters": {"keywords": request.text}}
 
     client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
 
-    prompt = f"""You are an ICP (Ideal Customer Profile) parser for a B2B lead generation platform powered by Prospeo.
+    prompt = f"""You are an ICP (Ideal Customer Profile) parser for a B2B lead generation platform powered by Wiza.
 
-Parse the following description into structured search filters. Return ONLY valid JSON with these fields (omit fields not mentioned or not clearly implied):
+Parse the following description into structured search filters. Return ONLY valid JSON (omit fields not mentioned):
 
 {{
   "job_title": "string — e.g. CTO, VP of Sales",
-  "departments": ["array — valid values: C-Suite, Consulting, Design, Education & Coaching, Engineering & Technical, Finance, Human Resources, Information Technology, Legal, Marketing, Medical & Health, Operations, Product, Sales"],
-  "seniority": "one of: entry, intern, junior, senior, head, manager, director, partner, vp, c_suite, owner, founder",
-  "location": "person's city, state, or country e.g. San Francisco",
-  "company_location": "company HQ city, state, or country",
+  "departments": ["array — e.g. Engineering, Sales, Marketing, Finance, Product, HR, Legal, Operations"],
+  "seniority": "one of: entry, junior, senior, manager, director, vp, c_suite, owner, founder",
+  "location": "city, state, or country — e.g. New York, California, United States",
+  "company_location": "company HQ location",
   "company": "specific company name if mentioned",
-  "company_domain": "company website domain e.g. acme.com",
+  "company_domain": "company domain e.g. acme.com",
   "company_size": "one of: 1-10, 11-50, 51-200, 201-500, 501-1000, 1001-5000, 5001-10000, 10001+",
   "industry": "industry string e.g. Software Development, Financial Services, Healthcare",
   "technologies": ["tech stack strings e.g. Salesforce, HubSpot, AWS"],
-  "keywords": "additional free-text search terms",
-  "intent_topics": ["buyer intent categories — only from: Mergers, Funding, Product Launch, Hiring, Partnership, Expansion, Award, Leadership Change, IPO"],
-  "intent_days": integer — one of 60, 90, 180, 365 (lookback window for intent events),
+  "keywords": "additional search terms",
+  "intent_topics": ["buyer intent — only from: Funding, IPO, Mergers, Investment"],
   "revenue_min": integer in USD,
   "revenue_max": integer in USD,
-  "job_change_days": integer — e.g. 90, if recently changed jobs is mentioned
+  "job_change_days": integer e.g. 90 if recently changed jobs is mentioned
 }}
 
 ICP Description: {request.text}
@@ -736,81 +535,71 @@ Return only the JSON object, no explanation, no markdown fences."""
 @app.post("/search", response_model=SearchResponse)
 async def search_leads(request: SearchRequest):
     """
-    Cache-first lead search with buyer intent.
+    Cache-first lead search powered by Wiza.
 
     Flow:
     1. Check DB cache — return immediately if found
-    2. Cache miss:
-       a. POST /search-person (with company_news intent filter + standard filters)
-       b. POST /enrich-person for each result concurrently (gets verified email + mobile)
-    3. Cache raw enriched results
-    4. Return transformed leads
+    2. Cache miss → Wiza 3-step: create list → poll → fetch contacts
+    3. Cache and return results
     """
     params = {k: v for k, v in request.model_dump().items() if v is not None and v != "" and v != []}
+    print(f"=== SEARCH REQUEST ===\nFiltered params: {params}")
 
-    print(f"=== SEARCH REQUEST ===")
-    print(f"Filtered params: {params}")
-
-    # Auto-parse plain-text query into structured filters
     structured_fields = {
         "job_title", "departments", "seniority", "location", "company_location",
         "company", "company_domain", "company_size", "industry", "technologies",
         "keywords", "intent_topics", "revenue_min", "revenue_max", "job_change_days",
     }
+
     raw_query = params.pop("query", None)
     if raw_query and not any(params.get(f) for f in structured_fields):
         parsed_filters: dict = {}
-
         if settings.anthropic_api_key:
             try:
-                print(f"Auto-parsing query via ICP parser: {raw_query}")
+                print(f"Auto-parsing query: {raw_query}")
                 icp_result = await parse_icp(ICPParseRequest(text=raw_query))
                 parsed_filters = icp_result.get("filters", {})
                 print(f"ICP parser returned: {parsed_filters}")
             except Exception as e:
                 print(f"WARNING: ICP parser failed ({e}) — falling back to keyword search")
 
-        # Merge parsed filters into params
         for k, v in parsed_filters.items():
             if v is not None and v != "" and v != []:
                 params[k] = v
 
-        # If parsing produced nothing useful, use the raw query as a keyword search
         if not any(params.get(f) for f in structured_fields):
-            print(f"ICP parse yielded no filters — using raw query as keyword search")
+            print("ICP parse yielded no filters — using raw query as keyword search")
             params["keywords"] = raw_query
 
-        print(f"Final params after query resolution: {params}")
+        print(f"Final params: {params}")
 
     search_hash = generate_search_hash(params)
     print(f"Search hash: {search_hash}")
 
     async with async_session() as session:
         stmt = select(CachedSearch).where(CachedSearch.search_hash == search_hash)
-        result = await session.execute(stmt)
-        cached = result.scalar_one_or_none()
+        cached = (await session.execute(stmt)).scalar_one_or_none()
 
         if cached:
             print(f"Cache HIT for hash: {search_hash}")
             data = json.loads(cached.results)
-            leads = [transform_prospeo_contact(r, params) for r in data]
+            leads = [transform_wiza_contact(r, params) for r in data]
             return SearchResponse(
                 success=True, source="cache", from_cache=True,
                 count=len(leads), total=len(leads), leads=leads, data=data,
             )
 
-        print(f"Cache MISS — calling Prospeo with params: {params}")
-        raw_results = await fetch_from_prospeo(params)
-        print(f"Prospeo returned {len(raw_results)} enriched leads")
+        print(f"Cache MISS — calling Wiza")
+        raw_results = await fetch_from_wiza(params)
+        print(f"Wiza returned {len(raw_results)} leads")
 
-        leads = [transform_prospeo_contact(r, params) for r in raw_results]
+        leads = [transform_wiza_contact(r, params) for r in raw_results]
 
-        new_cache = CachedSearch(
+        session.add(CachedSearch(
             search_hash=search_hash,
             search_params=json.dumps(params),
             results=json.dumps(raw_results),
-        )
-        session.add(new_cache)
+        ))
         await session.commit()
 
         return SearchResponse(
@@ -834,14 +623,11 @@ async def clear_cache():
 @app.delete("/cache/empty")
 async def clear_empty_cache():
     async with async_session() as session:
-        stmt = select(CachedSearch)
-        result = await session.execute(stmt)
-        all_cached = result.scalars().all()
-        deleted = 0
-        for cached in all_cached:
-            if len(json.loads(cached.results)) == 0:
-                await session.delete(cached)
-                deleted += 1
+        all_cached = (await session.execute(select(CachedSearch))).scalars().all()
+        deleted = sum(1 for c in all_cached if len(json.loads(c.results)) == 0)
+        for c in all_cached:
+            if len(json.loads(c.results)) == 0:
+                await session.delete(c)
         await session.commit()
     return {"message": f"Cleared {deleted} empty cached searches"}
 
@@ -854,7 +640,6 @@ async def cache_stats():
         recent = (await session.execute(
             select(CachedSearch).order_by(desc(CachedSearch.created_at)).limit(10)
         )).scalars().all()
-
         return {
             "cached_searches": count,
             "recent_searches": [
@@ -871,23 +656,21 @@ async def cache_stats():
 
 @app.get("/cache/all")
 async def get_all_cached_leads():
-    """Retrieve all cached leads (fallback when Prospeo credits are exhausted)."""
+    """Retrieve all cached leads (fallback when Wiza credits are exhausted)."""
     async with async_session() as session:
-        stmt = select(CachedSearch).order_by(CachedSearch.created_at.desc())
-        all_cached = (await session.execute(stmt)).scalars().all()
+        all_cached = (await session.execute(
+            select(CachedSearch).order_by(CachedSearch.created_at.desc())
+        )).scalars().all()
 
-        all_leads = []
-        seen = set()
-
+        all_leads, seen = [], set()
         for cached in all_cached:
             data = json.loads(cached.results)
             search_params = json.loads(cached.search_params)
-            for record in data:
-                person = record.get("person", record)
-                key = f"{person.get('full_name', '')}-{record.get('company', {}).get('name', '')}"
+            for contact in data:
+                key = f"{contact.get('full_name', '')}-{contact.get('name', '')}"
                 if key not in seen:
                     seen.add(key)
-                    all_leads.append(transform_prospeo_contact(record, search_params))
+                    all_leads.append(transform_wiza_contact(contact, search_params))
 
         return {
             "success": True, "from_cache": True,
@@ -899,15 +682,15 @@ async def get_all_cached_leads():
 @app.get("/cache/search/{search_hash}")
 async def get_cached_search(search_hash: str):
     async with async_session() as session:
-        stmt = select(CachedSearch).where(CachedSearch.search_hash == search_hash)
-        cached = (await session.execute(stmt)).scalar_one_or_none()
+        cached = (await session.execute(
+            select(CachedSearch).where(CachedSearch.search_hash == search_hash)
+        )).scalar_one_or_none()
         if not cached:
             raise HTTPException(status_code=404, detail="Cached search not found")
 
         data = json.loads(cached.results)
         search_params = json.loads(cached.search_params)
-        leads = [transform_prospeo_contact(r, search_params) for r in data]
-
+        leads = [transform_wiza_contact(r, search_params) for r in data]
         return {
             "success": True, "from_cache": True,
             "search_params": search_params,
@@ -921,17 +704,19 @@ async def get_cached_search(search_hash: str):
 async def debug_info():
     async with async_session() as session:
         all_cached = (await session.execute(select(CachedSearch))).scalars().all()
-        searches = []
-        for cached in all_cached:
-            results = json.loads(cached.results)
-            searches.append({
-                "hash": cached.search_hash,
-                "params": json.loads(cached.search_params),
-                "result_count": len(results),
-                "sample_lead": results[0] if results else None,
-                "created_at": cached.created_at.isoformat() if cached.created_at else None,
-            })
-    return {"total_cached_searches": len(searches), "searches": searches}
+        return {
+            "total_cached_searches": len(all_cached),
+            "searches": [
+                {
+                    "hash": c.search_hash,
+                    "params": json.loads(c.search_params),
+                    "result_count": len(json.loads(c.results)),
+                    "sample_lead": json.loads(c.results)[0] if json.loads(c.results) else None,
+                    "created_at": c.created_at.isoformat() if c.created_at else None,
+                }
+                for c in all_cached
+            ],
+        }
 
 
 # =============================================================================
