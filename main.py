@@ -160,6 +160,20 @@ def looks_like_domain(value: str) -> bool:
     return bool(_DOMAIN_RE.match(host))
 
 
+def find_domain_in_text(text: str) -> Optional[str]:
+    """Return the first bare domain found in free text, else None.
+
+    Lets a query like "people who work at workflows.io" route to a company
+    filter even when the ICP parser is unavailable (e.g. no LLM credits),
+    instead of degrading to a keyword/job-title search that never matches.
+    """
+    for token in re.split(r"[\s,;]+", text.strip()):
+        t = token.strip(".,;:!?()[]\"'")
+        if looks_like_domain(t):
+            return t
+    return None
+
+
 def company_name_from_domain(value: str) -> str:
     """Best-effort company-name token from a domain.
 
@@ -1117,8 +1131,18 @@ async def resolve_search_params(request: SearchRequest) -> dict:
                 params[k] = v
 
         if not any(params.get(f) for f in STRUCTURED_FIELDS):
-            print("ICP parse yielded no filters — using raw query as keyword search")
-            params["keywords"] = raw_query
+            # Parser gave us nothing (often because it's offline). A bare domain
+            # in the query is unambiguous — route it to company_domain (which
+            # build_wiza_filters turns into a job_company match) rather than
+            # dumping the whole query into keywords -> job_title, which rarely
+            # matches anything.
+            domain = find_domain_in_text(raw_query)
+            if domain:
+                print(f"ICP parse yielded no filters — routing domain '{domain}' to company_domain")
+                params["company_domain"] = domain
+            else:
+                print("ICP parse yielded no filters — using raw query as keyword search")
+                params["keywords"] = raw_query
 
         print(f"Final params: {params}")
 
