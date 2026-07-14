@@ -352,8 +352,87 @@ def transform_wiza_contact(contact: dict, search_params: dict = None) -> dict:
     }
 
 
+def transform_reveal_contact(contact: dict) -> dict:
+    """Transform a Wiza *individual_reveal* response into the internal lead format.
+
+    The reveal endpoint's schema differs from the list-contacts schema handled by
+    transform_wiza_contact:
+
+      * the person's name is in `name` (there are no first_name/last_name fields),
+        whereas list contacts put the *company* name in `name`;
+      * the company name is in `company`;
+      * the LinkedIn URL is in `linkedin_profile_url`;
+      * emails carry `email_type` rather than `type`.
+
+    Passing a reveal object through transform_wiza_contact therefore drops
+    first/last name and swaps the person's name into company_name. Reveals get
+    their own transform to map every field to the right place.
+    """
+    full_name = contact.get("name") or contact.get("full_name")
+    first_name = contact.get("first_name")
+    last_name = contact.get("last_name")
+    # The reveal schema has no first/last name — derive them from the full name.
+    if full_name and not (first_name or last_name):
+        parts = full_name.split()
+        if len(parts) >= 2:
+            first_name, last_name = parts[0], " ".join(parts[1:])
+        elif parts:
+            first_name = parts[0]
+
+    emails = contact.get("emails") or []
+    primary_email = (
+        next((e.get("email") for e in emails
+              if e.get("email_type") == "work" or e.get("type") == "work"), None)
+        or (emails[0].get("email") if emails else None)
+        or contact.get("email")
+    )
+
+    phones = contact.get("phones") or []
+    primary_phone = (
+        (phones[0].get("pretty_number") or phones[0].get("number")) if phones
+        else contact.get("mobile_phone") or contact.get("phone_number") or contact.get("phone")
+    )
+
+    return {
+        "contact_name": full_name,
+        "first_name": first_name,
+        "last_name": last_name,
+        "job_title": contact.get("title"),
+        "linkedin_url": contact.get("linkedin_profile_url") or contact.get("linkedin"),
+        "business_email": primary_email,
+        "email_status": contact.get("email_status"),
+        "phone": primary_phone,
+        "location": contact.get("location"),
+        "company_name": contact.get("company") or contact.get("company_name"),
+        "company_domain": contact.get("domain") or contact.get("company_domain"),
+        "industry": contact.get("industry"),
+        "company_size": contact.get("company_size") or contact.get("size"),
+        "company_revenue": contact.get("revenue"),
+        "company_funding": contact.get("funding"),
+        "technologies": None,
+        "raw_data": contact,
+    }
+
+
 def generate_search_hash(params: dict) -> str:
     return hashlib.sha256(json.dumps(params, sort_keys=True).encode()).hexdigest()
+
+
+def extract_json_object(text: str) -> dict:
+    """Best-effort parse of a JSON object from an LLM response.
+
+    Models sometimes wrap JSON in ```json fences or add a line of prose despite
+    being told not to. Try a straight parse first, then fall back to slicing the
+    outermost {...} span. Raises json.JSONDecodeError if no object can be found.
+    """
+    s = text.strip()
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        start, end = s.find("{"), s.rfind("}")
+        if start != -1 and end > start:
+            return json.loads(s[start:end + 1])
+        raise
 
 
 # =============================================================================
@@ -876,7 +955,7 @@ async def enrich_lead(request: EnrichRequest):
                 return {
                     "success": True,
                     "enrichment_status": "complete" if data.get("status") != "failed" else "failed",
-                    "lead": transform_wiza_contact(contact),
+                    "lead": transform_reveal_contact(contact),
                 }
 
         raise HTTPException(status_code=504, detail="Wiza enrichment timed out")
@@ -888,7 +967,7 @@ async def parse_icp(request: ICPParseRequest):
     if not settings.anthropic_api_key:
         return {"success": True, "filters": {"keywords": request.text}}
 
-    client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+    client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
 
     prompt = f"""You are an ICP (Ideal Customer Profile) parser for a B2B lead generation platform powered by Wiza.
 
@@ -916,18 +995,25 @@ ICP Description: {request.text}
 
 Return only the JSON object, no explanation, no markdown fences."""
 
-    message = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=1024,
-        messages=[{"role": "user", "content": prompt}],
-    )
-
-    raw = message.content[0].text.strip()
-
     try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=500, detail=f"ICP parser returned invalid JSON: {raw}")
+        message = await client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=1024,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = "".join(
+            block.text for block in message.content
+            if getattr(block, "type", None) == "text"
+        ).strip()
+        parsed = extract_json_object(raw)
+    except anthropic.APIError as e:
+        # Upstream model/API failure (auth, model not found, overload, rate limit).
+        # Degrade to a keyword search instead of 500-ing so callers keep working.
+        print(f"ICP parser: Anthropic API error — falling back to keyword search ({e})")
+        return {"success": True, "filters": {"keywords": request.text}, "fallback": True}
+    except (json.JSONDecodeError, IndexError, KeyError, AttributeError) as e:
+        print(f"ICP parser: could not parse model output — falling back to keyword search ({e})")
+        return {"success": True, "filters": {"keywords": request.text}, "fallback": True}
 
     return {"success": True, "filters": parsed}
 
