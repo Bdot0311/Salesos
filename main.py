@@ -6,6 +6,7 @@ A FastAPI application that caches Wiza API results to reduce costs.
 import asyncio
 import hashlib
 import json
+import re
 from datetime import datetime
 from typing import Optional
 
@@ -144,13 +145,46 @@ DROPPABLE = ["job_title_level", "job_role", "skill", "funding_stage",
              "company_size", "revenue", "company_industry", "company_location"]
 
 
+# A bare hostname like "workflows.io" or "app.acme-corp.com" (no spaces, has a
+# dot, ends in a TLD). Used to tell a domain apart from a plain company name.
+_DOMAIN_RE = re.compile(r"^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$", re.I)
+_SUBDOMAIN_PREFIXES = {"www", "app", "mail", "go", "get", "my", "hi", "try"}
+
+
+def looks_like_domain(value: str) -> bool:
+    """True if `value` is a bare domain/URL rather than a company name."""
+    v = value.strip()
+    if not v or " " in v:
+        return False
+    host = v.split("//")[-1].split("/")[0].split("@")[-1]
+    return bool(_DOMAIN_RE.match(host))
+
+
+def company_name_from_domain(value: str) -> str:
+    """Best-effort company-name token from a domain.
+
+    'workflows.io' -> 'workflows', 'app.acme-corp.com' -> 'acme-corp'. Wiza's
+    prospect filters have no company-domain field, so a domain-based "people at
+    X" search is approximated with a job_company (company name) text match on
+    the domain's second-level label.
+    """
+    host = value.strip().lower().split("//")[-1].split("/")[0].split("@")[-1]
+    labels = [l for l in host.split(".") if l]
+    while len(labels) > 2 and labels[0] in _SUBDOMAIN_PREFIXES:
+        labels = labels[1:]
+    if len(labels) >= 2:
+        return labels[-2]
+    return labels[0] if labels else value.strip()
+
+
 def build_wiza_filters(p: dict) -> dict:
     """Translate our internal search params into a Wiza `filters` object.
 
     Used by both the prospect list workflow (create_prospect_list) and the
-    synchronous prospect search preview (/prospects/search). Note: Wiza's
-    prospect filters have no company-domain field — domain lookups go through
-    the company enrichment endpoint instead.
+    synchronous prospect search preview (/prospects/search). Wiza's prospect
+    filters have no company-domain field, so a company_domain (or a `company`
+    value that is really a domain) is approximated with a job_company match on
+    the domain's root label — see company_name_from_domain.
     """
     fil: dict = {}
 
@@ -177,8 +211,19 @@ def build_wiza_filters(p: dict) -> dict:
     if p.get("company_location"):
         fil["company_location"] = [location_filter(p["company_location"])]
 
-    if p.get("company"):
-        fil["job_company"] = [f(p["company"])]
+    # Company: prefer the name; fall back to the domain's root label since Wiza
+    # can't filter prospects by domain. A `company` value that is itself a bare
+    # domain (e.g. the ICP parser emitting "workflows.io") is treated as one.
+    company = p.get("company")
+    domain = p.get("company_domain")
+    if company and not domain and looks_like_domain(company):
+        domain, company = company, None
+    if company:
+        fil["job_company"] = [f(company)]
+    elif domain:
+        name = company_name_from_domain(domain)
+        if name:
+            fil["job_company"] = [f(name)]
 
     if p.get("industry"):
         fil["company_industry"] = [f(p["industry"])]
