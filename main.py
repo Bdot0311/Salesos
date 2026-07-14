@@ -877,11 +877,21 @@ async def health_check():
 # =============================================================================
 
 class EnrichRequest(BaseModel):
-    linkedin_url: Optional[str] = None
+    # Accept the common shorthands callers send alongside the canonical names so
+    # a `{"profile_url": ...}` / `{"linkedin": ...}` / `{"domain": ...}` body
+    # doesn't get its keys dropped and 400 as "provide ...".
+    linkedin_url: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "linkedin_url", "profile_url", "linkedin", "linkedin_profile_url"))
     email: Optional[str] = None
-    full_name: Optional[str] = None
+    full_name: Optional[str] = Field(
+        default=None, validation_alias=AliasChoices("full_name", "name"))
     company: Optional[str] = None
-    company_domain: Optional[str] = None
+    company_domain: Optional[str] = Field(
+        default=None, validation_alias=AliasChoices("company_domain", "domain"))
+
+    model_config = {"populate_by_name": True}
 
 
 @app.post("/enrich")
@@ -896,9 +906,11 @@ async def enrich_lead(request: EnrichRequest):
         "Content-Type": "application/json",
     }
 
-    # Build the individual_reveal payload — Wiza accepts any one identifier
+    # Build the individual_reveal payload — Wiza accepts any one identifier.
+    # Wiza's field for the LinkedIn URL is `profile_url` (not `linkedin_url`);
+    # sending the wrong key left the reveal with no identifier and Wiza 400'd.
     if request.linkedin_url:
-        reveal_data = {"linkedin_url": request.linkedin_url}
+        reveal_data = {"profile_url": request.linkedin_url}
     elif request.email:
         reveal_data = {"email": request.email}
     elif request.full_name and (request.company or request.company_domain):
