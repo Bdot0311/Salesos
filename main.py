@@ -802,6 +802,7 @@ async def fetch_from_wiza(params: dict) -> list:
             "filters": fil,
         }
 
+    await resolve_company_domain(params)
     filters = build_wiza_filters(params)
     print(f"Wiza initial filters: {json.dumps(filters)}")
 
@@ -942,6 +943,7 @@ async def wiza_prospect_search(params: dict, size: int) -> dict:
         "Content-Type": "application/json",
     }
 
+    await resolve_company_domain(params)
     filters = build_wiza_filters(params)
     size = max(min(size, 30), 0)
 
@@ -1035,6 +1037,32 @@ async def wiza_company_enrich(payload: dict) -> Optional[dict]:
         if not data or not (data.get("company_name") or data.get("domain")):
             return None
         return data
+
+
+async def resolve_company_domain(params: dict) -> None:
+    """Turn a company_domain into a concrete `company` name for people search.
+
+    Wiza's prospect filters can't target a company by domain, so a domain-only
+    search is resolved to the company's real name via company enrichment — the
+    same domain->company step Wiza's own Company tab does — and that exact name
+    drives the job_company filter. Falls back to the domain's root label if
+    enrichment finds nothing. Mutates `params` in place. Runs only on cache
+    miss (from inside the Wiza fetchers), so it costs at most 2 credits per
+    unique search, not per request.
+    """
+    domain = params.get("company_domain")
+    if not domain or params.get("company"):
+        return
+    name = None
+    try:
+        enriched = await wiza_company_enrich({"company_domain": domain})
+        if enriched:
+            name = enriched.get("company_name")
+    except HTTPException as exc:
+        print(f"Domain resolve: company enrich failed for {domain} ({exc.detail})")
+    params["company"] = name or company_name_from_domain(domain)
+    print(f"Domain resolve: {domain} -> company '{params['company']}'"
+          f"{' (exact)' if name else ' (root-label fallback)'}")
 
 
 # =============================================================================
