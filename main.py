@@ -13,7 +13,7 @@ import anthropic
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, Field, AliasChoices
 from pydantic_settings import BaseSettings
 from sqlalchemy import Column, String, Text, DateTime, select
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
@@ -297,7 +297,11 @@ class SearchRequest(BaseModel):
 
 
 class ICPParseRequest(BaseModel):
-    text: str
+    # Accept `text` or `query` — edge functions post `{"query": "..."}` (the same
+    # key /search uses), so alias it in rather than 422-ing on the missing `text`.
+    text: str = Field(validation_alias=AliasChoices("text", "query"))
+
+    model_config = {"populate_by_name": True}
 
 
 class SearchResponse(BaseModel):
@@ -1226,10 +1230,18 @@ async def company_search(request: SearchRequest, enrich: bool = True, enrich_lim
 # =============================================================================
 
 class CompanyEnrichRequest(BaseModel):
-    company_domain: Optional[str] = None
-    company_name: Optional[str] = None
+    # Accept both the canonical field names and the common shorthands callers
+    # send (`domain`, `company`, `name`). Without these aliases a `{"domain": ...}`
+    # or `{"company": ...}` body has its unknown keys dropped, leaving an empty
+    # payload that 400s with "Provide one of ...".
+    company_domain: Optional[str] = Field(
+        default=None, validation_alias=AliasChoices("company_domain", "domain"))
+    company_name: Optional[str] = Field(
+        default=None, validation_alias=AliasChoices("company_name", "company", "name"))
     company_linkedin_id: Optional[str] = None
     company_linkedin_slug: Optional[str] = None
+
+    model_config = {"populate_by_name": True}
 
 
 @app.post("/company/enrich")
