@@ -92,8 +92,13 @@ INTENT_TO_FUNDING = {
 
 
 def f(value: str, flag: str = "i", bucket: str = None) -> dict:
-    """Wiza filter value wrapper — f='i' include, f='e' exclude, b=bucket type."""
-    d = {"v": value, "f": flag}
+    """Wiza filter value wrapper.
+
+    Emits both the legacy `f` key (used by the prospect *list* endpoint) and the
+    documented `s` key (used by the prospect *search* preview endpoint) so the
+    same filter dict works against both. flag 'i' = include, 'e' = exclude.
+    """
+    d = {"v": value, "f": flag, "s": flag}
     if bucket:
         d["b"] = bucket
     return d
@@ -128,6 +133,80 @@ _US_STATES = {"alabama", "alaska", "arizona", "arkansas", "california", "colorad
               "pennsylvania", "rhode island", "south carolina", "south dakota",
               "tennessee", "texas", "utah", "vermont", "virginia", "washington",
               "west virginia", "wisconsin", "wyoming"}
+
+
+# =============================================================================
+# Wiza Filter Builder (shared by list search, prospect preview, company search)
+# =============================================================================
+
+# Filters to drop one-by-one if Wiza rejects the request, ordered least→most useful
+DROPPABLE = ["job_title_level", "job_role", "skill", "funding_stage",
+             "company_size", "revenue", "company_industry", "company_location"]
+
+
+def build_wiza_filters(p: dict) -> dict:
+    """Translate our internal search params into a Wiza `filters` object.
+
+    Used by both the prospect list workflow (create_prospect_list) and the
+    synchronous prospect search preview (/prospects/search). Note: Wiza's
+    prospect filters have no company-domain field — domain lookups go through
+    the company enrichment endpoint instead.
+    """
+    fil: dict = {}
+
+    # Job title — free text, Wiza accepts anything here
+    if p.get("job_title"):
+        fil["job_title"] = [f(p["job_title"])]
+
+    # Keywords merged into job_title search (Wiza has no generic keyword field)
+    if p.get("keywords"):
+        fil["job_title"] = fil.get("job_title", []) + [f(p["keywords"])]
+
+    # Seniority — only add if we have a known Wiza level
+    if p.get("seniority"):
+        level = SENIORITY_MAP.get(p["seniority"].lower())
+        if level:
+            fil["job_title_level"] = [level]
+
+    if p.get("departments"):
+        fil["job_role"] = [f(d) for d in p["departments"]]
+
+    if p.get("location"):
+        fil["location"] = [location_filter(p["location"])]
+
+    if p.get("company_location"):
+        fil["company_location"] = [location_filter(p["company_location"])]
+
+    if p.get("company"):
+        fil["job_company"] = [f(p["company"])]
+
+    if p.get("industry"):
+        fil["company_industry"] = [f(p["industry"])]
+
+    if p.get("company_size"):
+        sizes = COMPANY_SIZE_MAP.get(p["company_size"], [])
+        if sizes:
+            fil["company_size"] = sizes
+
+    if p.get("technologies"):
+        fil["skill"] = [f(t) for t in p["technologies"]]
+
+    if p.get("intent_topics"):
+        stages = []
+        for topic in p["intent_topics"]:
+            stages.extend(INTENT_TO_FUNDING.get(topic, []))
+        if stages:
+            fil["funding_stage"] = list(set(stages))
+
+    if p.get("revenue_min") or p.get("revenue_max"):
+        rev: dict = {}
+        if p.get("revenue_min"):
+            rev["min"] = p["revenue_min"]
+        if p.get("revenue_max"):
+            rev["max"] = p["revenue_max"]
+        fil["revenue"] = rev
+
+    return fil
 
 
 # =============================================================================
@@ -306,71 +385,6 @@ async def fetch_from_wiza(params: dict) -> list:
         "Content-Type": "application/json",
     }
 
-    # ------------------------------------------------------------------
-    # Build filters — ordered from most to least specific so that if Wiza
-    # rejects a filter we can progressively drop and retry
-    # ------------------------------------------------------------------
-    def build_filters(p: dict) -> dict:
-        fil: dict = {}
-
-        # Job title — free text, Wiza accepts anything here
-        if p.get("job_title"):
-            fil["job_title"] = [f(p["job_title"])]
-
-        # Keywords merged into job_title search (Wiza has no generic keyword field)
-        if p.get("keywords"):
-            fil["job_title"] = fil.get("job_title", []) + [f(p["keywords"])]
-
-        # Seniority — only add if we have a known Wiza level
-        if p.get("seniority"):
-            level = SENIORITY_MAP.get(p["seniority"].lower())
-            if level:
-                fil["job_title_level"] = [level]
-
-        if p.get("departments"):
-            fil["job_role"] = [f(d) for d in p["departments"]]
-
-        if p.get("location"):
-            fil["location"] = [location_filter(p["location"])]
-
-        if p.get("company_location"):
-            fil["company_location"] = [location_filter(p["company_location"])]
-
-        if p.get("company"):
-            fil["job_company"] = [f(p["company"])]
-
-        if p.get("industry"):
-            fil["company_industry"] = [f(p["industry"])]
-
-        if p.get("company_size"):
-            sizes = COMPANY_SIZE_MAP.get(p["company_size"], [])
-            if sizes:
-                fil["company_size"] = sizes
-
-        if p.get("technologies"):
-            fil["skill"] = [f(t) for t in p["technologies"]]
-
-        if p.get("intent_topics"):
-            stages = []
-            for topic in p["intent_topics"]:
-                stages.extend(INTENT_TO_FUNDING.get(topic, []))
-            if stages:
-                fil["funding_stage"] = list(set(stages))
-
-        if p.get("revenue_min") or p.get("revenue_max"):
-            rev: dict = {}
-            if p.get("revenue_min"):
-                rev["min"] = p["revenue_min"]
-            if p.get("revenue_max"):
-                rev["max"] = p["revenue_max"]
-            fil["revenue"] = rev
-
-        return fil
-
-    # Filters to drop one-by-one if Wiza rejects the request
-    DROPPABLE = ["job_title_level", "job_role", "skill", "funding_stage",
-                 "company_size", "revenue", "company_industry", "company_location"]
-
     limit = max(min(params.get("limit", 10), 100), 1)
     list_name = f"salesos-{generate_search_hash(params)[:8]}-{int(datetime.utcnow().timestamp())}"
 
@@ -390,7 +404,7 @@ async def fetch_from_wiza(params: dict) -> list:
             "filters": fil,
         }
 
-    filters = build_filters(params)
+    filters = build_wiza_filters(params)
     print(f"Wiza initial filters: {json.dumps(filters)}")
 
     async with httpx.AsyncClient(timeout=60.0) as client:
@@ -501,6 +515,241 @@ async def fetch_from_wiza(params: dict) -> list:
         contacts = contacts_resp.json().get("data", [])
         print(f"Wiza returned {len(contacts)} contacts")
         return contacts
+
+
+# =============================================================================
+# Wiza: Prospect Search Preview (synchronous, no enrichment/email credits)
+# =============================================================================
+
+async def wiza_prospect_search(params: dict, size: int) -> dict:
+    """Synchronous prospect search preview via POST /prospects/search.
+
+    Returns {"total": int, "profiles": [...]} where profiles carry
+    full_name, job_title, job_company_name, job_company_website, industry and
+    location_name. Unlike the list workflow this is instant and does not spend
+    email credits — ideal for "how many match" counts and quick previews.
+
+    Progressively drops droppable filters if Wiza rejects the request.
+    """
+    searchable_fields = (
+        "job_title", "departments", "location", "company_location", "industry",
+        "company", "company_domain", "company_size", "seniority", "technologies",
+        "intent_topics", "keywords", "revenue_min", "revenue_max", "job_change_days",
+    )
+    if not any(params.get(k) for k in searchable_fields):
+        raise HTTPException(status_code=400, detail="At least one search parameter required")
+
+    headers = {
+        "Authorization": f"Bearer {settings.wiza_api_key}",
+        "Content-Type": "application/json",
+    }
+
+    filters = build_wiza_filters(params)
+    size = max(min(size, 30), 0)
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = None
+        for _drop_attempt in range(len(DROPPABLE) + 1):
+            body = {"size": size, "filters": filters}
+            print(f"Wiza prospect search body: {json.dumps(body)}")
+
+            for attempt in range(3):
+                resp = await client.post(
+                    f"{WIZA_BASE}/prospects/search", headers=headers, json=body,
+                )
+                if resp.status_code != 429:
+                    break
+                wait = 2 ** attempt
+                print(f"Rate limited — retrying in {wait}s")
+                await asyncio.sleep(wait)
+
+            print(f"Wiza prospect search status: {resp.status_code} {resp.text[:300]}")
+
+            if resp.status_code == 429:
+                raise HTTPException(status_code=429, detail="Wiza rate limit reached — please try again in a moment")
+            if resp.status_code in (200, 201):
+                return resp.json().get("data", {}) or {}
+
+            # Error → try dropping a filter and retry
+            err_text = resp.text.lower()
+            dropped = False
+            for key in DROPPABLE:
+                if key in filters and (key in err_text or "invalid" in err_text or "parameter" in err_text):
+                    print(f"Dropping filter '{key}' and retrying")
+                    del filters[key]
+                    dropped = True
+                    break
+            if not dropped:
+                raise HTTPException(
+                    status_code=resp.status_code,
+                    detail=f"Wiza prospect search error: {resp.text}",
+                )
+
+        # Exhausted droppable filters
+        raise HTTPException(status_code=resp.status_code if resp else 502,
+                            detail="Wiza prospect search failed after dropping optional filters")
+
+
+# =============================================================================
+# Wiza: Company Enrichment (domain / name / LinkedIn -> firmographics)
+# =============================================================================
+
+async def wiza_company_enrich(payload: dict) -> Optional[dict]:
+    """Enrich a single company via POST /company_enrichments (2 credits).
+
+    Accepts any of company_name, company_domain, company_linkedin_id,
+    company_linkedin_slug. Returns the raw company object, or None if Wiza
+    found no data.
+    """
+    headers = {
+        "Authorization": f"Bearer {settings.wiza_api_key}",
+        "Content-Type": "application/json",
+    }
+
+    print(f"Wiza company enrichment request: {json.dumps(payload)}")
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = None
+        for attempt in range(3):
+            resp = await client.post(
+                f"{WIZA_BASE}/company_enrichments", headers=headers, json=payload,
+            )
+            if resp.status_code != 429:
+                break
+            wait = 2 ** attempt
+            print(f"Rate limited — retrying in {wait}s")
+            await asyncio.sleep(wait)
+
+        print(f"Wiza company enrich status: {resp.status_code} {resp.text[:300]}")
+
+        if resp.status_code == 429:
+            raise HTTPException(status_code=429, detail="Wiza rate limit reached — please try again in a moment")
+        if resp.status_code == 404:
+            return None
+        if resp.status_code not in (200, 201):
+            raise HTTPException(
+                status_code=resp.status_code,
+                detail=f"Wiza company enrichment error: {resp.text}",
+            )
+
+        data = resp.json().get("data") or {}
+        # Wiza returns an empty/blank object when nothing is found
+        if not data or not (data.get("company_name") or data.get("domain")):
+            return None
+        return data
+
+
+# =============================================================================
+# Company / preview transforms
+# =============================================================================
+
+def transform_preview_profile(profile: dict) -> dict:
+    """Transform a /prospects/search preview profile to the internal lead shape."""
+    return {
+        "contact_name": profile.get("full_name"),
+        "job_title": profile.get("job_title"),
+        "linkedin_url": profile.get("linkedin_url"),
+        "location": profile.get("location_name"),
+        "company_name": profile.get("job_company_name"),
+        "company_domain": profile.get("job_company_website"),
+        "industry": profile.get("industry"),
+        "raw_data": profile,
+    }
+
+
+def transform_wiza_company(c: dict) -> dict:
+    """Normalize a Wiza company_enrichments object to a clean company shape."""
+    return {
+        "company_name": c.get("company_name"),
+        "company_domain": c.get("domain"),
+        "industry": c.get("company_industry"),
+        "company_size": c.get("company_size_range") or c.get("company_size"),
+        "employee_count": c.get("company_size"),
+        "revenue_range": c.get("company_revenue_range"),
+        "founded": c.get("company_founded"),
+        "company_type": c.get("company_type"),
+        "description": c.get("company_description"),
+        "funding": c.get("company_funding"),
+        "last_funding_round": c.get("company_last_funding_round"),
+        "last_funding_amount": c.get("company_last_funding_amount"),
+        "last_funding_at": c.get("company_last_funding_at"),
+        "ticker": c.get("company_ticker"),
+        "location": c.get("company_location"),
+        "country": c.get("company_country"),
+        "region": c.get("company_region"),
+        "locality": c.get("company_locality"),
+        "postal_code": c.get("company_postal_code"),
+        "street": c.get("company_street"),
+        "linkedin": c.get("company_linkedin"),
+        "linkedin_id": c.get("company_linkedin_id"),
+        "twitter": c.get("company_twitter"),
+        "facebook": c.get("company_facebook"),
+        "raw_data": c,
+    }
+
+
+def aggregate_companies(profiles: list) -> list:
+    """Roll up prospect-search preview profiles into unique companies with
+    a few sample contacts each. Used by /company/search."""
+    companies: dict = {}
+    for p in profiles:
+        name = p.get("job_company_name")
+        domain = p.get("job_company_website")
+        key = (domain or name or "").strip().lower()
+        if not key:
+            continue
+        if key not in companies:
+            companies[key] = {
+                "company_name": name,
+                "company_domain": domain,
+                "industry": p.get("industry"),
+                "location": p.get("location_name"),
+                "matched_contacts": 0,
+                "sample_contacts": [],
+            }
+        entry = companies[key]
+        entry["matched_contacts"] += 1
+        if len(entry["sample_contacts"]) < 5:
+            entry["sample_contacts"].append({
+                "contact_name": p.get("full_name"),
+                "job_title": p.get("job_title"),
+                "linkedin_url": p.get("linkedin_url"),
+            })
+    return sorted(companies.values(), key=lambda c: c["matched_contacts"], reverse=True)
+
+
+# =============================================================================
+# Cache helper (generic, cache-first for any endpoint)
+# =============================================================================
+
+async def cached_or_fetch(kind: str, params: dict, fetcher) -> tuple[list, bool]:
+    """Cache-first wrapper. `fetcher` is an async callable returning a LIST of
+    raw dicts (always a list so /debug and /cache/* stay consistent). Returns
+    (raw_results, from_cache). The cache key is namespaced by `kind`.
+    """
+    hashable = {"_kind": kind, **params}
+    search_hash = generate_search_hash(hashable)
+    print(f"[{kind}] search hash: {search_hash}")
+
+    async with async_session() as session:
+        stmt = select(CachedSearch).where(CachedSearch.search_hash == search_hash)
+        cached = (await session.execute(stmt)).scalar_one_or_none()
+        if cached:
+            print(f"[{kind}] cache HIT")
+            return json.loads(cached.results), True
+
+        print(f"[{kind}] cache MISS — calling Wiza")
+        raw = await fetcher()
+        if not isinstance(raw, list):
+            raw = [raw] if raw else []
+
+        session.add(CachedSearch(
+            search_hash=search_hash,
+            search_params=json.dumps(hashable),
+            results=json.dumps(raw),
+        ))
+        await session.commit()
+        return raw, False
 
 
 # =============================================================================
@@ -687,27 +936,25 @@ Return only the JSON object, no explanation, no markdown fences."""
 # Search Endpoint
 # =============================================================================
 
-@app.post("/search", response_model=SearchResponse)
-async def search_leads(request: SearchRequest):
-    """
-    Cache-first lead search powered by Wiza.
+STRUCTURED_FIELDS = {
+    "job_title", "departments", "seniority", "location", "company_location",
+    "company", "company_domain", "company_size", "industry", "technologies",
+    "keywords", "intent_topics", "revenue_min", "revenue_max", "job_change_days",
+}
 
-    Flow:
-    1. Check DB cache — return immediately if found
-    2. Cache miss → Wiza 3-step: create list → poll → fetch contacts
-    3. Cache and return results
+
+async def resolve_search_params(request: SearchRequest) -> dict:
+    """Turn a SearchRequest into concrete Wiza params.
+
+    If only a natural-language `query` was provided, parse it into structured
+    filters via the ICP parser (falling back to a keyword search). Shared by
+    /search, /prospects/preview and /company/search.
     """
     params = {k: v for k, v in request.model_dump().items() if v is not None and v != "" and v != []}
     print(f"=== SEARCH REQUEST ===\nFiltered params: {params}")
 
-    structured_fields = {
-        "job_title", "departments", "seniority", "location", "company_location",
-        "company", "company_domain", "company_size", "industry", "technologies",
-        "keywords", "intent_topics", "revenue_min", "revenue_max", "job_change_days",
-    }
-
     raw_query = params.pop("query", None)
-    if raw_query and not any(params.get(f) for f in structured_fields):
+    if raw_query and not any(params.get(f) for f in STRUCTURED_FIELDS):
         parsed_filters: dict = {}
         if settings.anthropic_api_key:
             try:
@@ -722,12 +969,26 @@ async def search_leads(request: SearchRequest):
             if v is not None and v != "" and v != []:
                 params[k] = v
 
-        if not any(params.get(f) for f in structured_fields):
+        if not any(params.get(f) for f in STRUCTURED_FIELDS):
             print("ICP parse yielded no filters — using raw query as keyword search")
             params["keywords"] = raw_query
 
         print(f"Final params: {params}")
 
+    return params
+
+
+@app.post("/search", response_model=SearchResponse)
+async def search_leads(request: SearchRequest):
+    """
+    Cache-first lead search powered by Wiza.
+
+    Flow:
+    1. Check DB cache — return immediately if found
+    2. Cache miss → Wiza 3-step: create list → poll → fetch contacts
+    3. Cache and return results
+    """
+    params = await resolve_search_params(request)
     search_hash = generate_search_hash(params)
     print(f"Search hash: {search_hash}")
 
@@ -761,6 +1022,162 @@ async def search_leads(request: SearchRequest):
             success=True, source="api", from_cache=False,
             count=len(leads), total=len(leads), leads=leads, data=raw_results,
         )
+
+
+# =============================================================================
+# Prospect Preview Endpoint  (fast, synchronous, no email credits)
+# =============================================================================
+
+@app.post("/prospects/preview")
+async def prospects_preview(request: SearchRequest):
+    """
+    Fast contact preview via Wiza /prospects/search.
+
+    Returns the total number of matching prospects plus a sample of preview
+    profiles — instantly and without spending email/enrichment credits. Use
+    this to size an audience before committing to a full /search enrichment.
+    """
+    params = await resolve_search_params(request)
+    size = max(min(request.limit or 10, 30), 0)
+
+    async def fetcher():
+        data = await wiza_prospect_search(params, size)
+        # Store total alongside profiles so it survives caching
+        return [{"_total": data.get("total", 0)}] + (data.get("profiles") or [])
+
+    raw, from_cache = await cached_or_fetch("preview", {**params, "_size": size}, fetcher)
+
+    total = raw[0].get("_total", 0) if raw and "_total" in raw[0] else 0
+    profiles = [r for r in raw if "_total" not in r]
+    leads = [transform_preview_profile(p) for p in profiles]
+
+    return {
+        "success": True,
+        "source": "cache" if from_cache else "api",
+        "from_cache": from_cache,
+        "total": total,
+        "count": len(leads),
+        "leads": leads,
+        "data": profiles,
+    }
+
+
+# =============================================================================
+# Company Search Endpoint  (unique companies from prospect search)
+# =============================================================================
+
+@app.post("/company/search")
+async def company_search(request: SearchRequest, enrich: bool = True, enrich_limit: int = 25):
+    """
+    Search for companies (not just people) via Wiza /prospects/search.
+
+    Runs a prospect search using the firmographic/company filters, then rolls
+    the matching profiles up into unique companies — each with a few sample
+    contacts. Cache-first.
+
+    By default each unique company is auto-enriched with full firmographics
+    (industry, size, revenue, funding, socials) via Wiza company enrichment.
+    That costs 2 API credits per company, capped at `enrich_limit` companies
+    (top matches first). Pass `?enrich=false` to skip enrichment (0 credits).
+    """
+    params = await resolve_search_params(request)
+    # Pull the max preview window so we can dedupe as many companies as possible
+    size = 30
+    enrich_limit = max(min(enrich_limit, 30), 0)
+
+    async def fetcher():
+        data = await wiza_prospect_search(params, size)
+        companies = aggregate_companies(data.get("profiles") or [])
+        if not enrich:
+            return companies
+
+        # Auto-enrich firmographics for the top companies (2 credits each).
+        for company in companies[:enrich_limit]:
+            ident = {}
+            if company.get("company_domain"):
+                ident["company_domain"] = company["company_domain"]
+            elif company.get("company_name"):
+                ident["company_name"] = company["company_name"]
+            if not ident:
+                continue
+
+            try:
+                raw = await wiza_company_enrich(ident)
+            except HTTPException as exc:
+                # Don't fail the whole search on one enrichment error.
+                # On a rate limit, stop enriching further and return what we have.
+                print(f"Company enrich failed for {ident}: {exc.detail}")
+                if exc.status_code == 429:
+                    break
+                continue
+
+            if raw:
+                firmo = transform_wiza_company(raw)
+                for k, v in firmo.items():
+                    if k == "raw_data" or v is None:
+                        continue
+                    company[k] = v
+                company["enriched"] = True
+
+        return companies
+
+    cache_params = {**params, "_enrich": enrich, "_enrich_limit": enrich_limit}
+    companies, from_cache = await cached_or_fetch("company_search", cache_params, fetcher)
+
+    return {
+        "success": True,
+        "source": "cache" if from_cache else "api",
+        "from_cache": from_cache,
+        "count": len(companies),
+        "total": len(companies),
+        "companies": companies,
+        "data": companies,
+    }
+
+
+# =============================================================================
+# Company Enrichment Endpoint  (domain / name / LinkedIn -> firmographics)
+# =============================================================================
+
+class CompanyEnrichRequest(BaseModel):
+    company_domain: Optional[str] = None
+    company_name: Optional[str] = None
+    company_linkedin_id: Optional[str] = None
+    company_linkedin_slug: Optional[str] = None
+
+
+@app.post("/company/enrich")
+async def company_enrich(request: CompanyEnrichRequest):
+    """
+    Enrich / look up a single company by domain, name, or LinkedIn.
+
+    This is the "domain search" — pass a company_domain (e.g. "stripe.com")
+    and get back firmographics: industry, size, revenue, funding, location and
+    social profiles. Cache-first; each live lookup costs 2 Wiza API credits.
+    """
+    payload = {k: v for k, v in request.model_dump().items() if v}
+    if not payload:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide one of: company_domain, company_name, company_linkedin_id, company_linkedin_slug",
+        )
+
+    async def fetcher():
+        company = await wiza_company_enrich(payload)
+        return [company] if company else []
+
+    raw, from_cache = await cached_or_fetch("company_enrich", payload, fetcher)
+
+    if not raw:
+        raise HTTPException(status_code=404, detail="No company data found")
+
+    return {
+        "success": True,
+        "source": "cache" if from_cache else "api",
+        "from_cache": from_cache,
+        "company": transform_wiza_company(raw[0]),
+        "data": raw[0],
+    }
 
 
 # =============================================================================
@@ -819,8 +1236,11 @@ async def get_all_cached_leads():
 
         all_leads, seen = [], set()
         for cached in all_cached:
-            data = json.loads(cached.results)
             search_params = json.loads(cached.search_params)
+            # Skip company/preview caches — this fallback returns enriched people only
+            if search_params.get("_kind"):
+                continue
+            data = json.loads(cached.results)
             for contact in data:
                 key = f"{contact.get('full_name', '')}-{contact.get('name', '')}"
                 if key not in seen:
