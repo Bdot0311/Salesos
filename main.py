@@ -29,6 +29,10 @@ class Settings(BaseSettings):
     database_url: str
     wiza_api_key: str
     anthropic_api_key: Optional[str] = None
+    # ICP parsing is rule-based by default (no API credits needed). Set
+    # USE_LLM_PARSER=true (with ANTHROPIC_API_KEY) to also run the LLM and let it
+    # fill any gaps the rules miss.
+    use_llm_parser: bool = False
 
     class Config:
         env_file = ".env"
@@ -189,6 +193,258 @@ def company_name_from_domain(value: str) -> str:
     if len(labels) >= 2:
         return labels[-2]
     return labels[0] if labels else value.strip()
+
+
+# =============================================================================
+# Rule-based ICP parser (deterministic, no LLM / API credits required)
+# =============================================================================
+
+# Country/UK/US abbreviations -> canonical location string.
+_LOCATION_ALIASES = {
+    "united states": "United States", "u.s.a": "United States", "u.s": "United States",
+    "usa": "United States", "us": "United States", "america": "United States",
+    "united kingdom": "United Kingdom", "u.k": "United Kingdom", "uk": "United Kingdom",
+    "britain": "United Kingdom", "england": "United Kingdom",
+}
+
+# Industry keyword -> a Wiza/LinkedIn-style industry label. Only high-confidence
+# mappings; unknown words are left for the keyword fallback.
+_INDUSTRY_MAP = {
+    "fintech": "Financial Services", "financial services": "Financial Services",
+    "finance": "Financial Services", "banking": "Banking",
+    "saas": "Computer Software", "software": "Computer Software",
+    "ai": "Computer Software", "artificial intelligence": "Computer Software",
+    "machine learning": "Computer Software",
+    "healthcare": "Hospital & Health Care", "health care": "Hospital & Health Care",
+    "healthtech": "Hospital & Health Care", "biotech": "Biotechnology",
+    "biotechnology": "Biotechnology", "pharma": "Pharmaceuticals",
+    "edtech": "E-Learning", "education": "Education Management",
+    "ecommerce": "Internet", "e-commerce": "Internet",
+    "cybersecurity": "Computer & Network Security",
+    "cyber security": "Computer & Network Security",
+    "security": "Computer & Network Security",
+    "insurance": "Insurance", "insurtech": "Insurance",
+    "real estate": "Real Estate", "proptech": "Real Estate",
+    "manufacturing": "Manufacturing", "retail": "Retail",
+    "marketing": "Marketing and Advertising", "advertising": "Marketing and Advertising",
+    "media": "Media Production", "gaming": "Computer Games", "games": "Computer Games",
+    "crypto": "Financial Services", "web3": "Financial Services", "blockchain": "Financial Services",
+    "telecom": "Telecommunications", "telecommunications": "Telecommunications",
+    "logistics": "Logistics and Supply Chain", "supply chain": "Logistics and Supply Chain",
+    "hospitality": "Hospitality", "travel": "Leisure, Travel & Tourism",
+    "automotive": "Automotive", "energy": "Oil & Energy", "consulting": "Management Consulting",
+    "nonprofit": "Nonprofit Organization Management",
+}
+
+# Named company-size tiers -> Wiza size bucket.
+_SIZE_TIERS = {
+    "smb": "11-50", "small business": "11-50", "small businesses": "11-50",
+    "mid-market": "201-500", "midmarket": "201-500", "mid market": "201-500",
+    "enterprise": "1001-5000", "enterprises": "1001-5000",
+    "large enterprise": "5001-10000",
+}
+
+# Detection regex -> our seniority key (ordered strongest first; first hit wins).
+_SENIORITY_RULES = [
+    (r"\bco-?founders?\b|\bfounders?\b", "founder"),
+    (r"\bowners?\b", "owner"),
+    (r"\b(c[e-z]?os?|ceos?|ctos?|cfos?|coos?|cmos?|cios?|cisos?|cros?|cpos?|chros?|ccos?|cdos?|csos?|c-suite|chief)\b", "c_suite"),
+    (r"\b(svps?|evps?|vps?|vice presidents?)\b", "vp"),
+    (r"\bdirectors?\b", "director"),
+    (r"\b(heads?|managers?)\b", "manager"),
+    (r"\b(senior|sr\.?)\b", "senior"),
+    (r"\b(junior|jr\.?|entry[- ]level|interns?)\b", "junior"),
+]
+
+_CSUITE_ACRONYMS = r"\b(ceo|cto|cfo|coo|cmo|cio|ciso|cro|cpo|chro|cco|cdo|cso)s?\b"
+
+# Two-word "<function> <role>" and single role nouns for job_title detection.
+_ROLE_NOUNS = ("engineer", "developer", "designer", "manager", "director",
+               "analyst", "lead", "specialist", "representative", "executive",
+               "recruiter", "consultant", "architect", "scientist", "accountant",
+               "controller", "marketer", "administrator", "officer", "president")
+_TITLE_PHRASES = sorted(
+    ["software engineer", "account executive", "account manager", "product manager",
+     "project manager", "program manager", "data scientist", "data analyst",
+     "business analyst", "financial analyst", "sales development representative",
+     "business development representative", "solutions engineer", "sales engineer",
+     "product designer", "full stack developer", "co-founder", "cofounder",
+     "founder", "owner", "president", "recruiter", "controller", "accountant",
+     "consultant", "architect", "engineer", "developer", "designer", "sdr", "bdr"],
+    key=len, reverse=True,
+)
+
+_DEPARTMENTS = {"sales": "Sales", "marketing": "Marketing", "engineering": "Engineering",
+                "product": "Product", "finance": "Finance", "hr": "Human Resources",
+                "human resources": "Human Resources", "legal": "Legal",
+                "operations": "Operations", "design": "Design", "it": "Information Technology",
+                "data": "Data", "support": "Customer Support"}
+
+
+def _size_bucket(n: int) -> str:
+    """Map an employee count to the nearest Wiza size bucket."""
+    for ceiling, key in [(10, "1-10"), (50, "11-50"), (200, "51-200"), (500, "201-500"),
+                         (1000, "501-1000"), (5000, "1001-5000"), (10000, "5001-10000")]:
+        if n <= ceiling:
+            return key
+    return "10001+"
+
+
+def _money(num: str, unit: str) -> int:
+    mult = {"k": 1e3, "thousand": 1e3, "m": 1e6, "million": 1e6,
+            "b": 1e9, "billion": 1e9}.get(unit.lower(), 1)
+    return int(float(num.replace(",", "")) * mult)
+
+
+def heuristic_parse_icp(text: str) -> dict:
+    """Parse a plain-English ICP into Wiza search filters — deterministically,
+    with no LLM call. Covers the common phrasings (title, seniority, location,
+    company/domain, size, industry, revenue, buyer intent, job change). Anything
+    it can't structure falls through to a keyword search.
+    """
+    orig = (text or "").strip()
+    low = orig.lower()
+    filters: dict = {}
+
+    # --- Company domain / name -------------------------------------------------
+    domain = find_domain_in_text(orig)
+    if domain:
+        filters["company_domain"] = domain
+    else:
+        m = re.search(r"(?:\bwork(?:s|ing)?\s+)?(?:\bat\b|@)\s+"
+                      r"([A-Z][A-Za-z0-9&.\-]*(?:\s+[A-Z][A-Za-z0-9&.\-]*){0,3})", orig)
+        if m:
+            cand = re.sub(r"\b(compan(?:y|ies)|startups?|inc\.?|llc|corp\.?)\b.*$", "",
+                          m.group(1), flags=re.I).strip()
+            cl = cand.lower()
+            if cand and cl not in _INDUSTRY_MAP and cl not in _COUNTRIES \
+                    and cl not in _US_STATES and cl not in _LOCATION_ALIASES:
+                filters["company"] = cand
+
+    # --- Location (people location; "hq/headquartered" -> company_location) ----
+    loc = None
+    for alias, canon in _LOCATION_ALIASES.items():
+        if re.search(rf"\b{re.escape(alias)}\b", low):
+            loc = canon
+            break
+    if not loc:
+        for name in sorted(_COUNTRIES | _US_STATES, key=len, reverse=True):
+            if re.search(rf"\b{re.escape(name)}\b", low):
+                loc = name.title()
+                break
+    if not loc:
+        m = re.search(r"\b(?:in|near|based in|located in|from)\s+"
+                      r"([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+){0,2})", orig)
+        if m and m.group(1).lower() not in _INDUSTRY_MAP:
+            loc = m.group(1).strip()
+    if loc:
+        if re.search(r"\b(hq|headquarter(?:ed|s)?|based out of)\b", low):
+            filters["company_location"] = loc
+        else:
+            filters["location"] = loc
+
+    # --- Seniority -------------------------------------------------------------
+    for pattern, key in _SENIORITY_RULES:
+        if re.search(pattern, low):
+            filters["seniority"] = key
+            break
+
+    # --- Job title -------------------------------------------------------------
+    title = None
+    m = re.search(r"\b(svp|evp|vp|vice president|head|director|manager|lead|chief)\s+of\s+"
+                  r"[a-z][a-z ]*?(?=\s+(?:at|in|for|with|who|that|based|located)\b|[.,]|$)", low)
+    if m:
+        title = orig[m.start():m.end()].strip()
+    if not title:
+        m = re.search(_CSUITE_ACRONYMS, low)
+        if m:
+            title = m.group(1).upper()  # group drops any trailing plural 's'
+    if not title:
+        m = re.search(r"\b([a-z]+)\s+(" + "|".join(_ROLE_NOUNS) + r")s?\b", low)
+        if m:
+            title = orig[m.start():m.end()].strip()
+    if not title:
+        for phrase in _TITLE_PHRASES:
+            mm = re.search(rf"\b{re.escape(phrase)}s?\b", low)
+            if mm:
+                title = orig[mm.start():mm.end()].strip()
+                break
+    if title:
+        filters["job_title"] = title
+        # Derive a department from a "<X> of <Dept>" title.
+        dm = re.search(r"\bof\s+([a-z]+)", title.lower())
+        if dm and dm.group(1) in _DEPARTMENTS:
+            filters["departments"] = [_DEPARTMENTS[dm.group(1)]]
+
+    # --- Industry (skip when the word is a role modifier, e.g. "software
+    #     engineer", "marketing director" — that's a title/department, not an
+    #     industry filter) --------------------------------------------------------
+    _role_alt = "|".join(_ROLE_NOUNS)
+    for kw in sorted(_INDUSTRY_MAP, key=len, reverse=True):
+        if re.search(rf"\b{re.escape(kw)}\b(?!\s+(?:{_role_alt})s?\b)", low):
+            filters["industry"] = _INDUSTRY_MAP[kw]
+            break
+
+    # --- Company size ----------------------------------------------------------
+    size = None
+    for tier in sorted(_SIZE_TIERS, key=len, reverse=True):
+        if re.search(rf"\b{re.escape(tier)}\b", low):
+            size = _SIZE_TIERS[tier]
+            break
+    if not size:
+        m = re.search(r"(\d[\d,]*)\s*(?:-|to|–)\s*(\d[\d,]*)\s*"
+                      r"(?:employees|people|person|headcount|staff|team)", low)
+        if m:
+            size = _size_bucket(int(m.group(2).replace(",", "")))
+        else:
+            m = re.search(r"(\d[\d,]*)\s*\+?\s*"
+                          r"(?:employees|people|person|headcount|staff)", low)
+            if m:
+                size = _size_bucket(int(m.group(1).replace(",", "")))
+    if size:
+        filters["company_size"] = size
+
+    # --- Revenue (only when explicitly about revenue, not funding amounts) -----
+    if re.search(r"\b(revenue|arr|turnover)\b", low):
+        money = r"\$?\s*(\d[\d,.]*)\s*(k|m|b|thousand|million|billion)\b"
+        between = re.search(r"between\s+" + money + r"\s+and\s+" + money, low)
+        if between:
+            filters["revenue_min"] = _money(between.group(1), between.group(2))
+            filters["revenue_max"] = _money(between.group(3), between.group(4))
+        else:
+            m = re.search(r"(over|above|more than|greater than|>|at least)\s+" + money, low)
+            if m:
+                filters["revenue_min"] = _money(m.group(2), m.group(3))
+            m = re.search(r"(under|below|less than|<|up to)\s+" + money, low)
+            if m:
+                filters["revenue_max"] = _money(m.group(2), m.group(3))
+            if "revenue_min" not in filters and "revenue_max" not in filters:
+                m = re.search(money, low)
+                if m:
+                    filters["revenue_min"] = _money(m.group(1), m.group(2))
+
+    # --- Buyer intent ----------------------------------------------------------
+    intent = []
+    if re.search(r"\b(series [a-f]|seed|pre-?seed|raised|funding|funded|"
+                 r"venture[- ]backed|vc[- ]backed)\b", low):
+        intent.append("Funding")
+    if re.search(r"\b(ipo|going public|public offering)\b", low):
+        intent.append("IPO")
+    if re.search(r"\b(merger|m&a|acquisitions?|acquired)\b", low):
+        intent.append("Mergers")
+    if intent:
+        filters["intent_topics"] = intent
+
+    # --- Recent job change -----------------------------------------------------
+    if re.search(r"\b(recently (changed|joined|started)|new (role|job|position)|"
+                 r"just (joined|started)|changed jobs|job change)\b", low):
+        filters["job_change_days"] = 90
+
+    # --- Fallback --------------------------------------------------------------
+    if not filters:
+        filters["keywords"] = orig
+
+    return filters
 
 
 def build_wiza_filters(p: dict) -> dict:
@@ -1036,12 +1292,10 @@ async def enrich_lead(request: EnrichRequest):
         raise HTTPException(status_code=504, detail="Wiza enrichment timed out")
 
 
-@app.post("/parse-icp")
-async def parse_icp(request: ICPParseRequest):
-    """Parse a plain-English ICP description into structured Wiza search filters."""
-    if not settings.anthropic_api_key:
-        return {"success": True, "filters": {"keywords": request.text}}
-
+async def _llm_parse_icp(text: str) -> dict:
+    """Parse an ICP via the Anthropic API. Raises on any API/parse error so the
+    caller can fall back to the rule-based parser. Requires anthropic_api_key.
+    """
     client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
 
     prompt = f"""You are an ICP (Ideal Customer Profile) parser for a B2B lead generation platform powered by Wiza.
@@ -1070,27 +1324,43 @@ ICP Description: {request.text}
 
 Return only the JSON object, no explanation, no markdown fences."""
 
-    try:
-        message = await client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=1024,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        raw = "".join(
-            block.text for block in message.content
-            if getattr(block, "type", None) == "text"
-        ).strip()
-        parsed = extract_json_object(raw)
-    except anthropic.APIError as e:
-        # Upstream model/API failure (auth, model not found, overload, rate limit).
-        # Degrade to a keyword search instead of 500-ing so callers keep working.
-        print(f"ICP parser: Anthropic API error — falling back to keyword search ({e})")
-        return {"success": True, "filters": {"keywords": request.text}, "fallback": True}
-    except (json.JSONDecodeError, IndexError, KeyError, AttributeError) as e:
-        print(f"ICP parser: could not parse model output — falling back to keyword search ({e})")
-        return {"success": True, "filters": {"keywords": request.text}, "fallback": True}
+    message = await client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=1024,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    raw = "".join(
+        block.text for block in message.content
+        if getattr(block, "type", None) == "text"
+    ).strip()
+    return extract_json_object(raw)
 
-    return {"success": True, "filters": parsed}
+
+@app.post("/parse-icp")
+async def parse_icp(request: ICPParseRequest):
+    """Parse a plain-English ICP description into structured Wiza search filters.
+
+    Rule-based by default — deterministic, instant, and free (no API credits).
+    When USE_LLM_PARSER is enabled and an Anthropic key is set, the LLM also runs
+    and fills any fields the rules didn't capture; if it errors (e.g. no credits)
+    the rule-based result is used unchanged.
+    """
+    filters = heuristic_parse_icp(request.text)
+
+    if settings.use_llm_parser and settings.anthropic_api_key:
+        try:
+            llm = await _llm_parse_icp(request.text)
+            for k, v in llm.items():
+                if v not in (None, "", []) and k not in filters:
+                    filters[k] = v
+        except Exception as e:
+            print(f"ICP parser: LLM booster skipped, using rule-based result ({e})")
+
+    # Drop a bare keyword fallback if the rules (or LLM) found real filters.
+    if len(filters) > 1 and filters.get("keywords") == request.text:
+        filters.pop("keywords", None)
+
+    return {"success": True, "filters": filters}
 
 
 # =============================================================================
