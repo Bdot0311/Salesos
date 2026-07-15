@@ -195,6 +195,20 @@ def company_name_from_domain(value: str) -> str:
     return labels[0] if labels else value.strip()
 
 
+def domain_host(value: str) -> str:
+    """The registrable host of a domain, TLD kept and subdomains stripped.
+
+    'https://www.workflows.io/x' -> 'workflows.io', 'app.acme-corp.com' ->
+    'acme-corp.com'. Used as a job_company candidate because many companies are
+    named after their full domain (e.g. the brand is literally 'workflows.io').
+    """
+    host = value.strip().lower().split("//")[-1].split("/")[0].split("@")[-1]
+    labels = [l for l in host.split(".") if l]
+    while len(labels) > 2 and labels[0] in _SUBDOMAIN_PREFIXES:
+        labels = labels[1:]
+    return ".".join(labels) if labels else value.strip().lower()
+
+
 # =============================================================================
 # Rule-based ICP parser (deterministic, no LLM / API credits required)
 # =============================================================================
@@ -488,12 +502,25 @@ def build_wiza_filters(p: dict) -> dict:
     domain = p.get("company_domain")
     if company and not domain and looks_like_domain(company):
         domain, company = company, None
+    # Build OR candidates for the company-name filter. For a domain we can't be
+    # sure how the company is recorded, so offer several forms — the resolved
+    # name (if any), the full domain ("workflows.io", for domain-named brands),
+    # and the root label ("workflows"). Wiza treats multiple job_company values
+    # as OR, so any one matching surfaces the company in a single search.
+    candidates = []
     if company:
-        fil["job_company"] = [f(company)]
-    elif domain:
-        name = company_name_from_domain(domain)
-        if name:
-            fil["job_company"] = [f(name)]
+        candidates.append(company)
+    if domain:
+        candidates.append(domain_host(domain))
+        candidates.append(company_name_from_domain(domain))
+    seen, values = set(), []
+    for c in candidates:
+        key = (c or "").strip().lower()
+        if key and key not in seen:
+            seen.add(key)
+            values.append(c)
+    if values:
+        fil["job_company"] = [f(c) for c in values]
 
     if p.get("industry"):
         fil["company_industry"] = [f(p["industry"])]
