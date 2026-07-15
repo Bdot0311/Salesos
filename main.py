@@ -297,6 +297,110 @@ _INDUSTRY_MAP = {
     "nonprofit": "non-profit organization management",
 }
 
+# Wiza's complete, fixed company_industry vocabulary (from the prospect-search
+# docs). Anything outside this set is silently ignored by Wiza, so we validate
+# against it before sending — see normalize_industry.
+WIZA_INDUSTRIES = frozenset({
+    "accounting", "airlines/aviation", "alternative dispute resolution",
+    "alternative medicine", "animation", "apparel & fashion",
+    "architecture & planning", "arts and crafts", "automotive",
+    "aviation & aerospace", "banking", "biotechnology", "broadcast media",
+    "building materials", "business supplies and equipment", "capital markets",
+    "chemicals", "civic & social organization", "civil engineering",
+    "commercial real estate", "computer & network security", "computer games",
+    "computer hardware", "computer networking", "computer software",
+    "construction", "consumer electronics", "consumer goods",
+    "consumer services", "cosmetics", "dairy", "defense & space", "design",
+    "e-learning", "education management", "electrical/electronic manufacturing",
+    "entertainment", "environmental services", "events services",
+    "executive office", "facilities services", "farming", "financial services",
+    "fine art", "fishery", "food & beverages", "food production", "fund-raising",
+    "furniture", "gambling & casinos", "government administration",
+    "government relations", "graphic design", "health, wellness and fitness",
+    "higher education", "hospital & health care", "hospitality",
+    "human resources", "import and export", "individual & family services",
+    "industrial automation", "information services",
+    "information technology and services", "insurance", "international affairs",
+    "international trade and development", "internet", "investment banking",
+    "investment management", "judiciary", "law enforcement", "law practice",
+    "legal services", "legislative office", "libraries",
+    "logistics and supply chain", "luxury goods & jewelry", "machinery",
+    "management consulting", "maritime", "market research",
+    "marketing and advertising", "mechanical or industrial engineering",
+    "media production", "medical devices", "medical practice",
+    "mental health care", "military", "mining & metals",
+    "motion pictures and film", "museums and institutions", "music",
+    "nanotechnology", "newspapers", "non-profit organization management",
+    "oil & energy", "online media", "outsourcing/offshoring",
+    "package/freight delivery", "packaging and containers",
+    "paper & forest products", "performing arts", "pharmaceuticals",
+    "philanthropy", "photography", "plastics", "political organization",
+    "primary/secondary education", "printing",
+    "professional training & coaching", "program development", "public policy",
+    "public relations and communications", "public safety", "publishing",
+    "railroad manufacture", "ranching", "real estate",
+    "recreational facilities and services", "religious institutions",
+    "renewables & environment", "research", "restaurants", "retail",
+    "security and investigations", "semiconductors", "shipbuilding",
+    "sporting goods", "sports", "staffing and recruiting", "supermarkets",
+    "telecommunications", "textiles", "think tanks", "tobacco",
+    "translation and localization", "transportation/trucking/railroad",
+    "utilities", "venture capital & private equity", "veterinary",
+    "warehousing", "wholesale", "wine and spirits", "wireless",
+    "writing and editing",
+})
+
+# Common free-form phrasings (often from the LLM parser) that aren't in
+# _INDUSTRY_MAP and don't exactly match Wiza's wording -> the Wiza value.
+_INDUSTRY_ALIASES = {
+    "software development": "computer software",
+    "information technology": "information technology and services",
+    "it": "information technology and services",
+    "it services": "information technology and services",
+    "tech": "computer software", "technology": "computer software",
+    "health and wellness": "health, wellness and fitness",
+    "health & wellness": "health, wellness and fitness",
+    "wellness": "health, wellness and fitness",
+    "fitness": "health, wellness and fitness",
+    "venture capital": "venture capital & private equity",
+    "private equity": "venture capital & private equity",
+    "vc": "venture capital & private equity",
+    "recruiting": "staffing and recruiting",
+    "staffing": "staffing and recruiting",
+    "manufacturing": "mechanical or industrial engineering",
+    "transportation": "transportation/trucking/railroad",
+    "food and beverage": "food & beverages",
+    "food & beverage": "food & beverages",
+    "aerospace": "aviation & aerospace",
+    "defense": "defense & space",
+    "renewables": "renewables & environment",
+    "renewable energy": "renewables & environment",
+    "clean energy": "renewables & environment",
+}
+
+
+def normalize_industry(value: str):
+    """Coerce an arbitrary industry string to a valid Wiza company_industry value.
+
+    Wiza silently ignores industries outside its fixed vocabulary, and the
+    `industry` field can arrive free-form (Title-Case, out-of-vocab) from the
+    LLM parser as well as from the rule-based _INDUSTRY_MAP. Snap it onto the
+    documented set. Returns the canonical lowercase value, or None when we can't
+    map it confidently — the caller then drops the filter rather than send an
+    invalid value that Wiza would ignore.
+    """
+    if not value:
+        return None
+    key = value.strip().lower()
+    if not key:
+        return None
+    if key in WIZA_INDUSTRIES:      # already a valid Wiza industry
+        return key
+    if key in _INDUSTRY_MAP:        # keyword/synonym (fintech -> financial services)
+        return _INDUSTRY_MAP[key]
+    return _INDUSTRY_ALIASES.get(key)  # common phrasing, else None
+
+
 # Named company-size tiers -> Wiza size bucket.
 _SIZE_TIERS = {
     "smb": "11-50", "small business": "11-50", "small businesses": "11-50",
@@ -574,8 +678,14 @@ def build_wiza_filters(p: dict) -> dict:
     if values:
         fil["job_company"] = [f(c) for c in values]
 
+    # company_industry must be one of Wiza's fixed values or it's silently
+    # ignored; normalize (handles free-form LLM output) and drop if unmappable.
     if p.get("industry"):
-        fil["company_industry"] = [f(p["industry"])]
+        industry = normalize_industry(p["industry"])
+        if industry:
+            fil["company_industry"] = [f(industry)]
+        else:
+            print(f"Dropping unrecognized industry filter: {p['industry']!r}")
 
     if p.get("company_size"):
         sizes = COMPANY_SIZE_MAP.get(p["company_size"], [])
@@ -1424,7 +1534,7 @@ Parse the following description into structured search filters. Return ONLY vali
   "company": "specific company name if mentioned",
   "company_domain": "company domain e.g. acme.com",
   "company_size": "one of: 1-10, 11-50, 51-200, 201-500, 501-1000, 1001-5000, 5001-10000, 10001+",
-  "industry": "industry string e.g. Software Development, Financial Services, Healthcare",
+  "industry": "lowercase industry from Wiza's vocabulary e.g. computer software, financial services, hospital & health care",
   "technologies": ["tech stack strings e.g. Salesforce, HubSpot, AWS"],
   "keywords": "additional search terms",
   "intent_topics": ["buyer intent — only from: Funding, IPO, Mergers, Investment"],
