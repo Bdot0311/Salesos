@@ -1608,16 +1608,28 @@ async def resolve_search_params(request: SearchRequest) -> dict:
     print(f"=== SEARCH REQUEST ===\nFiltered params: {params}")
 
     raw_query = params.pop("query", None)
+
+    # The frontend search box sends its text as `keywords`, not `query`. When
+    # `keywords` is the only input, treat it as a natural-language query so domain
+    # detection and ICP parsing run — otherwise a bare domain like "workflows.io"
+    # stays a job_title keyword match and never reaches the company path.
+    if not raw_query and params.get("keywords") and not any(
+        params.get(fld) for fld in STRUCTURED_FIELDS if fld != "keywords"
+    ):
+        raw_query = params.pop("keywords")
+
     if raw_query and not any(params.get(f) for f in STRUCTURED_FIELDS):
         parsed_filters: dict = {}
-        if settings.anthropic_api_key:
-            try:
-                print(f"Auto-parsing query: {raw_query}")
-                icp_result = await parse_icp(ICPParseRequest(text=raw_query))
-                parsed_filters = icp_result.get("filters", {})
-                print(f"ICP parser returned: {parsed_filters}")
-            except Exception as e:
-                print(f"WARNING: ICP parser failed ({e}) — falling back to keyword search")
+        # The rule-based parser is free and deterministic — always run it. The
+        # LLM booster inside parse_icp only fires when enabled + an Anthropic key
+        # is set, so this is safe without one (and is the whole point of #5).
+        try:
+            print(f"Auto-parsing query: {raw_query}")
+            icp_result = await parse_icp(ICPParseRequest(text=raw_query))
+            parsed_filters = icp_result.get("filters", {})
+            print(f"ICP parser returned: {parsed_filters}")
+        except Exception as e:
+            print(f"WARNING: ICP parser failed ({e}) — falling back to keyword search")
 
         for k, v in parsed_filters.items():
             if v is not None and v != "" and v != []:
