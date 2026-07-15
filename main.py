@@ -56,22 +56,24 @@ WIZA_BASE = "https://wiza.co/api"
 # Wiza Filter Mappings
 # =============================================================================
 
-# Our seniority keys -> Wiza job_title_level values
+# Our seniority keys -> Wiza job_title_level enum.
+# Valid values (per Wiza prospect-search docs): CXO, VP, Director, Manager,
+# Senior, Entry, Owner, Partner, Training, Unpaid.
 SENIORITY_MAP = {
-    "entry":    "entry",
-    "training": "entry",
-    "intern":   "entry",
-    "junior":   "junior",
-    "senior":   "senior",
-    "manager":  "manager",
-    "head":     "manager",
-    "director": "director",
-    "partner":  "director",
-    "vp":       "vp",
-    "c_suite":  "c_suite",
-    "cxo":      "c_suite",
-    "owner":    "owner",
-    "founder":  "owner",
+    "entry":    "Entry",
+    "training": "Training",
+    "intern":   "Entry",
+    "junior":   "Entry",     # Wiza has no "Junior" level; Entry is closest
+    "senior":   "Senior",
+    "manager":  "Manager",
+    "head":     "Manager",
+    "director": "Director",
+    "partner":  "Partner",
+    "vp":       "VP",
+    "c_suite":  "CXO",
+    "cxo":      "CXO",
+    "owner":    "Owner",
+    "founder":  "Owner",     # Wiza has no "Founder" level; Owner is closest
 }
 
 # Our size keys -> Wiza company_size values (Wiza uses same range strings)
@@ -86,13 +88,49 @@ COMPANY_SIZE_MAP = {
     "10001+":     ["10001+"],
 }
 
-# Buyer intent -> Wiza funding_stage values
+# Buyer intent -> Wiza funding_stage.v values (valid: pre_seed, seed, series_a,
+# series_b, series_c, series_d, series_e-j, other). IPO and Mergers aren't
+# funding stages — they map to company_type / funding_type instead (see
+# build_wiza_filters).
 INTENT_TO_FUNDING = {
-    "Funding":    ["seed", "series_a", "series_b", "series_c", "series_d",
-                   "series_e", "series_f", "angel", "pre_seed"],
-    "IPO":        ["ipo"],
-    "Mergers":    ["private_equity", "post_ipo_equity"],
-    "Investment": ["seed", "series_a", "series_b", "angel"],
+    "Funding":    ["pre_seed", "seed", "series_a", "series_b", "series_c",
+                   "series_d", "series_e-j"],
+    "Investment": ["seed", "series_a", "series_b"],
+}
+
+# Company revenue buckets (lo inclusive, hi exclusive) -> Wiza revenue enum.
+REVENUE_BUCKETS = [
+    (0,        1_000_000,   "$0-$1M"),
+    (1_000_000, 10_000_000, "$1M-$10M"),
+    (10_000_000, 25_000_000, "$10M-$25M"),
+    (25_000_000, 50_000_000, "$25M-$50M"),
+    (50_000_000, 100_000_000, "$50M-$100M"),
+    (100_000_000, 250_000_000, "$100M-$250M"),
+    (250_000_000, 500_000_000, "$250M-$500M"),
+    (500_000_000, 1_000_000_000, "$500M-$1B"),
+    (1_000_000_000, 10_000_000_000, "$1B-$10B"),
+    (10_000_000_000, float("inf"), "$10B+"),
+]
+
+
+def revenue_buckets(rmin, rmax) -> list:
+    """Map a min/max USD revenue range to the overlapping Wiza revenue enums."""
+    lo_bound = rmin if rmin is not None else 0
+    hi_bound = rmax if rmax is not None else float("inf")
+    return [label for lo, hi, label in REVENUE_BUCKETS
+            if hi > lo_bound and lo < hi_bound]
+
+
+# Our department labels -> Wiza job_role enum (plain lowercase strings).
+JOB_ROLE_MAP = {
+    "sales": "sales", "marketing": "marketing", "engineering": "engineering",
+    "finance": "finance", "legal": "legal", "operations": "operations",
+    "design": "design", "media": "media", "education": "education",
+    "health": "health", "healthcare": "health", "trades": "trades",
+    "human resources": "human_resources", "hr": "human_resources",
+    "real estate": "real_estate", "public relations": "public_relations",
+    "pr": "public_relations", "customer service": "customer_service",
+    "customer support": "customer_service", "support": "customer_service",
 }
 
 
@@ -110,13 +148,21 @@ def f(value: str, flag: str = "i", bucket: str = None) -> dict:
 
 
 def location_filter(value: str, flag: str = "i") -> dict:
-    """Build a Wiza location filter with the required 'b' (bucket) field."""
-    loc = value.strip().lower()
-    # Detect bucket type from the value
+    """Build a Wiza location filter with the required 'b' (bucket) field.
+
+    Wiza wants the value shaped by bucket: country = 'country', state =
+    'state, country', city = 'city, state, country'. We can reliably qualify a
+    US state ('california' -> 'california, united states'); country is passed
+    through and a city is best-effort (Wiza still matches many bare cities).
+    """
+    value = value.strip()
+    loc = value.lower()
     if loc in _COUNTRIES:
         bucket = "country"
     elif loc in _US_STATES or (len(loc) == 2 and loc.isalpha()):
         bucket = "state"
+        if loc in _US_STATES and "," not in value:
+            value = f"{value}, United States"
     else:
         bucket = "city"
     return f(value, flag, bucket)
@@ -195,6 +241,20 @@ def company_name_from_domain(value: str) -> str:
     return labels[0] if labels else value.strip()
 
 
+def domain_host(value: str) -> str:
+    """The registrable host of a domain, TLD kept and subdomains stripped.
+
+    'https://www.workflows.io/x' -> 'workflows.io', 'app.acme-corp.com' ->
+    'acme-corp.com'. Used as a job_company candidate because many companies are
+    named after their full domain (e.g. the brand is literally 'workflows.io').
+    """
+    host = value.strip().lower().split("//")[-1].split("/")[0].split("@")[-1]
+    labels = [l for l in host.split(".") if l]
+    while len(labels) > 2 and labels[0] in _SUBDOMAIN_PREFIXES:
+        labels = labels[1:]
+    return ".".join(labels) if labels else value.strip().lower()
+
+
 # =============================================================================
 # Rule-based ICP parser (deterministic, no LLM / API credits required)
 # =============================================================================
@@ -207,33 +267,34 @@ _LOCATION_ALIASES = {
     "britain": "United Kingdom", "england": "United Kingdom",
 }
 
-# Industry keyword -> a Wiza/LinkedIn-style industry label. Only high-confidence
-# mappings; unknown words are left for the keyword fallback.
+# Industry keyword -> a Wiza company_industry value. Values MUST come from Wiza's
+# documented industry vocabulary (all lowercase). Only high-confidence mappings;
+# unknown words are left for the keyword fallback.
 _INDUSTRY_MAP = {
-    "fintech": "Financial Services", "financial services": "Financial Services",
-    "finance": "Financial Services", "banking": "Banking",
-    "saas": "Computer Software", "software": "Computer Software",
-    "ai": "Computer Software", "artificial intelligence": "Computer Software",
-    "machine learning": "Computer Software",
-    "healthcare": "Hospital & Health Care", "health care": "Hospital & Health Care",
-    "healthtech": "Hospital & Health Care", "biotech": "Biotechnology",
-    "biotechnology": "Biotechnology", "pharma": "Pharmaceuticals",
-    "edtech": "E-Learning", "education": "Education Management",
-    "ecommerce": "Internet", "e-commerce": "Internet",
-    "cybersecurity": "Computer & Network Security",
-    "cyber security": "Computer & Network Security",
-    "security": "Computer & Network Security",
-    "insurance": "Insurance", "insurtech": "Insurance",
-    "real estate": "Real Estate", "proptech": "Real Estate",
-    "manufacturing": "Manufacturing", "retail": "Retail",
-    "marketing": "Marketing and Advertising", "advertising": "Marketing and Advertising",
-    "media": "Media Production", "gaming": "Computer Games", "games": "Computer Games",
-    "crypto": "Financial Services", "web3": "Financial Services", "blockchain": "Financial Services",
-    "telecom": "Telecommunications", "telecommunications": "Telecommunications",
-    "logistics": "Logistics and Supply Chain", "supply chain": "Logistics and Supply Chain",
-    "hospitality": "Hospitality", "travel": "Leisure, Travel & Tourism",
-    "automotive": "Automotive", "energy": "Oil & Energy", "consulting": "Management Consulting",
-    "nonprofit": "Nonprofit Organization Management",
+    "fintech": "financial services", "financial services": "financial services",
+    "finance": "financial services", "banking": "banking",
+    "saas": "computer software", "software": "computer software",
+    "ai": "computer software", "artificial intelligence": "computer software",
+    "machine learning": "computer software",
+    "healthcare": "hospital & health care", "health care": "hospital & health care",
+    "healthtech": "hospital & health care", "biotech": "biotechnology",
+    "biotechnology": "biotechnology", "pharma": "pharmaceuticals",
+    "edtech": "e-learning", "education": "education management",
+    "ecommerce": "internet", "e-commerce": "internet",
+    "cybersecurity": "computer & network security",
+    "cyber security": "computer & network security",
+    "security": "computer & network security",
+    "insurance": "insurance", "insurtech": "insurance",
+    "real estate": "real estate", "proptech": "real estate",
+    "retail": "retail",
+    "marketing": "marketing and advertising", "advertising": "marketing and advertising",
+    "media": "media production", "gaming": "computer games", "games": "computer games",
+    "crypto": "financial services", "web3": "financial services", "blockchain": "financial services",
+    "telecom": "telecommunications", "telecommunications": "telecommunications",
+    "logistics": "logistics and supply chain", "supply chain": "logistics and supply chain",
+    "hospitality": "hospitality",
+    "automotive": "automotive", "energy": "oil & energy", "consulting": "management consulting",
+    "nonprofit": "non-profit organization management",
 }
 
 # Named company-size tiers -> Wiza size bucket.
@@ -472,8 +533,13 @@ def build_wiza_filters(p: dict) -> dict:
         if level:
             fil["job_title_level"] = [level]
 
+    # job_role is a plain enum array (not {v,s} objects); map our labels to
+    # Wiza's role vocabulary and drop anything that isn't a valid role.
     if p.get("departments"):
-        fil["job_role"] = [f(d) for d in p["departments"]]
+        roles = [JOB_ROLE_MAP[d.strip().lower()] for d in p["departments"]
+                 if d.strip().lower() in JOB_ROLE_MAP]
+        if roles:
+            fil["job_role"] = list(dict.fromkeys(roles))  # dedupe, keep order
 
     if p.get("location"):
         fil["location"] = [location_filter(p["location"])]
@@ -488,12 +554,25 @@ def build_wiza_filters(p: dict) -> dict:
     domain = p.get("company_domain")
     if company and not domain and looks_like_domain(company):
         domain, company = company, None
+    # Build OR candidates for the company-name filter. For a domain we can't be
+    # sure how the company is recorded, so offer several forms — the resolved
+    # name (if any), the full domain ("workflows.io", for domain-named brands),
+    # and the root label ("workflows"). Wiza treats multiple job_company values
+    # as OR, so any one matching surfaces the company in a single search.
+    candidates = []
     if company:
-        fil["job_company"] = [f(company)]
-    elif domain:
-        name = company_name_from_domain(domain)
-        if name:
-            fil["job_company"] = [f(name)]
+        candidates.append(company)
+    if domain:
+        candidates.append(domain_host(domain))
+        candidates.append(company_name_from_domain(domain))
+    seen, values = set(), []
+    for c in candidates:
+        key = (c or "").strip().lower()
+        if key and key not in seen:
+            seen.add(key)
+            values.append(c)
+    if values:
+        fil["job_company"] = [f(c) for c in values]
 
     if p.get("industry"):
         fil["company_industry"] = [f(p["industry"])]
@@ -503,23 +582,29 @@ def build_wiza_filters(p: dict) -> dict:
         if sizes:
             fil["company_size"] = sizes
 
+    # skill is a plain string array, not {v,s} objects.
     if p.get("technologies"):
-        fil["skill"] = [f(t) for t in p["technologies"]]
+        fil["skill"] = list(p["technologies"])
 
+    # Buyer intent. Funding/Investment -> funding_stage ({t, v:[stages]}); IPO ->
+    # company_type "public"; Mergers -> funding_type private_equity.
     if p.get("intent_topics"):
+        topics = p["intent_topics"]
         stages = []
-        for topic in p["intent_topics"]:
+        for topic in topics:
             stages.extend(INTENT_TO_FUNDING.get(topic, []))
         if stages:
-            fil["funding_stage"] = list(set(stages))
+            fil["funding_stage"] = {"t": "any", "v": list(dict.fromkeys(stages))}
+        if "IPO" in topics:
+            fil["company_type"] = list(dict.fromkeys(fil.get("company_type", []) + ["public"]))
+        if "Mergers" in topics:
+            fil["funding_type"] = {"t": "any", "v": ["private_equity"]}
 
+    # Revenue -> overlapping Wiza revenue enum buckets (not a min/max object).
     if p.get("revenue_min") or p.get("revenue_max"):
-        rev: dict = {}
-        if p.get("revenue_min"):
-            rev["min"] = p["revenue_min"]
-        if p.get("revenue_max"):
-            rev["max"] = p["revenue_max"]
-        fil["revenue"] = rev
+        buckets = revenue_buckets(p.get("revenue_min"), p.get("revenue_max"))
+        if buckets:
+            fil["revenue"] = buckets
 
     return fil
 
