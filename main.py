@@ -1246,7 +1246,17 @@ async def resolve_company_domain(params: dict) -> None:
     unique search, not per request.
     """
     domain = params.get("company_domain")
-    if not domain or params.get("company"):
+    company = params.get("company")
+    # The ICP parser / frontend often puts the bare domain in the `company`
+    # field too (e.g. company="workflows.io"). A domain isn't a usable company
+    # name, so treat it as the domain to resolve rather than an already-resolved
+    # company — otherwise we'd skip enrichment and text-match the raw domain,
+    # which matches none of the company's actual employees.
+    if company and looks_like_domain(company):
+        domain = domain or company
+        company = None
+        params["company"] = None
+    if not domain or company:
         return
     name = None
     try:
@@ -1255,9 +1265,19 @@ async def resolve_company_domain(params: dict) -> None:
             name = enriched.get("company_name")
     except HTTPException as exc:
         print(f"Domain resolve: company enrich failed for {domain} ({exc.detail})")
-    params["company"] = name or company_name_from_domain(domain)
-    print(f"Domain resolve: {domain} -> company '{params['company']}'"
-          f"{' (exact)' if name else ' (root-label fallback)'}")
+    if name:
+        # Exact company entity — the same domain->company step Wiza's Company tab
+        # runs. Use the canonical name alone and drop the domain so
+        # build_wiza_filters doesn't also OR-in the root-label form, which pulls
+        # in unrelated firms that merely share the word (e.g. "workflows").
+        params["company"] = name
+        params["company_domain"] = None
+        print(f"Domain resolve: {domain} -> company '{name}' (exact)")
+    else:
+        # Enrichment found nothing — keep the domain so build_wiza_filters can
+        # fall back to the root-label / full-domain job_company forms.
+        params["company_domain"] = domain
+        print(f"Domain resolve: {domain} -> no company match, using domain forms")
 
 
 # =============================================================================
