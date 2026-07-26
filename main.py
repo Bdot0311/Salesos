@@ -29,6 +29,13 @@ class Settings(BaseSettings):
     database_url: str
     wiza_api_key: str
     anthropic_api_key: Optional[str] = None
+    # Prospecting data provider. Crustdata is primary because — unlike Wiza —
+    # its people API can filter by a company's exact domain, so a domain search
+    # returns that company's real employees instead of fuzzy name matches. Wiza
+    # is kept wired as a fallback: set SEARCH_PROVIDER=wiza (or leave
+    # CRUSTDATA_API_KEY unset) to route searches back through Wiza.
+    crustdata_api_key: Optional[str] = None
+    search_provider: str = "crustdata"
     # ICP parsing is rule-based by default (no API credits needed). Set
     # USE_LLM_PARSER=true (with ANTHROPIC_API_KEY) to also run the LLM and let it
     # fill any gaps the rules miss.
@@ -50,6 +57,20 @@ class Settings(BaseSettings):
 settings = Settings()
 
 WIZA_BASE = "https://wiza.co/api"
+CRUSTDATA_BASE = "https://api.crustdata.com"
+CRUSTDATA_VERSION = "2025-11-01"
+
+
+def active_provider() -> str:
+    """Which data provider to use for this request.
+
+    Honors SEARCH_PROVIDER but degrades to Wiza if Crustdata is selected
+    without a key configured, so a missing key never breaks search.
+    """
+    p = (settings.search_provider or "crustdata").strip().lower()
+    if p == "crustdata" and not settings.crustdata_api_key:
+        return "wiza"
+    return p
 
 
 # =============================================================================
@@ -1360,6 +1381,227 @@ def aggregate_companies(profiles: list) -> list:
 
 
 # =============================================================================
+# Crustdata provider  (primary — people API can filter by company domain)
+# =============================================================================
+
+# Crustdata person-search field paths (v2025-11-01).
+_CD_DOMAIN = "experience.employment_details.current.company_website_domain"
+_CD_COMPANY = "experience.employment_details.current.company_name"
+_CD_TITLE = "experience.employment_details.current.title"
+_CD_INDUSTRY = "experience.employment_details.current.company_industry"
+_CD_HEADCOUNT = "experience.employment_details.current.company_headcount_latest"
+_CD_LOCATION = "basic_profile.location.raw"
+
+
+def _size_bounds(size: str):
+    """Parse a headcount range label ('11-50', '10001+') into (min, max)."""
+    s = (size or "").replace(",", "").strip()
+    if s.endswith("+"):
+        try:
+            return int(s[:-1]), None
+        except ValueError:
+            return None, None
+    if "-" in s:
+        lo, _, hi = s.partition("-")
+        try:
+            return int(lo), int(hi)
+        except ValueError:
+            return None, None
+    return None, None
+
+
+def build_crustdata_filters(p: dict):
+    """Translate internal search params into a Crustdata person/search filter.
+
+    Returns a single condition, an {op:"and", conditions:[...]} group, or None
+    if there's nothing to filter on. The key win over Wiza: a domain filters
+    people by their company's exact website domain, not a fuzzy name match.
+    """
+    conds: list = []
+
+    company = p.get("company")
+    domain = p.get("company_domain")
+    # A `company` value that is really a bare domain is treated as the domain.
+    if company and not domain and looks_like_domain(company):
+        domain, company = company, None
+    if domain:
+        conds.append({"field": _CD_DOMAIN, "type": "=", "value": domain_host(domain)})
+    elif company:
+        # Fuzzy, typo-tolerant match on the company name when we have no domain.
+        conds.append({"field": _CD_COMPANY, "type": "(.)", "value": company})
+
+    # Job title + keywords → fuzzy title match (Crustdata has no generic keyword
+    # field; title is the closest signal, same as the Wiza mapping).
+    for term in (p.get("job_title"), p.get("keywords")):
+        if term:
+            conds.append({"field": _CD_TITLE, "type": "(.)", "value": term})
+
+    if p.get("location"):
+        conds.append({"field": _CD_LOCATION, "type": "(.)", "value": p["location"]})
+
+    if p.get("industry"):
+        conds.append({"field": _CD_INDUSTRY, "type": "(.)", "value": p["industry"]})
+
+    if p.get("company_size"):
+        lo, hi = _size_bounds(p["company_size"])
+        if lo is not None:
+            conds.append({"field": _CD_HEADCOUNT, "type": "=>", "value": lo})
+        if hi is not None:
+            conds.append({"field": _CD_HEADCOUNT, "type": "=<", "value": hi})
+
+    if not conds:
+        return None
+    return conds[0] if len(conds) == 1 else {"op": "and", "conditions": conds}
+
+
+async def crustdata_person_search(params: dict, limit: int) -> dict:
+    """Call Crustdata POST /person/search. Returns {profiles, total}."""
+    filters = build_crustdata_filters(params)
+    if not filters:
+        raise HTTPException(status_code=400, detail="At least one search parameter required")
+
+    body = {
+        "filters": filters,
+        "limit": max(min(limit, 100), 1),
+        "fields": ["basic_profile", "experience", "contact"],
+    }
+    headers = {
+        "Authorization": f"Bearer {settings.crustdata_api_key}",
+        "x-api-version": CRUSTDATA_VERSION,
+        "Content-Type": "application/json",
+    }
+    print(f"Crustdata person search body: {json.dumps(body)}")
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.post(
+            f"{CRUSTDATA_BASE}/person/search", headers=headers, json=body,
+        )
+        print(f"Crustdata search status: {resp.status_code} {resp.text[:300]}")
+        if resp.status_code == 429:
+            raise HTTPException(status_code=429, detail="Crustdata rate limit reached — please try again in a moment")
+        if resp.status_code not in (200, 201):
+            raise HTTPException(status_code=resp.status_code, detail=f"Crustdata search error: {resp.text[:300]}")
+
+        data = resp.json()
+        profiles = data.get("profiles") or []
+        return {"profiles": profiles, "total": data.get("total_count") or len(profiles)}
+
+
+async def fetch_from_crustdata(params: dict) -> list:
+    """People-search fetcher for /search — returns raw Crustdata profiles."""
+    limit = max(min(params.get("limit", 10), 100), 1)
+    data = await crustdata_person_search(params, limit)
+    return data["profiles"]
+
+
+def _cd_current(profile: dict) -> dict:
+    """The person's primary current employment record (or {})."""
+    cur = (((profile.get("experience") or {}).get("employment_details") or {}).get("current")) or []
+    return cur[0] if cur else {}
+
+
+def transform_crustdata_profile(profile: dict, search_params: dict = None) -> dict:
+    """Transform a Crustdata person into the internal lead shape.
+
+    Search returns email/phone *availability* flags (has_business_email, …); the
+    actual values are pulled on demand by /enrich, so email/phone are None here.
+    """
+    search_params = search_params or {}
+    bp = profile.get("basic_profile") or {}
+    cur = _cd_current(profile)
+    contact = profile.get("contact") or {}
+    loc = bp.get("location") or {}
+
+    name = bp.get("name")
+    first, last = bp.get("first_name"), bp.get("last_name")
+    if name and not (first or last):
+        parts = name.split()
+        if len(parts) >= 2:
+            first, last = parts[0], " ".join(parts[1:])
+        elif parts:
+            first = parts[0]
+
+    industries = cur.get("company_industries") or []
+    website = cur.get("company_website") or ""
+    domain = domain_host(website) if website else None
+
+    return {
+        "contact_name": name,
+        "first_name": first,
+        "last_name": last,
+        "job_title": cur.get("title") or bp.get("current_title"),
+        # Crustdata search doesn't expose the person's LinkedIn URL; /enrich
+        # reveals by full_name + company/domain instead.
+        "linkedin_url": None,
+        "business_email": None,
+        "email_status": "available" if contact.get("has_business_email") else None,
+        "email_available": bool(contact.get("has_business_email")),
+        "phone": None,
+        "phone_available": bool(contact.get("has_phone_number")),
+        "location": loc.get("raw"),
+        "company_name": cur.get("name"),
+        "company_domain": domain,
+        "industry": (cur.get("company_professional_network_industry")
+                     or (industries[0] if industries else None)
+                     or search_params.get("industry")),
+        "company_size": cur.get("company_headcount_range") or search_params.get("company_size"),
+        "company_headcount": cur.get("company_headcount_latest"),
+        "company_revenue": None,
+        "company_funding": None,
+        "technologies": search_params.get("technologies"),
+        "department": (bp.get("normalized_title") or {}).get("department"),
+        "company_linkedin": cur.get("company_professional_network_profile_url"),
+        "profile_picture": bp.get("profile_picture_permalink"),
+        "raw_data": profile,
+    }
+
+
+def aggregate_companies_crustdata(profiles: list) -> list:
+    """Roll Crustdata people up into unique companies with sample contacts.
+
+    Crustdata already returns full firmographics per person, so each company is
+    populated directly from the profiles — no separate enrichment call needed.
+    """
+    companies: dict = {}
+    for p in profiles:
+        bp = p.get("basic_profile") or {}
+        cur = _cd_current(p)
+        name = cur.get("name")
+        website = cur.get("company_website") or ""
+        domain = domain_host(website) if website else None
+        key = (domain or name or "").strip().lower()
+        if not key:
+            continue
+        if key not in companies:
+            industries = cur.get("company_industries") or []
+            companies[key] = {
+                "company_name": name,
+                "company_domain": domain,
+                "industry": cur.get("company_professional_network_industry")
+                            or (industries[0] if industries else None),
+                "company_size": cur.get("company_headcount_range"),
+                "employee_count": cur.get("company_headcount_latest"),
+                "location": cur.get("company_hq_location"),
+                "country": cur.get("company_headquarters_country"),
+                "company_type": cur.get("company_type"),
+                "linkedin": cur.get("company_professional_network_profile_url"),
+                "logo": cur.get("company_profile_picture_permalink"),
+                "enriched": True,
+                "matched_contacts": 0,
+                "sample_contacts": [],
+            }
+        entry = companies[key]
+        entry["matched_contacts"] += 1
+        if len(entry["sample_contacts"]) < 5:
+            entry["sample_contacts"].append({
+                "contact_name": bp.get("name"),
+                "job_title": cur.get("title") or bp.get("current_title"),
+                "linkedin_url": None,
+            })
+    return sorted(companies.values(), key=lambda c: c["matched_contacts"], reverse=True)
+
+
+# =============================================================================
 # Cache helper (generic, cache-first for any endpoint)
 # =============================================================================
 
@@ -1708,25 +1950,31 @@ async def search_leads(request: SearchRequest):
     3. Cache and return results
     """
     params = await resolve_search_params(request)
-    search_hash = generate_search_hash(params)
-    print(f"Search hash: {search_hash}")
+    prov = active_provider()
+    # Namespace the cache by provider so Wiza and Crustdata results (different
+    # shapes) never collide under the same key.
+    search_hash = generate_search_hash({**params, "_provider": prov})
+    print(f"Search hash: {search_hash} (provider={prov})")
+
+    transform = transform_crustdata_profile if prov == "crustdata" else transform_wiza_contact
+    fetcher = fetch_from_crustdata if prov == "crustdata" else fetch_from_wiza
 
     # Cache is best-effort: a DB outage must not blank out every search.
     cached = await cache_lookup(search_hash)
     if cached:
         print(f"Cache HIT for hash: {search_hash}")
         data = json.loads(cached.results)
-        leads = [transform_wiza_contact(r, params) for r in data]
+        leads = [transform(r, params) for r in data]
         return SearchResponse(
             success=True, source="cache", from_cache=True,
             count=len(leads), total=len(leads), leads=leads, data=data,
         )
 
-    print(f"Cache MISS — calling Wiza")
-    raw_results = await fetch_from_wiza(params)
-    print(f"Wiza returned {len(raw_results)} leads")
+    print(f"Cache MISS — calling {prov}")
+    raw_results = await fetcher(params)
+    print(f"{prov} returned {len(raw_results)} leads")
 
-    leads = [transform_wiza_contact(r, params) for r in raw_results]
+    leads = [transform(r, params) for r in raw_results]
     await cache_store(search_hash, params, raw_results)
 
     return SearchResponse(
@@ -1749,18 +1997,24 @@ async def prospects_preview(request: SearchRequest):
     this to size an audience before committing to a full /search enrichment.
     """
     params = await resolve_search_params(request)
+    prov = active_provider()
     size = max(min(request.limit or 10, 30), 0)
 
     async def fetcher():
-        data = await wiza_prospect_search(params, size)
+        if prov == "crustdata":
+            data = await crustdata_person_search(params, size)
+        else:
+            data = await wiza_prospect_search(params, size)
         # Store total alongside profiles so it survives caching
         return [{"_total": data.get("total", 0)}] + (data.get("profiles") or [])
 
-    raw, from_cache = await cached_or_fetch("preview", {**params, "_size": size}, fetcher)
+    raw, from_cache = await cached_or_fetch(
+        "preview", {**params, "_provider": prov, "_size": size}, fetcher)
 
     total = raw[0].get("_total", 0) if raw and "_total" in raw[0] else 0
     profiles = [r for r in raw if "_total" not in r]
-    leads = [transform_preview_profile(p) for p in profiles]
+    preview_transform = transform_crustdata_profile if prov == "crustdata" else transform_preview_profile
+    leads = [preview_transform(p) for p in profiles]
 
     return {
         "success": True,
@@ -1792,11 +2046,18 @@ async def company_search(request: SearchRequest, enrich: bool = True, enrich_lim
     (top matches first). Pass `?enrich=false` to skip enrichment (0 credits).
     """
     params = await resolve_search_params(request)
+    prov = active_provider()
     # Pull the max preview window so we can dedupe as many companies as possible
     size = 30
     enrich_limit = max(min(enrich_limit, 30), 0)
 
     async def fetcher():
+        if prov == "crustdata":
+            # Crustdata returns firmographics inline, so companies are fully
+            # populated from the people search — no per-company enrich needed.
+            data = await crustdata_person_search(params, size)
+            return aggregate_companies_crustdata(data.get("profiles") or [])
+
         data = await wiza_prospect_search(params, size)
         companies = aggregate_companies(data.get("profiles") or [])
         if not enrich:
@@ -1832,7 +2093,7 @@ async def company_search(request: SearchRequest, enrich: bool = True, enrich_lim
 
         return companies
 
-    cache_params = {**params, "_enrich": enrich, "_enrich_limit": enrich_limit}
+    cache_params = {**params, "_provider": prov, "_enrich": enrich, "_enrich_limit": enrich_limit}
     companies, from_cache = await cached_or_fetch("company_search", cache_params, fetcher)
 
     return {
