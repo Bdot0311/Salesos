@@ -1246,7 +1246,17 @@ async def resolve_company_domain(params: dict) -> None:
     unique search, not per request.
     """
     domain = params.get("company_domain")
-    if not domain or params.get("company"):
+    company = params.get("company")
+    # The ICP parser / frontend often puts the bare domain in the `company`
+    # field too (e.g. company="workflows.io"). A domain isn't a usable company
+    # name, so treat it as the domain to resolve rather than an already-resolved
+    # company — otherwise we'd skip enrichment and text-match the raw domain,
+    # which matches none of the company's actual employees.
+    if company and looks_like_domain(company):
+        domain = domain or company
+        company = None
+        params["company"] = None
+    if not domain or company:
         return
     name = None
     try:
@@ -1255,9 +1265,19 @@ async def resolve_company_domain(params: dict) -> None:
             name = enriched.get("company_name")
     except HTTPException as exc:
         print(f"Domain resolve: company enrich failed for {domain} ({exc.detail})")
-    params["company"] = name or company_name_from_domain(domain)
-    print(f"Domain resolve: {domain} -> company '{params['company']}'"
-          f"{' (exact)' if name else ' (root-label fallback)'}")
+    if name:
+        # Exact company entity — the same domain->company step Wiza's Company tab
+        # runs. Use the canonical name alone and drop the domain so
+        # build_wiza_filters doesn't also OR-in the root-label form, which pulls
+        # in unrelated firms that merely share the word (e.g. "workflows").
+        params["company"] = name
+        params["company_domain"] = None
+        print(f"Domain resolve: {domain} -> company '{name}' (exact)")
+    else:
+        # Enrichment found nothing — keep the domain so build_wiza_filters can
+        # fall back to the root-label / full-domain job_company forms.
+        params["company_domain"] = domain
+        print(f"Domain resolve: {domain} -> no company match, using domain forms")
 
 
 # =============================================================================
@@ -1343,34 +1363,57 @@ def aggregate_companies(profiles: list) -> list:
 # Cache helper (generic, cache-first for any endpoint)
 # =============================================================================
 
+async def cache_lookup(search_hash: str):
+    """Return the CachedSearch row for a hash, or None. Never raises: a DB outage
+    degrades to a live (uncached) fetch instead of failing the whole request."""
+    try:
+        async with async_session() as session:
+            stmt = select(CachedSearch).where(CachedSearch.search_hash == search_hash)
+            return (await session.execute(stmt)).scalar_one_or_none()
+    except Exception as e:
+        print(f"WARNING: cache lookup failed ({e}) — proceeding without cache")
+        return None
+
+
+async def cache_store(search_hash: str, params: dict, raw: list) -> None:
+    """Persist a search result; best-effort. Never raises — if the DB is down we
+    simply don't cache, rather than failing a search that already succeeded."""
+    try:
+        async with async_session() as session:
+            session.add(CachedSearch(
+                search_hash=search_hash,
+                search_params=json.dumps(params),
+                results=json.dumps(raw),
+            ))
+            await session.commit()
+    except Exception as e:
+        print(f"WARNING: cache store failed ({e}) — result not cached")
+
+
 async def cached_or_fetch(kind: str, params: dict, fetcher) -> tuple[list, bool]:
     """Cache-first wrapper. `fetcher` is an async callable returning a LIST of
     raw dicts (always a list so /debug and /cache/* stay consistent). Returns
     (raw_results, from_cache). The cache key is namespaced by `kind`.
+
+    Caching is best-effort: if the database is unreachable the search still runs
+    against Wiza and returns live results (just uncached).
     """
     hashable = {"_kind": kind, **params}
     search_hash = generate_search_hash(hashable)
     print(f"[{kind}] search hash: {search_hash}")
 
-    async with async_session() as session:
-        stmt = select(CachedSearch).where(CachedSearch.search_hash == search_hash)
-        cached = (await session.execute(stmt)).scalar_one_or_none()
-        if cached:
-            print(f"[{kind}] cache HIT")
-            return json.loads(cached.results), True
+    cached = await cache_lookup(search_hash)
+    if cached:
+        print(f"[{kind}] cache HIT")
+        return json.loads(cached.results), True
 
-        print(f"[{kind}] cache MISS — calling Wiza")
-        raw = await fetcher()
-        if not isinstance(raw, list):
-            raw = [raw] if raw else []
+    print(f"[{kind}] cache MISS — calling Wiza")
+    raw = await fetcher()
+    if not isinstance(raw, list):
+        raw = [raw] if raw else []
 
-        session.add(CachedSearch(
-            search_hash=search_hash,
-            search_params=json.dumps(hashable),
-            results=json.dumps(raw),
-        ))
-        await session.commit()
-        return raw, False
+    await cache_store(search_hash, hashable, raw)
+    return raw, False
 
 
 # =============================================================================
@@ -1668,36 +1711,28 @@ async def search_leads(request: SearchRequest):
     search_hash = generate_search_hash(params)
     print(f"Search hash: {search_hash}")
 
-    async with async_session() as session:
-        stmt = select(CachedSearch).where(CachedSearch.search_hash == search_hash)
-        cached = (await session.execute(stmt)).scalar_one_or_none()
-
-        if cached:
-            print(f"Cache HIT for hash: {search_hash}")
-            data = json.loads(cached.results)
-            leads = [transform_wiza_contact(r, params) for r in data]
-            return SearchResponse(
-                success=True, source="cache", from_cache=True,
-                count=len(leads), total=len(leads), leads=leads, data=data,
-            )
-
-        print(f"Cache MISS — calling Wiza")
-        raw_results = await fetch_from_wiza(params)
-        print(f"Wiza returned {len(raw_results)} leads")
-
-        leads = [transform_wiza_contact(r, params) for r in raw_results]
-
-        session.add(CachedSearch(
-            search_hash=search_hash,
-            search_params=json.dumps(params),
-            results=json.dumps(raw_results),
-        ))
-        await session.commit()
-
+    # Cache is best-effort: a DB outage must not blank out every search.
+    cached = await cache_lookup(search_hash)
+    if cached:
+        print(f"Cache HIT for hash: {search_hash}")
+        data = json.loads(cached.results)
+        leads = [transform_wiza_contact(r, params) for r in data]
         return SearchResponse(
-            success=True, source="api", from_cache=False,
-            count=len(leads), total=len(leads), leads=leads, data=raw_results,
+            success=True, source="cache", from_cache=True,
+            count=len(leads), total=len(leads), leads=leads, data=data,
         )
+
+    print(f"Cache MISS — calling Wiza")
+    raw_results = await fetch_from_wiza(params)
+    print(f"Wiza returned {len(raw_results)} leads")
+
+    leads = [transform_wiza_contact(r, params) for r in raw_results]
+    await cache_store(search_hash, params, raw_results)
+
+    return SearchResponse(
+        success=True, source="api", from_cache=False,
+        count=len(leads), total=len(leads), leads=leads, data=raw_results,
+    )
 
 
 # =============================================================================
