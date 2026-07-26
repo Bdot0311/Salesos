@@ -1463,7 +1463,9 @@ async def crustdata_person_search(params: dict, limit: int) -> dict:
     body = {
         "filters": filters,
         "limit": max(min(limit, 100), 1),
-        "fields": ["basic_profile", "experience", "contact"],
+        # social_handles carries the person's LinkedIn URL — the identifier the
+        # enrich endpoint needs to reveal their work email/phone on demand.
+        "fields": ["basic_profile", "experience", "contact", "social_handles"],
     }
     headers = {
         "Authorization": f"Bearer {settings.crustdata_api_key}",
@@ -1524,15 +1526,16 @@ def transform_crustdata_profile(profile: dict, search_params: dict = None) -> di
     industries = cur.get("company_industries") or []
     website = cur.get("company_website") or ""
     domain = domain_host(website) if website else None
+    linkedin_url = (((profile.get("social_handles") or {})
+                     .get("professional_network_identifier") or {}).get("profile_url"))
 
     return {
         "contact_name": name,
         "first_name": first,
         "last_name": last,
         "job_title": cur.get("title") or bp.get("current_title"),
-        # Crustdata search doesn't expose the person's LinkedIn URL; /enrich
-        # reveals by full_name + company/domain instead.
-        "linkedin_url": None,
+        # LinkedIn URL is the identifier /enrich uses to reveal email/phone.
+        "linkedin_url": linkedin_url,
         "business_email": None,
         "email_status": "available" if contact.get("has_business_email") else None,
         "email_available": bool(contact.get("has_business_email")),
@@ -1554,6 +1557,65 @@ def transform_crustdata_profile(profile: dict, search_params: dict = None) -> di
         "profile_picture": bp.get("profile_picture_permalink"),
         "raw_data": profile,
     }
+
+
+async def crustdata_person_enrich(linkedin_url: str) -> dict:
+    """Reveal a person's work email + phone via Crustdata POST /person/enrich.
+
+    Crustdata's enrich only accepts a LinkedIn profile URL as the identifier,
+    and email/phone are additive fields that must be requested explicitly (they
+    cost extra credits — the on-demand reveal, same idea as Wiza's reveal).
+    Returns the matched person_data object, or {} if no match.
+    """
+    body = {
+        "professional_network_profile_urls": [linkedin_url],
+        "fields": ["basic_profile", "experience", "contact", "social_handles"],
+    }
+    headers = {
+        "Authorization": f"Bearer {settings.crustdata_api_key}",
+        "x-api-version": CRUSTDATA_VERSION,
+        "Content-Type": "application/json",
+    }
+    print(f"Crustdata enrich request: {json.dumps(body)}")
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.post(
+            f"{CRUSTDATA_BASE}/person/enrich", headers=headers, json=body,
+        )
+        print(f"Crustdata enrich status: {resp.status_code} {resp.text[:200]}")
+        if resp.status_code == 429:
+            raise HTTPException(status_code=429, detail="Crustdata rate limit — try again in a moment")
+        if resp.status_code not in (200, 201):
+            raise HTTPException(status_code=resp.status_code, detail=f"Crustdata enrich error: {resp.text[:300]}")
+
+        data = resp.json()
+        # Response shape: [{matched_on, matches: [{person_data, confidence_score}]}]
+        if isinstance(data, list) and data:
+            matches = data[0].get("matches") or []
+            if matches:
+                return matches[0].get("person_data") or {}
+        return {}
+
+
+def transform_crustdata_enrich(person_data: dict) -> dict:
+    """Transform a Crustdata enrich person_data object into the internal lead."""
+    lead = transform_crustdata_profile(person_data)
+    contact = person_data.get("contact") or {}
+
+    biz = contact.get("business_emails") or []
+    primary = biz[0] if biz else None
+    if not primary:
+        personal = contact.get("personal_emails") or []
+        primary = personal[0] if personal else None
+    phones = contact.get("phone_numbers") or []
+
+    lead["business_email"] = primary.get("email") if primary else None
+    lead["email_status"] = primary.get("status") if primary else None
+    lead["email_available"] = bool(biz)
+    lead["phone"] = (phones[0].get("number") or phones[0].get("phone_number")
+                     or (phones[0] if isinstance(phones[0], str) else None)) if phones else None
+    lead["phone_available"] = bool(phones)
+    return lead
 
 
 def aggregate_companies_crustdata(profiles: list) -> list:
@@ -1720,10 +1782,24 @@ class EnrichRequest(BaseModel):
 @app.post("/enrich")
 async def enrich_lead(request: EnrichRequest):
     """
-    Enrich a single lead via Wiza Individual Reveal.
-    Accepts linkedin_url, email, or full_name + company/domain.
-    Polls until finished (up to 60s) then returns the enriched contact.
+    Enrich a single lead. Crustdata (primary) reveals by LinkedIn URL — the
+    identifier its search returns. Anything without a LinkedIn URL (email-only,
+    or name+company) falls through to the Wiza reveal, so the fallback provider
+    still covers cases Crustdata's enrich can't take.
     """
+    # Crustdata reveal path: fast, single call, keyed on the LinkedIn URL that
+    # Crustdata-sourced leads carry.
+    if active_provider() == "crustdata" and request.linkedin_url:
+        person = await crustdata_person_enrich(request.linkedin_url)
+        if person:
+            lead = transform_crustdata_enrich(person)
+            return {
+                "success": True,
+                "enrichment_status": "complete" if lead.get("business_email") else "no_email",
+                "lead": lead,
+            }
+        # No Crustdata match — fall through to Wiza with whatever identifiers we have.
+
     headers = {
         "Authorization": f"Bearer {settings.wiza_api_key}",
         "Content-Type": "application/json",
