@@ -7,7 +7,7 @@ import asyncio
 import hashlib
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 import anthropic
@@ -17,6 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator, Field, AliasChoices
 from pydantic_settings import BaseSettings
 from sqlalchemy import Column, String, Text, DateTime, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
 
@@ -40,6 +41,9 @@ class Settings(BaseSettings):
     # USE_LLM_PARSER=true (with ANTHROPIC_API_KEY) to also run the LLM and let it
     # fill any gaps the rules miss.
     use_llm_parser: bool = False
+    # Search results older than this are treated as cache misses. Set to 0 to
+    # disable search-result caching without dropping the cache table.
+    search_cache_ttl_seconds: int = 3600
 
     class Config:
         env_file = ".env"
@@ -758,6 +762,18 @@ class CachedSearch(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class CampaignSeenLead(Base):
+    """A durable per-campaign ledger used to prevent resurfacing people."""
+
+    __tablename__ = "campaign_seen_leads"
+
+    campaign_id = Column(String(128), primary_key=True)
+    lead_key = Column(String(256), primary_key=True)
+    crustdata_person_id = Column(String(64), nullable=True)
+    profile_url = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 # =============================================================================
 # Database Setup
 # =============================================================================
@@ -811,6 +827,16 @@ class SearchRequest(BaseModel):
 
     limit: int = 10
 
+    # Search controls. Cursor is opaque and must be echoed from `next_cursor`.
+    cursor: Optional[str] = None
+    campaign_id: Optional[str] = None
+    exclude_profiles: Optional[list[str]] = None
+    refresh: bool = False
+    # Broad title-only searches are blocked by default because they were the
+    # final, unsafe step in the frontend's progressive fallback. A deliberate
+    # title-only search must opt in explicitly.
+    allow_broad_search: bool = False
+
     @field_validator("keywords", "seniority", "job_title", "location", "company_location",
                      "company", "company_domain", "industry", "company_size", "query", mode="before")
     @classmethod
@@ -819,11 +845,19 @@ class SearchRequest(BaseModel):
             return ", ".join(str(x) for x in v) if v else None
         return v
 
-    @field_validator("technologies", "departments", "intent_topics", "signals", mode="before")
+    @field_validator("technologies", "departments", "intent_topics", "signals",
+                     "exclude_profiles", mode="before")
     @classmethod
     def coerce_list(cls, v):
         if isinstance(v, str):
             return [x.strip() for x in v.split(",") if x.strip()]
+        return v
+
+    @field_validator("campaign_id")
+    @classmethod
+    def validate_campaign_id(cls, v):
+        if v is not None and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", v):
+            raise ValueError("campaign_id must be 1-128 URL-safe characters")
         return v
 
 
@@ -843,6 +877,8 @@ class SearchResponse(BaseModel):
     total: int
     leads: list
     data: list
+    next_cursor: Optional[str] = None
+    campaign_id: Optional[str] = None
 
 
 # =============================================================================
@@ -1388,9 +1424,27 @@ def aggregate_companies(profiles: list) -> list:
 _CD_DOMAIN = "experience.employment_details.current.company_website_domain"
 _CD_COMPANY = "experience.employment_details.current.company_name"
 _CD_TITLE = "experience.employment_details.current.title"
-_CD_INDUSTRY = "experience.employment_details.current.company_industry"
+_CD_INDUSTRY = "experience.employment_details.current.company_industries"
 _CD_HEADCOUNT = "experience.employment_details.current.company_headcount_latest"
-_CD_LOCATION = "basic_profile.location.raw"
+_CD_LOCATION = "basic_profile.location.full_location"
+_CD_COUNTRY = "basic_profile.location.country"
+_CD_SENIORITY = "experience.employment_details.current.seniority_level"
+_CD_COMPANY_LOCATION = "experience.employment_details.current.company_hq_location"
+
+_CD_COUNTRY_ALIASES = {
+    "us": "United States", "u.s": "United States", "u.s.": "United States",
+    "usa": "United States", "united states": "United States",
+    "uk": "United Kingdom", "u.k": "United Kingdom", "u.k.": "United Kingdom",
+    "united kingdom": "United Kingdom",
+}
+
+_CD_SENIORITY_MAP = {
+    "entry": "Entry", "training": "Training", "intern": "Entry",
+    "junior": "Entry", "senior": "Senior", "manager": "Manager",
+    "head": "Manager", "director": "Director", "partner": "Partner",
+    "vp": "VP", "c_suite": "CXO", "cxo": "CXO", "owner": "Owner",
+    "founder": "Owner",
+}
 
 
 def _size_bounds(size: str):
@@ -1430,14 +1484,28 @@ def build_crustdata_filters(p: dict):
         # Fuzzy, typo-tolerant match on the company name when we have no domain.
         conds.append({"field": _CD_COMPANY, "type": "(.)", "value": company})
 
-    # Job title + keywords → fuzzy title match (Crustdata has no generic keyword
-    # field; title is the closest signal, same as the Wiza mapping).
-    for term in (p.get("job_title"), p.get("keywords")):
-        if term:
-            conds.append({"field": _CD_TITLE, "type": "(.)", "value": term})
+    if p.get("job_title"):
+        conds.append({"field": _CD_TITLE, "type": "(.)", "value": p["job_title"]})
+
+    if p.get("seniority"):
+        raw_seniority = p["seniority"].strip()
+        seniority = _CD_SENIORITY_MAP.get(raw_seniority.lower(), raw_seniority)
+        conds.append({"field": _CD_SENIORITY, "type": "=", "value": seniority})
 
     if p.get("location"):
-        conds.append({"field": _CD_LOCATION, "type": "(.)", "value": p["location"]})
+        raw_location = p["location"].strip()
+        country = _CD_COUNTRY_ALIASES.get(raw_location.lower())
+        if country:
+            conds.append({"field": _CD_COUNTRY, "type": "=", "value": country})
+        else:
+            conds.append({"field": _CD_LOCATION, "type": "(.)", "value": raw_location})
+
+    if p.get("company_location"):
+        conds.append({
+            "field": _CD_COMPANY_LOCATION,
+            "type": "(.)",
+            "value": p["company_location"].strip(),
+        })
 
     if p.get("industry"):
         conds.append({"field": _CD_INDUSTRY, "type": "(.)", "value": p["industry"]})
@@ -1454,19 +1522,39 @@ def build_crustdata_filters(p: dict):
     return conds[0] if len(conds) == 1 else {"op": "and", "conditions": conds}
 
 
-async def crustdata_person_search(params: dict, limit: int) -> dict:
-    """Call Crustdata POST /person/search. Returns {profiles, total}."""
+async def crustdata_person_search(
+    params: dict,
+    limit: int,
+    cursor: str = None,
+    exclude_profiles: list[str] = None,
+) -> dict:
+    """Call Crustdata POST /person/search with stable cursor pagination."""
     filters = build_crustdata_filters(params)
-    if not filters:
+    semantic_query = (params.get("keywords") or "").strip()
+    if not filters and not semantic_query:
         raise HTTPException(status_code=400, detail="At least one search parameter required")
 
     body = {
-        "filters": filters,
         "limit": max(min(limit, 100), 1),
+        # A deterministic unique key prevents page drift while walking cursors.
+        "sorts": [{"field": "crustdata_person_id", "order": "asc"}],
         # social_handles carries the person's LinkedIn URL — the identifier the
         # enrich endpoint needs to reveal their work email/phone on demand.
-        "fields": ["basic_profile", "experience", "contact", "social_handles"],
+        "fields": ["crustdata_person_id", "basic_profile", "experience", "contact", "social_handles"],
     }
+    if filters:
+        body["filters"] = filters
+    if semantic_query:
+        body["search"] = {"query": semantic_query, "mode": "hybrid"}
+        # Keep structured filters as hard constraints; keywords only rank within
+        # the requested ICP rather than broadening it.
+        if filters:
+            body["mode"] = "exact"
+    if cursor:
+        body["cursor"] = cursor
+    exclusions = list(dict.fromkeys(x for x in (exclude_profiles or []) if x))
+    if exclusions:
+        body["post_processing"] = {"exclude_profiles": exclusions}
     headers = {
         "Authorization": f"Bearer {settings.crustdata_api_key}",
         "x-api-version": CRUSTDATA_VERSION,
@@ -1486,7 +1574,12 @@ async def crustdata_person_search(params: dict, limit: int) -> dict:
 
         data = resp.json()
         profiles = data.get("profiles") or []
-        return {"profiles": profiles, "total": data.get("total_count") or len(profiles)}
+        total = data.get("total_count")
+        return {
+            "profiles": profiles,
+            "total": len(profiles) if total is None else total,
+            "next_cursor": data.get("next_cursor"),
+        }
 
 
 async def fetch_from_crustdata(params: dict) -> list:
@@ -1667,13 +1760,102 @@ def aggregate_companies_crustdata(profiles: list) -> list:
 # Cache helper (generic, cache-first for any endpoint)
 # =============================================================================
 
+def _profile_url(profile: dict) -> Optional[str]:
+    return (((profile.get("social_handles") or {})
+             .get("professional_network_identifier") or {}).get("profile_url"))
+
+
+def _profile_lead_key(profile: dict) -> Optional[str]:
+    person_id = profile.get("crustdata_person_id")
+    if person_id is not None:
+        return f"id:{person_id}"
+    profile_url = _profile_url(profile)
+    if profile_url:
+        return f"url:{hashlib.sha256(profile_url.encode()).hexdigest()}"
+    return None
+
+
+def dedupe_crustdata_profiles(profiles: list[dict]) -> list[dict]:
+    """Remove duplicate people within a provider page while preserving order."""
+    output, seen = [], set()
+    for profile in profiles:
+        key = _profile_lead_key(profile)
+        if key and key in seen:
+            continue
+        if key:
+            seen.add(key)
+        output.append(profile)
+    return output
+
+
+async def campaign_seen(campaign_id: str) -> tuple[set[str], list[str]]:
+    """Return the campaign's durable lead keys and usable provider exclusions."""
+    try:
+        async with async_session() as session:
+            rows = (await session.execute(
+                select(CampaignSeenLead).where(CampaignSeenLead.campaign_id == campaign_id)
+            )).scalars().all()
+            return {row.lead_key for row in rows}, [row.profile_url for row in rows if row.profile_url]
+    except Exception as e:
+        print(f"WARNING: campaign seen lookup failed ({e})")
+        return set(), []
+
+
+async def record_new_campaign_profiles(campaign_id: str, profiles: list[dict]) -> list[dict]:
+    """Atomically claim unseen profiles and return only rows claimed by this call.
+
+    PostgreSQL's ON CONFLICT guard makes concurrent requests for one campaign
+    safe: only one request can claim a given person and surface it to the user.
+    Profiles without a stable provider ID or profile URL are returned but cannot
+    be tracked durably.
+    """
+    keyed = [(profile, _profile_lead_key(profile)) for profile in profiles]
+    trackable = [(profile, key) for profile, key in keyed if key]
+    untrackable = [profile for profile, key in keyed if not key]
+    if not trackable:
+        return untrackable
+
+    values = [{
+        "campaign_id": campaign_id,
+        "lead_key": key,
+        "crustdata_person_id": (str(profile.get("crustdata_person_id"))
+                                 if profile.get("crustdata_person_id") is not None else None),
+        "profile_url": _profile_url(profile),
+        "created_at": datetime.utcnow(),
+    } for profile, key in trackable]
+
+    try:
+        async with async_session() as session:
+            stmt = (pg_insert(CampaignSeenLead)
+                    .values(values)
+                    .on_conflict_do_nothing(index_elements=["campaign_id", "lead_key"])
+                    .returning(CampaignSeenLead.lead_key))
+            inserted = set((await session.execute(stmt)).scalars().all())
+            await session.commit()
+        return [profile for profile, key in keyed if key is None or key in inserted]
+    except Exception as e:
+        # Availability wins if the seen-ledger DB is temporarily unavailable;
+        # the provider-level exclusions still prevent most repeats.
+        print(f"WARNING: campaign seen store failed ({e})")
+        return profiles
+
 async def cache_lookup(search_hash: str):
     """Return the CachedSearch row for a hash, or None. Never raises: a DB outage
     degrades to a live (uncached) fetch instead of failing the whole request."""
     try:
         async with async_session() as session:
             stmt = select(CachedSearch).where(CachedSearch.search_hash == search_hash)
-            return (await session.execute(stmt)).scalar_one_or_none()
+            cached = (await session.execute(stmt)).scalar_one_or_none()
+            if not cached:
+                return None
+            ttl = max(settings.search_cache_ttl_seconds, 0)
+            if ttl == 0:
+                return None
+            cached_at = cached.updated_at or cached.created_at
+            if cached_at and datetime.utcnow() - cached_at > timedelta(seconds=ttl):
+                print(f"Cache EXPIRED for hash: {search_hash}")
+                return None
+            return cached
     except Exception as e:
         print(f"WARNING: cache lookup failed ({e}) — proceeding without cache")
         return None
@@ -1684,11 +1866,19 @@ async def cache_store(search_hash: str, params: dict, raw: list) -> None:
     simply don't cache, rather than failing a search that already succeeded."""
     try:
         async with async_session() as session:
-            session.add(CachedSearch(
-                search_hash=search_hash,
-                search_params=json.dumps(params),
-                results=json.dumps(raw),
-            ))
+            existing = (await session.execute(
+                select(CachedSearch).where(CachedSearch.search_hash == search_hash)
+            )).scalar_one_or_none()
+            if existing:
+                existing.search_params = json.dumps(params)
+                existing.results = json.dumps(raw)
+                existing.updated_at = datetime.utcnow()
+            else:
+                session.add(CachedSearch(
+                    search_hash=search_hash,
+                    search_params=json.dumps(params),
+                    results=json.dumps(raw),
+                ))
             await session.commit()
     except Exception as e:
         print(f"WARNING: cache store failed ({e}) — result not cached")
@@ -1957,6 +2147,10 @@ STRUCTURED_FIELDS = {
     "keywords", "intent_topics", "revenue_min", "revenue_max", "job_change_days",
 }
 
+SEARCH_CONTROL_FIELDS = {
+    "cursor", "campaign_id", "exclude_profiles", "refresh", "allow_broad_search",
+}
+
 
 async def resolve_search_params(request: SearchRequest) -> dict:
     """Turn a SearchRequest into concrete Wiza params.
@@ -1965,7 +2159,10 @@ async def resolve_search_params(request: SearchRequest) -> dict:
     filters via the ICP parser (falling back to a keyword search). Shared by
     /search, /prospects/preview and /company/search.
     """
-    params = {k: v for k, v in request.model_dump().items() if v is not None and v != "" and v != []}
+    params = {
+        k: v for k, v in request.model_dump().items()
+        if k not in SEARCH_CONTROL_FIELDS and v is not None and v != "" and v != []
+    }
     print(f"=== SEARCH REQUEST ===\nFiltered params: {params}")
 
     raw_query = params.pop("query", None)
@@ -2015,6 +2212,42 @@ async def resolve_search_params(request: SearchRequest) -> dict:
     return params
 
 
+def enforce_crustdata_search_scope(params: dict, allow_broad_search: bool) -> None:
+    """Reject the unsafe endpoint of the old progressive fallback.
+
+    The caller may still intentionally perform a title-only search, but it must
+    say so. This converts silent ICP broadening into a visible 422 response.
+    """
+    narrowing_fields = {
+        "company", "company_domain", "location", "company_location",
+        "company_size", "industry", "seniority", "keywords", "departments",
+        "technologies", "intent_topics", "revenue_min", "revenue_max",
+        "job_change_days",
+    }
+    if params.get("job_title") and not any(params.get(k) for k in narrowing_fields):
+        if not allow_broad_search:
+            raise HTTPException(
+                status_code=422,
+                detail=("Refusing a title-only Crustdata search because it can silently broaden "
+                        "the requested ICP. Retain at least one narrowing filter or set "
+                        "allow_broad_search=true for a deliberate title-only search."),
+            )
+
+    unsupported = [
+        field for field in (
+            "departments", "technologies", "intent_topics", "revenue_min",
+            "revenue_max", "job_change_days", "signals",
+        )
+        if params.get(field)
+    ]
+    if unsupported:
+        raise HTTPException(
+            status_code=422,
+            detail=("Crustdata does not map these requested filters yet: "
+                    f"{', '.join(unsupported)}. Refusing to silently ignore them."),
+        )
+
+
 @app.post("/search", response_model=SearchResponse)
 async def search_leads(request: SearchRequest):
     """
@@ -2027,35 +2260,91 @@ async def search_leads(request: SearchRequest):
     """
     params = await resolve_search_params(request)
     prov = active_provider()
+    if prov == "crustdata":
+        enforce_crustdata_search_scope(params, request.allow_broad_search)
+    elif request.cursor:
+        raise HTTPException(status_code=422, detail="Cursor pagination is only available with Crustdata")
+
     # Namespace the cache by provider so Wiza and Crustdata results (different
     # shapes) never collide under the same key.
-    search_hash = generate_search_hash({**params, "_provider": prov})
+    cache_params = {**params, "_provider": prov}
+    if request.cursor:
+        cache_params["_cursor"] = request.cursor
+    if request.exclude_profiles:
+        cache_params["_exclude_profiles"] = sorted(set(request.exclude_profiles))
+    search_hash = generate_search_hash(cache_params)
     print(f"Search hash: {search_hash} (provider={prov})")
 
     transform = transform_crustdata_profile if prov == "crustdata" else transform_wiza_contact
-    fetcher = fetch_from_crustdata if prov == "crustdata" else fetch_from_wiza
+
+    campaign_keys: set[str] = set()
+    campaign_exclusions: list[str] = []
+    if prov == "crustdata" and request.campaign_id:
+        campaign_keys, campaign_exclusions = await campaign_seen(request.campaign_id)
+
+    exclusions = list(dict.fromkeys(
+        (request.exclude_profiles or []) + campaign_exclusions
+    ))
+
+    # Campaign membership changes after every response, so campaign searches
+    # must never reuse a shared cached page. Explicit refresh also bypasses it.
+    use_cache = not request.refresh and not request.campaign_id
 
     # Cache is best-effort: a DB outage must not blank out every search.
-    cached = await cache_lookup(search_hash)
+    cached = await cache_lookup(search_hash) if use_cache else None
     if cached:
         print(f"Cache HIT for hash: {search_hash}")
-        data = json.loads(cached.results)
+        cached_payload = json.loads(cached.results)
+        if isinstance(cached_payload, dict):
+            data = cached_payload.get("profiles") or []
+            total = cached_payload.get("total", len(data))
+            next_cursor = cached_payload.get("next_cursor")
+        else:
+            # Backwards compatibility with cache rows written before cursor
+            # metadata was persisted.
+            data = cached_payload
+            total = len(data)
+            next_cursor = None
         leads = [transform(r, params) for r in data]
         return SearchResponse(
             success=True, source="cache", from_cache=True,
-            count=len(leads), total=len(leads), leads=leads, data=data,
+            count=len(leads), total=total, leads=leads, data=data,
+            next_cursor=next_cursor, campaign_id=request.campaign_id,
         )
 
     print(f"Cache MISS — calling {prov}")
-    raw_results = await fetcher(params)
+    next_cursor = None
+    if prov == "crustdata":
+        result = await crustdata_person_search(
+            params,
+            max(min(params.get("limit", 10), 100), 1),
+            cursor=request.cursor,
+            exclude_profiles=exclusions,
+        )
+        raw_results = dedupe_crustdata_profiles(result["profiles"])
+        # Provider exclusions require profile URLs; this catches previously seen
+        # stable IDs even when a profile has no URL.
+        if campaign_keys:
+            raw_results = [p for p in raw_results if _profile_lead_key(p) not in campaign_keys]
+        if request.campaign_id:
+            raw_results = await record_new_campaign_profiles(request.campaign_id, raw_results)
+        total = result["total"]
+        next_cursor = result.get("next_cursor")
+    else:
+        raw_results = await fetch_from_wiza(params)
+        total = len(raw_results)
     print(f"{prov} returned {len(raw_results)} leads")
 
     leads = [transform(r, params) for r in raw_results]
-    await cache_store(search_hash, params, raw_results)
+    cache_payload = ({"profiles": raw_results, "total": total, "next_cursor": next_cursor}
+                     if prov == "crustdata" else raw_results)
+    if not request.campaign_id:
+        await cache_store(search_hash, cache_params, cache_payload)
 
     return SearchResponse(
         success=True, source="api", from_cache=False,
-        count=len(leads), total=len(leads), leads=leads, data=raw_results,
+        count=len(leads), total=total, leads=leads, data=raw_results,
+        next_cursor=next_cursor, campaign_id=request.campaign_id,
     )
 
 
@@ -2240,6 +2529,29 @@ async def company_enrich(request: CompanyEnrichRequest):
 # Cache Management Endpoints
 # =============================================================================
 
+def _cached_items(payload) -> list:
+    """Read both legacy list rows and cursor-aware search cache payloads."""
+    if isinstance(payload, dict) and isinstance(payload.get("profiles"), list):
+        return payload["profiles"]
+    return payload if isinstance(payload, list) else []
+
+
+def _is_crustdata_profile(value: dict) -> bool:
+    return bool(value.get("crustdata_person_id") is not None or value.get("basic_profile"))
+
+
+@app.delete("/campaigns/{campaign_id}/seen")
+async def clear_campaign_seen(campaign_id: str):
+    """Reset a campaign's dedupe ledger so its leads may be surfaced again."""
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", campaign_id):
+        raise HTTPException(status_code=422, detail="Invalid campaign_id")
+    async with async_session() as session:
+        result = await session.execute(
+            CampaignSeenLead.__table__.delete().where(CampaignSeenLead.campaign_id == campaign_id)
+        )
+        await session.commit()
+    return {"campaign_id": campaign_id, "deleted": result.rowcount or 0}
+
 @app.delete("/cache")
 async def clear_cache():
     async with async_session() as session:
@@ -2252,9 +2564,9 @@ async def clear_cache():
 async def clear_empty_cache():
     async with async_session() as session:
         all_cached = (await session.execute(select(CachedSearch))).scalars().all()
-        deleted = sum(1 for c in all_cached if len(json.loads(c.results)) == 0)
+        deleted = sum(1 for c in all_cached if len(_cached_items(json.loads(c.results))) == 0)
         for c in all_cached:
-            if len(json.loads(c.results)) == 0:
+            if len(_cached_items(json.loads(c.results))) == 0:
                 await session.delete(c)
         await session.commit()
     return {"message": f"Cleared {deleted} empty cached searches"}
@@ -2270,11 +2582,12 @@ async def cache_stats():
         )).scalars().all()
         return {
             "cached_searches": count,
+            "ttl_seconds": settings.search_cache_ttl_seconds,
             "recent_searches": [
                 {
                     "search_hash": s.search_hash,
                     "params": json.loads(s.search_params),
-                    "result_count": len(json.loads(s.results)),
+                    "result_count": len(_cached_items(json.loads(s.results))),
                     "created_at": s.created_at.isoformat() if s.created_at else None,
                 }
                 for s in recent
@@ -2296,12 +2609,15 @@ async def get_all_cached_leads():
             # Skip company/preview caches — this fallback returns enriched people only
             if search_params.get("_kind"):
                 continue
-            data = json.loads(cached.results)
+            data = _cached_items(json.loads(cached.results))
             for contact in data:
-                key = f"{contact.get('full_name', '')}-{contact.get('name', '')}"
+                key = (_profile_lead_key(contact) if _is_crustdata_profile(contact)
+                       else f"{contact.get('full_name', '')}-{contact.get('name', '')}")
                 if key not in seen:
                     seen.add(key)
-                    all_leads.append(transform_wiza_contact(contact, search_params))
+                    transform = (transform_crustdata_profile if _is_crustdata_profile(contact)
+                                 else transform_wiza_contact)
+                    all_leads.append(transform(contact, search_params))
 
         return {
             "success": True, "from_cache": True,
@@ -2319,14 +2635,18 @@ async def get_cached_search(search_hash: str):
         if not cached:
             raise HTTPException(status_code=404, detail="Cached search not found")
 
-        data = json.loads(cached.results)
+        payload = json.loads(cached.results)
+        data = _cached_items(payload)
         search_params = json.loads(cached.search_params)
-        leads = [transform_wiza_contact(r, search_params) for r in data]
+        transform = (transform_crustdata_profile
+                     if data and _is_crustdata_profile(data[0]) else transform_wiza_contact)
+        leads = [transform(r, search_params) for r in data]
         return {
             "success": True, "from_cache": True,
             "search_params": search_params,
             "leads": leads, "data": data,
             "count": len(leads), "total": len(leads),
+            "next_cursor": payload.get("next_cursor") if isinstance(payload, dict) else None,
             "created_at": cached.created_at.isoformat() if cached.created_at else None,
         }
 
@@ -2341,8 +2661,9 @@ async def debug_info():
                 {
                     "hash": c.search_hash,
                     "params": json.loads(c.search_params),
-                    "result_count": len(json.loads(c.results)),
-                    "sample_lead": json.loads(c.results)[0] if json.loads(c.results) else None,
+                    "result_count": len(_cached_items(json.loads(c.results))),
+                    "sample_lead": (_cached_items(json.loads(c.results))[0]
+                                    if _cached_items(json.loads(c.results)) else None),
                     "created_at": c.created_at.isoformat() if c.created_at else None,
                 }
                 for c in all_cached

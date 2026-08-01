@@ -44,6 +44,54 @@ Search for leads (cache-first).
 
 Response includes `source: "cache"` or `source: "api"` to indicate data origin.
 
+Crustdata searches are cursor-paginated and deduplicated. Keep one stable
+`campaign_id` for a prospecting run, then pass each response's `next_cursor`
+into the next request. The backend records every returned
+`crustdata_person_id`, excludes profiles already seen by that campaign, and uses
+a stable person-ID sort so pages do not drift.
+
+```json
+{
+  "job_title": "Founder",
+  "seniority": "owner",
+  "location": "US",
+  "industry": "computer software",
+  "keywords": "cold email and outbound automation",
+  "company_size": "1-10",
+  "campaign_id": "august-founder-outreach",
+  "limit": 10,
+  "cursor": null
+}
+```
+
+Response pagination fields:
+
+```json
+{
+  "count": 10,
+  "total": 1240,
+  "next_cursor": "opaque-provider-cursor",
+  "campaign_id": "august-founder-outreach"
+}
+```
+
+- Do not progressively delete filters after a provider error. Unsupported
+  filters now return `422` instead of being silently ignored.
+- Title-only Crustdata searches return `422` by default. Set
+  `allow_broad_search: true` only when the user deliberately requested a broad
+  title search.
+- `keywords` uses Crustdata hybrid semantic search and structured filters remain
+  hard constraints; keywords are no longer treated as a second job title.
+- Set `refresh: true` to bypass a cached page. Cache rows expire after
+  `SEARCH_CACHE_TTL_SECONDS` (default `3600`; set `0` to disable caching).
+- Pass `exclude_profiles` with profile URLs for one-off exclusions when a
+  campaign ledger is not appropriate.
+- Reset a campaign ledger with `DELETE /campaigns/{campaign_id}/seen`.
+
+The frontend should stop on any non-2xx response and display the error. It must
+not retry by stripping `location`, `industry`, `company_size`, `seniority`, or
+semantic keywords.
+
 Runs Wiza's async 3-step list workflow (create → poll → enriched contacts) and
 spends email/enrichment credits. Accepts a natural-language `query` (auto-parsed
 into filters) as an alternative to structured fields.
