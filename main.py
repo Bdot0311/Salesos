@@ -1536,12 +1536,17 @@ async def crustdata_person_search(
 
     body = {
         "limit": max(min(limit, 100), 1),
-        # A deterministic unique key prevents page drift while walking cursors.
-        "sorts": [{"field": "crustdata_person_id", "order": "asc"}],
         # social_handles carries the person's LinkedIn URL — the identifier the
         # enrich endpoint needs to reveal their work email/phone on demand.
         "fields": ["crustdata_person_id", "basic_profile", "experience", "contact", "social_handles"],
     }
+    if not semantic_query:
+        # A deterministic unique key prevents page drift while walking cursors.
+        # Crustdata rejects the whole request with 400 "sorts are not supported
+        # when using semantic search" if this is sent alongside a search query,
+        # so a keyword search orders by relevance and paginates on the cursor
+        # alone.
+        body["sorts"] = [{"field": "crustdata_person_id", "order": "asc"}]
     if filters:
         body["filters"] = filters
     if semantic_query:
