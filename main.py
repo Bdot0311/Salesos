@@ -30,13 +30,18 @@ class Settings(BaseSettings):
     database_url: str
     wiza_api_key: str
     anthropic_api_key: Optional[str] = None
-    # Prospecting data provider. Crustdata is primary because — unlike Wiza —
-    # its people API can filter by a company's exact domain, so a domain search
-    # returns that company's real employees instead of fuzzy name matches. Wiza
-    # is kept wired as a fallback: set SEARCH_PROVIDER=wiza (or leave
-    # CRUSTDATA_API_KEY unset) to route searches back through Wiza.
+    # Prospecting data providers, tried in order: Bytemine, then Crustdata, then
+    # Wiza. A provider is only in the chain if its key is configured, so adding a
+    # key is all it takes to put one in front. SEARCH_PROVIDER pins whichever
+    # provider should be tried first; the others still follow it as fallbacks.
+    #
+    # The order is by capability, not preference. Bytemine and Crustdata both
+    # return masked/flagged contacts from search and charge on reveal, which
+    # matches how the app bills. Wiza's list workflow returns enriched contacts
+    # and spends an email credit per search, so it sits last.
+    bytemine_api_key: Optional[str] = None
     crustdata_api_key: Optional[str] = None
-    search_provider: str = "crustdata"
+    search_provider: str = "bytemine"
     # ICP parsing is rule-based by default (no API credits needed). Set
     # USE_LLM_PARSER=true (with ANTHROPIC_API_KEY) to also run the LLM and let it
     # fill any gaps the rules miss.
@@ -63,16 +68,50 @@ settings = Settings()
 WIZA_BASE = "https://wiza.co/api"
 CRUSTDATA_BASE = "https://api.crustdata.com"
 CRUSTDATA_VERSION = "2025-11-01"
+# Bytemine routes every endpoint through one gateway: the real path and method
+# travel in the JSON body rather than the URL.
+BYTEMINE_GATEWAY = "https://bvjmtgaxijpyasjtaqiv.supabase.co/functions/v1/api-gateway"
+
+# Default order, best-fit first. Filtered down to configured providers by
+# provider_chain().
+PROVIDER_ORDER = ("bytemine", "crustdata", "wiza")
+
+
+def provider_configured(name: str) -> bool:
+    """True when this provider has the credentials to be called at all."""
+    if name == "bytemine":
+        return bool(settings.bytemine_api_key)
+    if name == "crustdata":
+        return bool(settings.crustdata_api_key)
+    if name == "wiza":
+        return bool(settings.wiza_api_key)
+    return False
+
+
+def provider_chain() -> list[str]:
+    """Providers to try for one search, in order.
+
+    SEARCH_PROVIDER pins which one leads; the rest follow as fallbacks in
+    PROVIDER_ORDER. Only configured providers appear, so an unset key removes a
+    provider from the chain rather than breaking the request — and a chain of
+    one behaves exactly like the single-provider setup this replaced.
+    """
+    preferred = (settings.search_provider or PROVIDER_ORDER[0]).strip().lower()
+    ordered = [preferred] + [p for p in PROVIDER_ORDER if p != preferred]
+    chain = [p for p in ordered if p in PROVIDER_ORDER and provider_configured(p)]
+    # Wiza's key is required by Settings, so the chain is never empty in
+    # practice; the guard keeps a misconfigured environment from failing here
+    # with an IndexError instead of a readable provider error.
+    return chain or ["wiza"]
 
 
 def provider_state() -> tuple[str, bool]:
-    """(provider, degraded) for this request.
+    """(provider, degraded) — the provider that leads the chain.
 
-    Honors SEARCH_PROVIDER but degrades to Wiza if Crustdata is selected
-    without a key configured, so a missing key never breaks search.
-
-    `degraded` distinguishes that accident from someone deliberately setting
-    SEARCH_PROVIDER=wiza, and the two must not behave alike. Wiza's list
+    `degraded` means the provider SEARCH_PROVIDER asked for is not the one that
+    will run, because its key is missing. That distinguishes an accident from
+    someone deliberately setting SEARCH_PROVIDER=wiza, and the two must not
+    behave alike. Wiza's list
     workflow returns already-enriched contacts and spends an email credit per
     search, so a silent degradation would bill every search to the Wiza account
     while the app charges the user nothing — searching is free now, the credit
@@ -80,10 +119,12 @@ def provider_state() -> tuple[str, bool]:
     preview endpoint, which spends no credits and returns identity + company +
     LinkedIn URL, leaving the reveal to /enrich exactly as Crustdata does.
     """
-    p = (settings.search_provider or "crustdata").strip().lower()
-    if p == "crustdata" and not settings.crustdata_api_key:
-        return "wiza", True
-    return p, False
+    chain = provider_chain()
+    preferred = (settings.search_provider or PROVIDER_ORDER[0]).strip().lower()
+    head = chain[0]
+    # Degraded means the provider that was asked for is not the one that will
+    # run, which for Wiza changes what a search costs — see the note above.
+    return head, head != preferred
 
 
 def active_provider() -> str:
@@ -898,6 +939,12 @@ class SearchResponse(BaseModel):
     data: list
     next_cursor: Optional[str] = None
     campaign_id: Optional[str] = None
+    # Which provider actually served this search, and which ones were tried and
+    # passed over. Without it a fallback is invisible: the caller cannot tell
+    # whether the leads came from the provider it expects, or why the shape of
+    # the data changed between two identical-looking searches.
+    provider: Optional[str] = None
+    provider_attempts: Optional[list] = None
 
 
 # =============================================================================
@@ -1436,7 +1483,291 @@ def aggregate_companies(profiles: list) -> list:
 
 
 # =============================================================================
-# Crustdata provider  (primary — people API can filter by company domain)
+# Bytemine provider  (first in the chain — masked search, reveal on unlock)
+# =============================================================================
+
+# Bytemine's seniority vocabulary. "C-Team" is the canonical spelling; the API
+# also accepts C-Level/C-Suite/CXO aliases, but sending the canonical value
+# keeps what we send and what we log identical.
+_BM_SENIORITY = {
+    "founder": "Owner", "owner": "Owner", "partner": "Partner",
+    "cxo": "C-Team", "c-level": "C-Team", "c-suite": "C-Team", "c_suite": "C-Team",
+    "executive": "C-Team", "chief": "C-Team",
+    "vp": "VP", "vice president": "VP",
+    "director": "Director", "head": "Director",
+    "manager": "Manager", "senior": "Senior",
+    "entry": "Entry", "junior": "Entry", "intern": "Training", "training": "Training",
+}
+
+# Bytemine's employee bands. Note the top band is "10000+", not the "10001+"
+# Wiza uses — sending the wrong string filters nothing.
+_BM_EMPLOYEE_BANDS = [
+    (1, 10, "1-10"), (11, 50, "11-50"), (51, 200, "51-200"),
+    (201, 500, "201-500"), (501, 1000, "501-1000"),
+    (1001, 5000, "1001-5000"), (5001, 10000, "5001-10000"),
+]
+_BM_TOP_BAND = "10000+"
+
+_US_STATES = {
+    "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA", "HI", "ID", "IL",
+    "IN", "IA", "KS", "KY", "LA", "ME", "MD", "MA", "MI", "MN", "MS", "MO", "MT",
+    "NE", "NV", "NH", "NJ", "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI",
+    "SC", "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY", "DC",
+}
+
+
+def bytemine_employee_band(size: str):
+    """Map a headcount range onto a Bytemine employee band, or None.
+
+    Accepts the "N-M" / "N+" shapes the rest of the pipeline uses and picks the
+    band containing the range's floor. Returns None when there is no number to
+    read, so the caller can decline the search rather than drop the filter.
+    """
+    if not size:
+        return None
+    numbers = [int(n.replace(",", "")) for n in re.findall(r"\d[\d,]*", str(size))]
+    if not numbers:
+        return None
+    floor = min(numbers)
+    for low, high, band in _BM_EMPLOYEE_BANDS:
+        if floor <= high:
+            return band
+    return _BM_TOP_BAND
+
+
+class ProviderUnsupported(Exception):
+    """This provider cannot express one of the requested filters.
+
+    Raised instead of quietly dropping it: the chain moves to the next provider,
+    which is the whole reason a fallback exists. Silently ignoring the filter
+    would return leads outside the requested ICP.
+    """
+
+    def __init__(self, field: str, value):
+        super().__init__(f"{field}={value!r}")
+        self.field = field
+        self.value = value
+
+
+def build_bytemine_filters(p: dict) -> dict:
+    """Translate internal search params into a Bytemine /contacts/search body.
+
+    Raises ProviderUnsupported for anything Bytemine's contact search cannot
+    express — notably country-level location and free-text keywords, which it
+    has no field for. Crustdata handles both, so those searches fall through.
+    """
+    body: dict = {}
+
+    if p.get("job_title"):
+        body["jobTitles"] = [p["job_title"]]
+    if p.get("seniority"):
+        mapped = _BM_SENIORITY.get(str(p["seniority"]).strip().lower())
+        if mapped:
+            body["seniorityLevels"] = [mapped]
+    if p.get("departments"):
+        depts = p["departments"]
+        body["departments"] = depts if isinstance(depts, list) else [depts]
+    if p.get("industry"):
+        body["industries"] = [p["industry"]]
+    if p.get("company"):
+        body["companyNames"] = [p["company"]]
+    if p.get("company_domain"):
+        body["urls"] = [p["company_domain"]]
+
+    if p.get("company_size"):
+        band = bytemine_employee_band(p["company_size"])
+        if not band:
+            raise ProviderUnsupported("company_size", p["company_size"])
+        body["employeeSizes"] = [band]
+
+    # /contacts/search filters location by US state or city only. A country —
+    # which is what the ICP parser usually produces — has no field, so rather
+    # than search the whole world under a country filter the user set, hand the
+    # query to a provider that supports it.
+    location = p.get("location") or p.get("company_location")
+    if location:
+        token = str(location).strip()
+        if token.upper() in _US_STATES:
+            body["states"] = [token.upper()]
+        elif len(token) > 2 and token.upper() not in {"US", "USA", "GB", "UK"}:
+            body["cities"] = [token]
+        else:
+            raise ProviderUnsupported("location", location)
+
+    # No free-text field exists on contact search; keywords would be dropped.
+    if p.get("keywords"):
+        raise ProviderUnsupported("keywords", p["keywords"])
+
+    if not body:
+        raise HTTPException(status_code=400, detail="At least one search parameter required")
+    return body
+
+
+async def bytemine_call(path: str, body: dict, timeout: float = 60.0) -> dict:
+    """POST one Bytemine gateway request and return the decoded payload.
+
+    Every endpoint goes through a single URL with the real path and method in
+    the JSON body, so this is the only place that shape is constructed.
+    """
+    headers = {
+        "x-amz-security-token": settings.bytemine_api_key or "",
+        "Content-Type": "application/json",
+    }
+    envelope = {"path": path, "method": "POST", "body": body}
+    print(f"Bytemine {path} body: {json.dumps(body)[:400]}")
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.post(BYTEMINE_GATEWAY, headers=headers, json=envelope)
+        print(f"Bytemine {path} status: {resp.status_code} {resp.text[:300]}")
+        if resp.status_code == 402:
+            raise HTTPException(
+                status_code=402,
+                detail="Bytemine credits exhausted — top up the Bytemine account to keep searching",
+            )
+        if resp.status_code == 429:
+            raise HTTPException(
+                status_code=429,
+                detail="Bytemine rate limit reached — please try again in a moment",
+            )
+        if resp.status_code not in (200, 201):
+            raise HTTPException(
+                status_code=resp.status_code,
+                detail=f"Bytemine {path} error: {resp.text[:300]}",
+            )
+        return resp.json()
+
+
+async def bytemine_person_search(params: dict, limit: int, cursor: str = None) -> dict:
+    """Search Bytemine prospects. Results come back masked; /enrich unlocks them."""
+    body = build_bytemine_filters(params)
+    body["pageSize"] = max(min(limit, 100), 1)
+    body["page"] = 0
+    if cursor:
+        body["after"] = cursor
+
+    data = await bytemine_call("/contacts/search", body)
+    profiles = data.get("data") or []
+    pagination = data.get("pagination") or {}
+    total = pagination.get("total")
+    return {
+        "profiles": profiles,
+        "total": len(profiles) if total is None else total,
+        "next_cursor": pagination.get("after") or data.get("after"),
+        "credits_used": data.get("credits_used"),
+    }
+
+
+async def fetch_from_bytemine(params: dict) -> list:
+    """People-search fetcher for /search — returns raw Bytemine profiles."""
+    limit = max(min(params.get("limit", 10), 100), 1)
+    data = await bytemine_person_search(params, limit)
+    return data["profiles"]
+
+
+def _bm_masked(value) -> bool:
+    """True when a masked field indicates the real value exists behind it.
+
+    Search returns "***" where a contact has an email or phone, so presence of
+    the mask — not its content — is the availability signal.
+    """
+    return bool(value) and str(value).strip() not in {"", "null", "None"}
+
+
+def transform_bytemine_profile(profile: dict, search_params: dict = None) -> dict:
+    """Transform a Bytemine contact into the internal lead shape.
+
+    Search returns email and phone masked as "***"; the real values come from
+    /contacts/unlock keyed on `pid`, so they are None here and `pid` is carried
+    through for the reveal.
+    """
+    search_params = search_params or {}
+    first = profile.get("first_name")
+    last = profile.get("last_name")
+    full = " ".join(x for x in (first, last) if x) or profile.get("full_name")
+
+    city, state = profile.get("city"), profile.get("state")
+    location = ", ".join(x for x in (city, state) if x and not isinstance(x, int)) or None
+
+    return {
+        "contact_name": full,
+        "first_name": first,
+        "last_name": last,
+        "job_title": profile.get("job_title"),
+        "linkedin_url": profile.get("linkedin_url"),
+        # The unlock identifier. /enrich needs it to reveal this exact record.
+        "bytemine_pid": profile.get("pid"),
+        "business_email": None,
+        "email_status": "available" if _bm_masked(profile.get("email")) else None,
+        "email_available": _bm_masked(profile.get("email")),
+        "phone": None,
+        "phone_available": _bm_masked(profile.get("phone")),
+        "location": location,
+        "company_name": profile.get("company_name"),
+        "company_domain": profile.get("company_domain"),
+        "industry": profile.get("company_industry") or search_params.get("industry"),
+        "company_size": (profile.get("company_employee_range")
+                         or search_params.get("company_size")),
+        "company_headcount": None,
+        "company_revenue": profile.get("company_revenue_range"),
+        "company_funding": None,
+        "technologies": search_params.get("technologies"),
+        "department": profile.get("department"),
+        "company_linkedin": None,
+        "profile_picture": None,
+        "raw_data": profile,
+    }
+
+
+def transform_bytemine_unlocked(record: dict) -> dict:
+    """Transform an unlocked/enriched Bytemine contact into the internal shape.
+
+    Unlock and enrich return the real email and phone, plus the same
+    firmographics search returns under slightly different keys.
+    """
+    lead = transform_bytemine_profile(record)
+    email = (record.get("work_email") or record.get("email")
+             or record.get("personal_email"))
+    phone = (record.get("phone") or record.get("direct_dial")
+             or record.get("mobile_phone"))
+    lead.update({
+        "contact_name": record.get("full_name") or lead["contact_name"],
+        "business_email": email if email and "*" not in str(email) else None,
+        "email_status": "verified" if email and "*" not in str(email) else "no_email",
+        "email_available": bool(email and "*" not in str(email)),
+        "phone": phone if phone and "*" not in str(phone) else None,
+        "phone_available": bool(phone and "*" not in str(phone)),
+        "linkedin_url": record.get("linkedin_profile") or lead["linkedin_url"],
+        "company_linkedin": record.get("company_linkedin_profile"),
+    })
+    return lead
+
+
+async def bytemine_unlock(pid: str) -> dict:
+    """Reveal one contact by PID via /contacts/unlock. Costs 1 credit."""
+    data = await bytemine_call("/contacts/unlock", {"pids": [str(pid)]})
+    records = data.get("data") or data.get("results") or []
+    if isinstance(records, dict):
+        records = [records]
+    return records[0] if records else {}
+
+
+async def bytemine_enrich(identifiers: dict) -> dict:
+    """Reveal a contact from an email, phone, LinkedIn URL or name + domain."""
+    body = {k: v for k, v in identifiers.items() if v}
+    if not body:
+        return {}
+    # At least one match filter must be true or the upstream rejects the call.
+    body.setdefault("hasWorkEmail", True)
+    body.setdefault("hasPhone", True)
+    data = await bytemine_call("/contacts/enrich", body)
+    record = data.get("data") or {}
+    if isinstance(record, list):
+        record = record[0] if record else {}
+    return record
+
+
+# =============================================================================
+# Crustdata provider  (fallback — people API can filter by company domain)
 # =============================================================================
 
 # Crustdata person-search field paths (v2025-11-01).
@@ -1973,20 +2304,23 @@ async def startup():
 
 @app.get("/health")
 async def health_check():
-    """Liveness plus the provider actually in use.
+    """Liveness plus the provider chain actually in use.
 
-    The provider is reported because a missing Crustdata key silently changes
-    which upstream serves every search. Without this the degradation is
-    invisible until someone reads the logs or notices the result shape.
+    The chain is reported because a missing key silently changes which upstream
+    serves every search, and each returns a different shape. Without this the
+    change is invisible until someone reads the logs or notices the results.
     """
     prov, degraded = provider_state()
+    chain = provider_chain()
+    preferred = (settings.search_provider or PROVIDER_ORDER[0]).strip().lower()
     return {
         "status": "healthy",
         "search_provider": prov,
+        "provider_chain": chain,
         "degraded": degraded,
         "degraded_reason": (
-            "CRUSTDATA_API_KEY unset while SEARCH_PROVIDER=crustdata; "
-            "serving credit-free Wiza preview search"
+            f"SEARCH_PROVIDER={preferred} but no API key is configured for it; "
+            f"searches are served by {prov}"
         ) if degraded else None,
     }
 
@@ -2013,6 +2347,11 @@ class EnrichRequest(BaseModel):
     company: Optional[str] = None
     company_domain: Optional[str] = Field(
         default=None, validation_alias=AliasChoices("company_domain", "domain"))
+    # Bytemine's unlock identifier, carried on every lead its search returns.
+    # Unlocking by PID reveals the exact record that was shown, so it cannot
+    # resolve to a different person the way a name lookup can.
+    bytemine_pid: Optional[str] = Field(
+        default=None, validation_alias=AliasChoices("bytemine_pid", "pid"))
 
     model_config = {"populate_by_name": True}
 
@@ -2020,19 +2359,59 @@ class EnrichRequest(BaseModel):
 @app.post("/enrich")
 async def enrich_lead(request: EnrichRequest):
     """
-    Enrich a single lead. Crustdata (primary) reveals by LinkedIn URL — the
-    identifier its search returns. Anything without a LinkedIn URL (email-only,
-    or name+company) falls through to the Wiza reveal, so the fallback provider
-    still covers cases Crustdata's enrich can't take.
+    Enrich a single lead, trying each configured provider in turn.
+
+    Each provider reveals from the identifier its own search hands back, so the
+    order follows what the lead is carrying rather than a fixed preference: a
+    Bytemine PID unlocks the exact record that was shown, a LinkedIn URL goes to
+    Crustdata, and anything left (email-only, or name + company) falls through to
+    the Wiza reveal, which accepts the widest set of identifiers.
     """
+    chain = provider_chain()
+
+    # Bytemine reveal: unlock by PID when the lead came from its search,
+    # otherwise match on whatever identifier we do have.
+    if "bytemine" in chain:
+        record = {}
+        try:
+            if request.bytemine_pid:
+                record = await bytemine_unlock(request.bytemine_pid)
+            elif request.linkedin_url or request.email:
+                record = await bytemine_enrich({
+                    "linkedin": request.linkedin_url,
+                    "email": request.email,
+                    "firstName": (request.full_name or "").split(" ")[0] or None,
+                    "lastName": " ".join((request.full_name or "").split(" ")[1:]) or None,
+                    "companyDomain": request.company_domain,
+                    "companyName": request.company,
+                })
+        except HTTPException as exc:
+            # A reveal that fails at one provider should still be attempted at
+            # the next — the lead is the same person either way.
+            print(f"Bytemine reveal failed ({exc.status_code}); trying next provider")
+            record = {}
+        if record:
+            lead = transform_bytemine_unlocked(record)
+            return {
+                "success": True,
+                "provider": "bytemine",
+                "enrichment_status": "complete" if lead.get("business_email") else "no_email",
+                "lead": lead,
+            }
+
     # Crustdata reveal path: fast, single call, keyed on the LinkedIn URL that
     # Crustdata-sourced leads carry.
-    if active_provider() == "crustdata" and request.linkedin_url:
-        person = await crustdata_person_enrich(request.linkedin_url)
+    if "crustdata" in chain and request.linkedin_url:
+        try:
+            person = await crustdata_person_enrich(request.linkedin_url)
+        except HTTPException as exc:
+            print(f"Crustdata reveal failed ({exc.status_code}); falling through to Wiza")
+            person = {}
         if person:
             lead = transform_crustdata_enrich(person)
             return {
                 "success": True,
+                "provider": "crustdata",
                 "enrichment_status": "complete" if lead.get("business_email") else "no_email",
                 "lead": lead,
             }
@@ -2107,6 +2486,7 @@ async def enrich_lead(request: EnrichRequest):
                                         "email_credits", "phone_credits", "export_credits", "api_credits")}
                 return {
                     "success": True,
+                    "provider": "wiza",
                     "enrichment_status": "complete" if data.get("status") != "failed" else "failed",
                     "lead": transform_reveal_contact(contact),
                 }
@@ -2307,30 +2687,37 @@ async def search_leads(request: SearchRequest):
     3. Cache and return results
     """
     params = await resolve_search_params(request)
+    chain = provider_chain()
     prov, degraded = provider_state()
-    if prov == "crustdata":
-        enforce_crustdata_search_scope(params, request.allow_broad_search)
-    elif request.cursor:
-        raise HTTPException(status_code=422, detail="Cursor pagination is only available with Crustdata")
+    if request.cursor and prov not in ("crustdata", "bytemine"):
+        raise HTTPException(
+            status_code=422,
+            detail="Cursor pagination is only available with Crustdata or Bytemine")
 
-    # Namespace the cache by provider so Wiza and Crustdata results (different
-    # shapes) never collide under the same key.
+    # Namespace the cache by the whole chain: the same params can be served by
+    # a different provider once a key is added or a balance runs out, and the
+    # shapes differ. The stored payload records which provider produced it so a
+    # cache hit is transformed the way it was written.
     # The degraded path returns preview-shaped profiles, not the enriched
     # contacts the full Wiza workflow yields, so it needs its own namespace.
-    cache_params = {**params, "_provider": "wiza-preview" if degraded else prov}
+    cache_params = {**params, "_provider": "wiza-preview" if degraded else "+".join(chain)}
     if request.cursor:
         cache_params["_cursor"] = request.cursor
     if request.exclude_profiles:
         cache_params["_exclude_profiles"] = sorted(set(request.exclude_profiles))
     search_hash = generate_search_hash(cache_params)
-    print(f"Search hash: {search_hash} (provider={prov})")
+    print(f"Search hash: {search_hash} (chain={'+'.join(chain)})")
 
-    if prov == "crustdata":
-        transform = transform_crustdata_profile
-    elif degraded:
-        transform = lambda profile, _params=None: transform_preview_profile(profile)
-    else:
-        transform = transform_wiza_contact
+    def transform_for(name: str):
+        if name == "bytemine":
+            return transform_bytemine_profile
+        if name == "crustdata":
+            return transform_crustdata_profile
+        if degraded:
+            return lambda profile, _params=None: transform_preview_profile(profile)
+        return transform_wiza_contact
+
+    transform = transform_for(prov)
 
     campaign_keys: set[str] = set()
     campaign_exclusions: list[str] = []
@@ -2350,10 +2737,15 @@ async def search_leads(request: SearchRequest):
     if cached:
         print(f"Cache HIT for hash: {search_hash}")
         cached_payload = json.loads(cached.results)
+        served_by = prov
         if isinstance(cached_payload, dict):
             data = cached_payload.get("profiles") or []
             total = cached_payload.get("total", len(data))
             next_cursor = cached_payload.get("next_cursor")
+            # Rows written before the chain existed have no provider recorded;
+            # they can only have come from the head of the chain.
+            served_by = cached_payload.get("provider") or prov
+            transform = transform_for(served_by)
         else:
             # Backwards compatibility with cache rows written before cursor
             # metadata was persisted.
@@ -2365,40 +2757,95 @@ async def search_leads(request: SearchRequest):
             success=True, source="cache", from_cache=True,
             count=len(leads), total=total, leads=leads, data=data,
             next_cursor=next_cursor, campaign_id=request.campaign_id,
+            provider=served_by,
         )
 
-    print(f"Cache MISS — calling {prov}")
+    print(f"Cache MISS — walking chain {'+'.join(chain)}")
+
+    async def run_provider(name: str):
+        """One provider's search. Returns (raw_results, total, next_cursor)."""
+        if name == "bytemine":
+            result = await bytemine_person_search(
+                params, max(min(params.get("limit", 10), 100), 1), cursor=request.cursor)
+            return result["profiles"], result["total"], result.get("next_cursor")
+
+        if name == "crustdata":
+            # The title-only guard belongs to Crustdata's filter model, so it is
+            # applied when Crustdata runs rather than up front — a chain that
+            # never reaches Crustdata should not be refused by its rules.
+            enforce_crustdata_search_scope(params, request.allow_broad_search)
+            result = await crustdata_person_search(
+                params,
+                max(min(params.get("limit", 10), 100), 1),
+                cursor=request.cursor,
+                exclude_profiles=exclusions,
+            )
+            found = dedupe_crustdata_profiles(result["profiles"])
+            # Provider exclusions require profile URLs; this catches previously
+            # seen stable IDs even when a profile has no URL.
+            if campaign_keys:
+                found = [p for p in found if _profile_lead_key(p) not in campaign_keys]
+            if request.campaign_id:
+                found = await record_new_campaign_profiles(request.campaign_id, found)
+            return found, result["total"], result.get("next_cursor")
+
+        if degraded:
+            # Credit-free preview search — see provider_state(). Wiza caps this
+            # endpoint at 30 profiles per call.
+            data = await wiza_prospect_search(
+                params, max(min(params.get("limit", 10), 30), 1))
+            found = data.get("profiles") or []
+            return found, data.get("total", len(found)), None
+
+        found = await fetch_from_wiza(params)
+        return found, len(found), None
+
+    raw_results: list = []
+    total = 0
     next_cursor = None
-    if prov == "crustdata":
-        result = await crustdata_person_search(
-            params,
-            max(min(params.get("limit", 10), 100), 1),
-            cursor=request.cursor,
-            exclude_profiles=exclusions,
-        )
-        raw_results = dedupe_crustdata_profiles(result["profiles"])
-        # Provider exclusions require profile URLs; this catches previously seen
-        # stable IDs even when a profile has no URL.
-        if campaign_keys:
-            raw_results = [p for p in raw_results if _profile_lead_key(p) not in campaign_keys]
-        if request.campaign_id:
-            raw_results = await record_new_campaign_profiles(request.campaign_id, raw_results)
-        total = result["total"]
-        next_cursor = result.get("next_cursor")
-    elif degraded:
-        # Credit-free preview search — see provider_state(). Wiza caps this
-        # endpoint at 30 profiles per call.
-        data = await wiza_prospect_search(params, max(min(params.get("limit", 10), 30), 1))
-        raw_results = data.get("profiles") or []
-        total = data.get("total", len(raw_results))
-    else:
-        raw_results = await fetch_from_wiza(params)
-        total = len(raw_results)
-    print(f"{prov}{' (degraded preview)' if degraded else ''} returned {len(raw_results)} leads")
+    served_by = chain[0]
+    attempts: list = []
+
+    for index, name in enumerate(chain):
+        is_last = index == len(chain) - 1
+        try:
+            raw_results, total, next_cursor = await run_provider(name)
+        except ProviderUnsupported as unsupported:
+            # The provider cannot express one of the requested filters. Moving on
+            # keeps the ICP intact; dropping the filter would not.
+            print(f"{name} cannot express {unsupported} — trying next provider")
+            attempts.append({"provider": name, "outcome": "unsupported_filter",
+                             "detail": unsupported.field})
+            continue
+        except HTTPException as exc:
+            # 4xx about the request itself will fail identically everywhere, so
+            # they surface rather than burning a call on every provider.
+            if exc.status_code in (400, 422) or is_last:
+                raise
+            print(f"{name} failed ({exc.status_code}) — trying next provider")
+            attempts.append({"provider": name, "outcome": "error",
+                             "detail": exc.status_code})
+            continue
+
+        if raw_results:
+            served_by = name
+            break
+
+        # An empty result is not an error, but the next provider may hold the
+        # data this one lacks. Cheap to try: providers charge per result.
+        attempts.append({"provider": name, "outcome": "no_results"})
+        if not is_last:
+            print(f"{name} returned 0 leads — trying next provider")
+        else:
+            served_by = name
+
+    transform = transform_for(served_by)
+    print(f"{served_by}{' (degraded preview)' if degraded and served_by == 'wiza' else ''} "
+          f"returned {len(raw_results)} leads")
 
     leads = [transform(r, params) for r in raw_results]
-    cache_payload = ({"profiles": raw_results, "total": total, "next_cursor": next_cursor}
-                     if prov == "crustdata" else raw_results)
+    cache_payload = {"profiles": raw_results, "total": total,
+                     "next_cursor": next_cursor, "provider": served_by}
     if not request.campaign_id:
         await cache_store(search_hash, cache_params, cache_payload)
 
@@ -2406,6 +2853,7 @@ async def search_leads(request: SearchRequest):
         success=True, source="api", from_cache=False,
         count=len(leads), total=total, leads=leads, data=raw_results,
         next_cursor=next_cursor, campaign_id=request.campaign_id,
+        provider=served_by, provider_attempts=attempts or None,
     )
 
 
