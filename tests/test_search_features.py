@@ -159,5 +159,54 @@ class CrustdataRequestTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body["cursor"], "page-2")
 
 
+class ProviderStateTests(unittest.TestCase):
+    """A missing Crustdata key must not silently bill searches to Wiza.
+
+    Wiza's list workflow returns enriched contacts and spends an email credit
+    per search. Since searching is free for the user now — the credit is spent
+    on reveal — a silent degradation would turn every search into uncharged
+    spend on the Wiza account.
+    """
+
+    def test_crustdata_with_a_key_is_not_degraded(self):
+        with patch.object(main.settings, "search_provider", "crustdata"), \
+             patch.object(main.settings, "crustdata_api_key", "key"):
+            self.assertEqual(main.provider_state(), ("crustdata", False))
+            self.assertFalse(main.provider_degraded())
+
+    def test_missing_crustdata_key_degrades_and_is_flagged(self):
+        with patch.object(main.settings, "search_provider", "crustdata"), \
+             patch.object(main.settings, "crustdata_api_key", None):
+            provider, degraded = main.provider_state()
+            self.assertEqual(provider, "wiza")
+            self.assertTrue(degraded)
+
+    def test_deliberate_wiza_is_not_treated_as_degraded(self):
+        # Choosing Wiza on purpose keeps the full enrichment workflow; only the
+        # accidental fallback is routed to the credit-free preview.
+        with patch.object(main.settings, "search_provider", "wiza"), \
+             patch.object(main.settings, "crustdata_api_key", None):
+            self.assertEqual(main.provider_state(), ("wiza", False))
+
+
+class HealthTests(unittest.IsolatedAsyncioTestCase):
+    async def test_health_reports_the_active_provider(self):
+        with patch.object(main.settings, "search_provider", "crustdata"), \
+             patch.object(main.settings, "crustdata_api_key", "key"):
+            body = await main.health_check()
+        self.assertEqual(body["status"], "healthy")
+        self.assertEqual(body["search_provider"], "crustdata")
+        self.assertFalse(body["degraded"])
+        self.assertIsNone(body["degraded_reason"])
+
+    async def test_health_surfaces_a_degraded_provider(self):
+        with patch.object(main.settings, "search_provider", "crustdata"), \
+             patch.object(main.settings, "crustdata_api_key", None):
+            body = await main.health_check()
+        self.assertEqual(body["search_provider"], "wiza")
+        self.assertTrue(body["degraded"])
+        self.assertIn("CRUSTDATA_API_KEY", body["degraded_reason"])
+
+
 if __name__ == "__main__":
     unittest.main()
