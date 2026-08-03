@@ -44,6 +44,41 @@ Search for leads (cache-first).
 
 Response includes `source: "cache"` or `source: "api"` to indicate data origin.
 
+### Provider chain
+
+Searches are served by the first provider that can answer them, tried in order:
+**Bytemine → Crustdata → Wiza**. A provider only joins the chain if its key is
+configured (`BYTEMINE_API_KEY`, `CRUSTDATA_API_KEY`, `WIZA_API_KEY`), so adding a
+key is all it takes to put one in front. `SEARCH_PROVIDER` pins which one leads;
+the others still follow it as fallbacks.
+
+The order follows capability. Bytemine and Crustdata both return masked or
+flagged contacts from search and charge on reveal, matching how the app bills.
+Wiza's list workflow returns already-enriched contacts and spends an email
+credit per search, so it sits last.
+
+A search moves to the next provider when the current one:
+
+- **cannot express a filter** — Bytemine's contact search has no country or
+  free-text keyword field, so those queries go to Crustdata rather than having
+  the filter dropped;
+- **fails** — including `402` when a provider's own credit balance is empty;
+- **returns nothing** — the next provider may hold data this one lacks.
+
+A `400` or `422` is about the query itself, so it surfaces immediately instead
+of being retried against every provider. Every response reports which provider
+served it and which were passed over:
+
+```json
+{
+  "provider": "crustdata",
+  "provider_attempts": [{ "provider": "bytemine", "outcome": "unsupported_filter", "detail": "keywords" }]
+}
+```
+
+`GET /health` reports the live chain and flags a provider that was asked for but
+has no key configured.
+
 Crustdata searches are cursor-paginated and deduplicated. Keep one stable
 `campaign_id` for a prospecting run, then pass each response's `next_cursor`
 into the next request. The backend records every returned
