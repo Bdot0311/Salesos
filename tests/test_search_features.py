@@ -116,7 +116,6 @@ class CrustdataRequestTests(unittest.IsolatedAsyncioTestCase):
         body = FakeClient.last_json
 
         self.assertEqual(body["cursor"], "current-page")
-        self.assertEqual(body["sorts"], [{"field": "crustdata_person_id", "order": "asc"}])
         self.assertEqual(body["search"], {"query": "outbound automation", "mode": "hybrid"})
         self.assertEqual(body["mode"], "exact")
         self.assertEqual(
@@ -125,6 +124,39 @@ class CrustdataRequestTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result["next_cursor"], "next-page")
         self.assertEqual(result["total"], 12)
+
+    @patch.object(main.httpx, "AsyncClient", FakeClient)
+    async def test_sorts_are_omitted_when_the_search_is_semantic(self):
+        """Crustdata 400s the whole request if sorts accompany a search query.
+
+        Any ICP carrying keywords went semantic while still sending sorts, so
+        Crustdata replied 400 "sorts are not supported when using semantic
+        search" and the search failed outright — the caller then reported it as
+        an exhausted credit balance.
+        """
+        await main.crustdata_person_search(
+            {"job_title": "Founder", "company_size": "1-10",
+             "industry": "computer software", "keywords": "pre-revenue"},
+            10,
+        )
+        body = FakeClient.last_json
+
+        self.assertNotIn("sorts", body)
+        self.assertEqual(body["search"]["query"], "pre-revenue")
+
+    @patch.object(main.httpx, "AsyncClient", FakeClient)
+    async def test_sorts_are_sent_when_there_is_no_semantic_query(self):
+        """Without a search query the stable sort still guards cursor paging."""
+        await main.crustdata_person_search(
+            {"job_title": "CEO", "location": "DE", "industry": "manufacturing"},
+            10,
+            cursor="page-2",
+        )
+        body = FakeClient.last_json
+
+        self.assertEqual(body["sorts"], [{"field": "crustdata_person_id", "order": "asc"}])
+        self.assertNotIn("search", body)
+        self.assertEqual(body["cursor"], "page-2")
 
 
 if __name__ == "__main__":
