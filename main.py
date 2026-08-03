@@ -65,16 +65,35 @@ CRUSTDATA_BASE = "https://api.crustdata.com"
 CRUSTDATA_VERSION = "2025-11-01"
 
 
-def active_provider() -> str:
-    """Which data provider to use for this request.
+def provider_state() -> tuple[str, bool]:
+    """(provider, degraded) for this request.
 
     Honors SEARCH_PROVIDER but degrades to Wiza if Crustdata is selected
     without a key configured, so a missing key never breaks search.
+
+    `degraded` distinguishes that accident from someone deliberately setting
+    SEARCH_PROVIDER=wiza, and the two must not behave alike. Wiza's list
+    workflow returns already-enriched contacts and spends an email credit per
+    search, so a silent degradation would bill every search to the Wiza account
+    while the app charges the user nothing — searching is free now, the credit
+    is spent on reveal. The degraded path therefore searches through Wiza's
+    preview endpoint, which spends no credits and returns identity + company +
+    LinkedIn URL, leaving the reveal to /enrich exactly as Crustdata does.
     """
     p = (settings.search_provider or "crustdata").strip().lower()
     if p == "crustdata" and not settings.crustdata_api_key:
-        return "wiza"
-    return p
+        return "wiza", True
+    return p, False
+
+
+def active_provider() -> str:
+    """Which data provider to use for this request."""
+    return provider_state()[0]
+
+
+def provider_degraded() -> bool:
+    """True when we fell back to Wiza because Crustdata has no key configured."""
+    return provider_state()[1]
 
 
 # =============================================================================
@@ -1936,6 +1955,15 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def startup():
+    prov, degraded = provider_state()
+    if degraded:
+        print("WARNING: SEARCH_PROVIDER=crustdata but CRUSTDATA_API_KEY is unset.")
+        print("Falling back to Wiza's credit-free preview search: results are capped")
+        print("at 30 per page and carry no firmographics beyond company/industry.")
+        print("Set CRUSTDATA_API_KEY to restore full search.")
+    else:
+        print(f"Search provider: {prov}")
+
     try:
         await init_db()
     except Exception as e:
@@ -1945,7 +1973,22 @@ async def startup():
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy"}
+    """Liveness plus the provider actually in use.
+
+    The provider is reported because a missing Crustdata key silently changes
+    which upstream serves every search. Without this the degradation is
+    invisible until someone reads the logs or notices the result shape.
+    """
+    prov, degraded = provider_state()
+    return {
+        "status": "healthy",
+        "search_provider": prov,
+        "degraded": degraded,
+        "degraded_reason": (
+            "CRUSTDATA_API_KEY unset while SEARCH_PROVIDER=crustdata; "
+            "serving credit-free Wiza preview search"
+        ) if degraded else None,
+    }
 
 
 # =============================================================================
@@ -2264,7 +2307,7 @@ async def search_leads(request: SearchRequest):
     3. Cache and return results
     """
     params = await resolve_search_params(request)
-    prov = active_provider()
+    prov, degraded = provider_state()
     if prov == "crustdata":
         enforce_crustdata_search_scope(params, request.allow_broad_search)
     elif request.cursor:
@@ -2272,7 +2315,9 @@ async def search_leads(request: SearchRequest):
 
     # Namespace the cache by provider so Wiza and Crustdata results (different
     # shapes) never collide under the same key.
-    cache_params = {**params, "_provider": prov}
+    # The degraded path returns preview-shaped profiles, not the enriched
+    # contacts the full Wiza workflow yields, so it needs its own namespace.
+    cache_params = {**params, "_provider": "wiza-preview" if degraded else prov}
     if request.cursor:
         cache_params["_cursor"] = request.cursor
     if request.exclude_profiles:
@@ -2280,7 +2325,12 @@ async def search_leads(request: SearchRequest):
     search_hash = generate_search_hash(cache_params)
     print(f"Search hash: {search_hash} (provider={prov})")
 
-    transform = transform_crustdata_profile if prov == "crustdata" else transform_wiza_contact
+    if prov == "crustdata":
+        transform = transform_crustdata_profile
+    elif degraded:
+        transform = lambda profile, _params=None: transform_preview_profile(profile)
+    else:
+        transform = transform_wiza_contact
 
     campaign_keys: set[str] = set()
     campaign_exclusions: list[str] = []
@@ -2335,10 +2385,16 @@ async def search_leads(request: SearchRequest):
             raw_results = await record_new_campaign_profiles(request.campaign_id, raw_results)
         total = result["total"]
         next_cursor = result.get("next_cursor")
+    elif degraded:
+        # Credit-free preview search — see provider_state(). Wiza caps this
+        # endpoint at 30 profiles per call.
+        data = await wiza_prospect_search(params, max(min(params.get("limit", 10), 30), 1))
+        raw_results = data.get("profiles") or []
+        total = data.get("total", len(raw_results))
     else:
         raw_results = await fetch_from_wiza(params)
         total = len(raw_results)
-    print(f"{prov} returned {len(raw_results)} leads")
+    print(f"{prov}{' (degraded preview)' if degraded else ''} returned {len(raw_results)} leads")
 
     leads = [transform(r, params) for r in raw_results]
     cache_payload = ({"profiles": raw_results, "total": total, "next_cursor": next_cursor}
