@@ -539,5 +539,77 @@ class ProviderFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ctx.exception.status_code, 503)
 
 
+class PaginationTests(unittest.TestCase):
+    """Page 2 must not be page 1.
+
+    The caller sent `offset` and SearchRequest did not declare it, so pydantic
+    dropped it: every page produced identical params, hashed to the same cache
+    key, and was answered from page 1's cached rows. Every search looked like it
+    held the same few leads forever.
+    """
+
+    def test_offset_survives_the_request_model(self):
+        request = main.SearchRequest(**{"job_title": "CEO", "limit": 10, "offset": 10})
+        self.assertEqual(request.start_offset, 10)
+
+    def test_a_page_number_becomes_an_offset(self):
+        self.assertEqual(main.SearchRequest(job_title="CEO", limit=10, page=1).start_offset, 0)
+        self.assertEqual(main.SearchRequest(job_title="CEO", limit=10, page=3).start_offset, 20)
+        self.assertEqual(main.SearchRequest(job_title="CEO", limit=25, page=2).start_offset, 25)
+
+    def test_pages_are_no_longer_identical_requests(self):
+        page1 = main.SearchRequest(**{"job_title": "CEO", "limit": 10})
+        page2 = main.SearchRequest(**{"job_title": "CEO", "limit": 10, "offset": 10})
+        self.assertNotEqual(page1.model_dump(), page2.model_dump())
+
+    def test_an_explicit_offset_wins_over_the_page_number(self):
+        request = main.SearchRequest(**{"job_title": "CEO", "limit": 10, "page": 5, "offset": 3})
+        self.assertEqual(request.start_offset, 3)
+
+    def test_a_nonsense_page_does_not_produce_a_negative_offset(self):
+        self.assertEqual(main.SearchRequest(job_title="CEO", page=0).start_offset, 0)
+        self.assertEqual(main.SearchRequest(job_title="CEO", page=-4).start_offset, 0)
+
+
+class BytemineePaginationTests(unittest.IsolatedAsyncioTestCase):
+    @patch.object(main.httpx, "AsyncClient", FakeClient)
+    async def test_an_offset_becomes_bytemines_zero_indexed_page(self):
+        with patch.object(main.settings, "bytemine_api_key", "key"):
+            FakeResponse.text = json.dumps({"data": [], "pagination": {"total": 0}})
+            try:
+                for offset, expected_page in ((0, 0), (10, 1), (25, 2), (100, 10)):
+                    await main.bytemine_person_search(
+                        {"job_title": "CEO", "location": "CA"}, 10, offset=offset)
+                    self.assertEqual(
+                        FakeClient.last_json["body"]["page"], expected_page,
+                        f"offset {offset}")
+            finally:
+                FakeResponse.text = json.dumps({
+                    "profiles": [{"crustdata_person_id": 7}],
+                    "total_count": 12, "next_cursor": "next-page"})
+
+
+class IcpFilterRetentionTests(unittest.TestCase):
+    """Wiza retries without a rejected filter; it must never drop the ICP.
+
+    company_size, company_industry and company_location decide who the search is
+    for. Retrying without one returns leads from the wrong size, industry or
+    country while still reporting success.
+    """
+
+    def test_icp_defining_filters_are_not_droppable(self):
+        for field in ("company_size", "company_industry", "company_location"):
+            self.assertNotIn(field, main.DROPPABLE, field)
+
+    def test_genuinely_optional_filters_remain_droppable(self):
+        for field in ("job_title_level", "job_role", "skill", "funding_stage", "revenue"):
+            self.assertIn(field, main.DROPPABLE, field)
+
+    def test_the_icp_fields_are_named_for_the_error_message(self):
+        self.assertEqual(
+            set(main.ICP_DEFINING),
+            {"company_size", "company_industry", "company_location"})
+
+
 if __name__ == "__main__":
     unittest.main()

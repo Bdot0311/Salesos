@@ -276,8 +276,20 @@ _US_STATES = {"alabama", "alaska", "arizona", "arkansas", "california", "colorad
 # =============================================================================
 
 # Filters to drop one-by-one if Wiza rejects the request, ordered least→most useful
-DROPPABLE = ["job_title_level", "job_role", "skill", "funding_stage",
-             "company_size", "revenue", "company_industry", "company_location"]
+# Filters Wiza may reject outright and that can be dropped without changing who
+# the search is for. Retrying without one of these recovers a request Wiza would
+# otherwise refuse.
+#
+# company_size, company_industry and company_location are deliberately NOT here.
+# They define the ICP, and dropping them silently returns leads from the wrong
+# size, the wrong industry or the wrong country while reporting success — the
+# same failure the frontend's progressive fallback used to produce. If Wiza
+# refuses one of those, the search fails loudly and the caller sees why.
+DROPPABLE = ["job_title_level", "job_role", "skill", "funding_stage", "revenue"]
+
+# Kept for the error message so a refusal names the filter Wiza actually
+# rejected rather than failing anonymously.
+ICP_DEFINING = ("company_size", "company_industry", "company_location")
 
 
 # A bare hostname like "workflows.io" or "app.acme-corp.com" (no spaces, has a
@@ -887,6 +899,16 @@ class SearchRequest(BaseModel):
 
     limit: int = 10
 
+    # Pagination. Callers page either by number or by cursor; both are accepted
+    # because the two halves of the stack disagreed about which to use.
+    #
+    # The caller sent `offset` and this model did not declare it, so pydantic
+    # dropped it: page 2 arrived byte-identical to page 1, produced the same
+    # cache key, and was answered from page 1's cached rows. Every page showed
+    # the same leads, on every search, and no live call was ever made.
+    page: int = 1
+    offset: Optional[int] = None
+
     # Search controls. Cursor is opaque and must be echoed from `next_cursor`.
     cursor: Optional[str] = None
     campaign_id: Optional[str] = None
@@ -896,6 +918,13 @@ class SearchRequest(BaseModel):
     # final, unsafe step in the frontend's progressive fallback. A deliberate
     # title-only search must opt in explicitly.
     allow_broad_search: bool = False
+
+    @property
+    def start_offset(self) -> int:
+        """Rows to skip, however the caller expressed it."""
+        if self.offset is not None:
+            return max(self.offset, 0)
+        return max(self.page - 1, 0) * max(self.limit, 1)
 
     @field_validator("keywords", "seniority", "job_title", "location", "company_location",
                      "company", "company_domain", "industry", "company_size", "query", mode="before")
@@ -1163,7 +1192,17 @@ async def fetch_from_wiza(params: dict) -> list:
                     dropped = True
                     break
             if not dropped:
-                # Nothing left to drop — bail with the error
+                # Nothing droppable is left. If Wiza is objecting to a filter
+                # that defines the ICP, say which one instead of failing
+                # anonymously — and never retry without it.
+                blamed = [k for k in ICP_DEFINING if k in filters and k in err_text]
+                if blamed:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(f"Wiza rejected {', '.join(blamed)}, which defines this "
+                                "search. Dropping it would return leads outside the "
+                                "requested profile, so the search was not broadened."),
+                    )
                 raise HTTPException(
                     status_code=create_resp.status_code,
                     detail=f"Wiza list creation error: {create_resp.text}",
@@ -1298,6 +1337,16 @@ async def wiza_prospect_search(params: dict, size: int) -> dict:
                     dropped = True
                     break
             if not dropped:
+                # Same rule as the list workflow: an ICP-defining filter is
+                # never dropped to make a request succeed.
+                blamed = [k for k in ICP_DEFINING if k in filters and k in err_text]
+                if blamed:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(f"Wiza rejected {', '.join(blamed)}, which defines this "
+                                "search. Dropping it would return leads outside the "
+                                "requested profile, so the search was not broadened."),
+                    )
                 raise HTTPException(
                     status_code=resp.status_code,
                     detail=f"Wiza prospect search error: {resp.text}",
@@ -1637,11 +1686,18 @@ async def bytemine_call(path: str, body: dict, timeout: float = 60.0) -> dict:
         return resp.json()
 
 
-async def bytemine_person_search(params: dict, limit: int, cursor: str = None) -> dict:
-    """Search Bytemine prospects. Results come back masked; /enrich unlocks them."""
+async def bytemine_person_search(params: dict, limit: int, cursor: str = None,
+                                 offset: int = 0) -> dict:
+    """Search Bytemine prospects. Results come back masked; /enrich unlocks them.
+
+    Bytemine pages by 0-indexed page number, so an offset is converted rather
+    than ignored — returning page 1 for every page is what made every search
+    look like it had the same handful of leads.
+    """
     body = build_bytemine_filters(params)
-    body["pageSize"] = max(min(limit, 100), 1)
-    body["page"] = 0
+    size = max(min(limit, 100), 1)
+    body["pageSize"] = size
+    body["page"] = max(offset, 0) // size
     if cursor:
         body["after"] = cursor
 
@@ -2701,6 +2757,10 @@ async def search_leads(request: SearchRequest):
     # The degraded path returns preview-shaped profiles, not the enriched
     # contacts the full Wiza workflow yields, so it needs its own namespace.
     cache_params = {**params, "_provider": "wiza-preview" if degraded else "+".join(chain)}
+    # Page is part of the identity of a result set. Leaving it out is what let
+    # page 2 be answered from page 1's cached rows.
+    if request.start_offset:
+        cache_params["_offset"] = request.start_offset
     if request.cursor:
         cache_params["_cursor"] = request.cursor
     if request.exclude_profiles:
@@ -2766,7 +2826,8 @@ async def search_leads(request: SearchRequest):
         """One provider's search. Returns (raw_results, total, next_cursor)."""
         if name == "bytemine":
             result = await bytemine_person_search(
-                params, max(min(params.get("limit", 10), 100), 1), cursor=request.cursor)
+                params, max(min(params.get("limit", 10), 100), 1),
+                cursor=request.cursor, offset=request.start_offset)
             return result["profiles"], result["total"], result.get("next_cursor")
 
         if name == "crustdata":
@@ -2774,13 +2835,32 @@ async def search_leads(request: SearchRequest):
             # applied when Crustdata runs rather than up front — a chain that
             # never reaches Crustdata should not be refused by its rules.
             enforce_crustdata_search_scope(params, request.allow_broad_search)
+            page_size = max(min(params.get("limit", 10), 100), 1)
+            # Crustdata pages by cursor, not offset. When the caller asks for a
+            # numbered page without one, over-fetch and slice rather than hand
+            # back the first page again. Its ceiling is 100 rows per call, so
+            # past that the only honest answer is to ask for the cursor.
+            skip = 0 if request.cursor else request.start_offset
+            if skip:
+                if skip + page_size > 100:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=("Crustdata pages beyond this point need the "
+                                "`next_cursor` from the previous response rather "
+                                "than a page number."),
+                    )
+                fetch_size = skip + page_size
+            else:
+                fetch_size = page_size
             result = await crustdata_person_search(
                 params,
-                max(min(params.get("limit", 10), 100), 1),
+                fetch_size,
                 cursor=request.cursor,
                 exclude_profiles=exclusions,
             )
             found = dedupe_crustdata_profiles(result["profiles"])
+            if skip:
+                found = found[skip:]
             # Provider exclusions require profile URLs; this catches previously
             # seen stable IDs even when a profile has no URL.
             if campaign_keys:
@@ -2792,13 +2872,17 @@ async def search_leads(request: SearchRequest):
         if degraded:
             # Credit-free preview search — see provider_state(). Wiza caps this
             # endpoint at 30 profiles per call.
+            skip = request.start_offset
             data = await wiza_prospect_search(
-                params, max(min(params.get("limit", 10), 30), 1))
+                params, max(min(params.get("limit", 10) + skip, 30), 1))
             found = data.get("profiles") or []
-            return found, data.get("total", len(found)), None
+            return (found[skip:] if skip else found), data.get("total", len(found)), None
 
-        found = await fetch_from_wiza(params)
-        return found, len(found), None
+        skip = request.start_offset
+        found = await fetch_from_wiza(
+            {**params, "limit": params.get("limit", 10) + skip} if skip else params)
+        total = len(found)
+        return (found[skip:] if skip else found), total, None
 
     raw_results: list = []
     total = 0
