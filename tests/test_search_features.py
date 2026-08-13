@@ -260,7 +260,9 @@ class BytemineFilterTests(unittest.TestCase):
             "industry": "Information Technology and Services",
             "company_size": "51-200",
             "company_domain": "stripe.com",
-            "location": "CA",
+            # A state by name. "CA" would be Canada here — see
+            # classify_location — and Bytemine has no country field.
+            "location": "California",
         })
 
         self.assertEqual(body["jobTitles"], ["VP of Sales"])
@@ -395,7 +397,7 @@ class BytemineRequestTests(unittest.IsolatedAsyncioTestCase):
             })
             try:
                 result = await main.bytemine_person_search(
-                    {"job_title": "VP of Sales", "location": "CA"}, 25)
+                    {"job_title": "VP of Sales", "location": "California"}, 25)
             finally:
                 FakeResponse.text = json.dumps({
                     "profiles": [{"crustdata_person_id": 7}],
@@ -414,13 +416,17 @@ class BytemineRequestTests(unittest.IsolatedAsyncioTestCase):
 class ProviderFallbackTests(unittest.IsolatedAsyncioTestCase):
     """The chain is only worth having if a search actually moves down it."""
 
-    async def run_search(self, request, responses):
+    async def run_search(self, request, responses, crustdata_key="c"):
         """Run /search with the cache disabled and each provider call stubbed.
 
         `responses` maps a provider name to either the value its fetcher should
         return or an exception it should raise. A provider left out of the map
         is not stubbed at all, so its real implementation runs — which is how the
         genuine "this provider cannot express that filter" refusal gets covered.
+
+        `crustdata_key=None` drops Crustdata from the chain, which is how a
+        request that no configured provider can express gets covered: Crustdata
+        is the only one of the three with a free-text field.
         """
         calls: list = []
 
@@ -441,7 +447,7 @@ class ProviderFallbackTests(unittest.IsolatedAsyncioTestCase):
 
         patches = [
             patch.object(main.settings, "bytemine_api_key", "b"),
-            patch.object(main.settings, "crustdata_api_key", "c"),
+            patch.object(main.settings, "crustdata_api_key", crustdata_key),
             patch.object(main.settings, "search_provider", "bytemine"),
             patch.object(main, "cache_lookup", no_cache),
             patch.object(main, "cache_store", no_store),
@@ -475,11 +481,10 @@ class ProviderFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.leads[0]["contact_name"], "Ada")
 
     async def test_a_filter_bytemine_cannot_express_moves_to_crustdata(self):
-        # Keywords have no field on /contacts/search. Falling through keeps the
-        # ICP whole; dropping the keyword would not.
+        # A country location has no field on /contacts/search. Falling through
+        # keeps the ICP whole; dropping the country would not.
         response, calls = await self.run_search(
-            main.SearchRequest(job_title="Founder", industry="computer software",
-                               keywords="pre-revenue"),
+            main.SearchRequest(job_title="Founder", location="US"),
             # Bytemine is deliberately not stubbed: the real
             # build_bytemine_filters must be the thing that refuses.
             {"crustdata": {"profiles": [{"crustdata_person_id": 9}],
@@ -490,6 +495,35 @@ class ProviderFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.provider, "crustdata")
         self.assertEqual(
             [a["outcome"] for a in response.provider_attempts], ["unsupported_filter"])
+
+    async def test_every_provider_refusing_is_an_error_not_an_empty_result(self):
+        # Nothing ran, so "no leads" would be a different answer from the truth:
+        # no configured provider can express the filter. An empty success here
+        # reads as "no such people exist" and tells the user nothing to change.
+        #
+        # Bytemine refuses the country before spending a company-search credit;
+        # Wiza refuses the keyword. Neither is stubbed, so both refusals are the
+        # real ones, and bytemine_call must never be reached.
+        with patch.object(main, "bytemine_call", self._fail("must not be called")):
+            with self.assertRaises(HTTPException) as caught:
+                await self.run_search(
+                    main.SearchRequest(job_title="Founder", location="US",
+                                       keywords="ai saas"),
+                    {},
+                    crustdata_key=None,
+                )
+
+        self.assertEqual(caught.exception.status_code, 422)
+        detail = caught.exception.detail
+        self.assertIn("keywords", detail)
+        self.assertIn("location", detail)
+        self.assertIn("credit was not used", detail)
+
+    @staticmethod
+    def _fail(message):
+        async def run(*args, **kwargs):
+            raise AssertionError(message)
+        return run
 
     async def test_an_exhausted_bytemine_balance_falls_through(self):
         response, calls = await self.run_search(
@@ -579,7 +613,7 @@ class BytemineePaginationTests(unittest.IsolatedAsyncioTestCase):
             try:
                 for offset, expected_page in ((0, 0), (10, 1), (25, 2), (100, 10)):
                     await main.bytemine_person_search(
-                        {"job_title": "CEO", "location": "CA"}, 10, offset=offset)
+                        {"job_title": "CEO", "location": "California"}, 10, offset=offset)
                     self.assertEqual(
                         FakeClient.last_json["body"]["page"], expected_page,
                         f"offset {offset}")
@@ -609,6 +643,226 @@ class IcpFilterRetentionTests(unittest.TestCase):
         self.assertEqual(
             set(main.ICP_DEFINING),
             {"company_size", "company_industry", "company_location"})
+
+
+class SemanticTermTests(unittest.TestCase):
+    """Words no provider taxonomy can express must survive the parser.
+
+    Every provider classifies companies with LinkedIn's industry list, which has
+    no AI category. Collapsing "AI SaaS" to `computer software` and stopping
+    there searched every software company on earth, which is how an AI search
+    came back with aerospace and venture capital.
+    """
+
+    def test_ai_terms_are_recognised(self):
+        for text in ("AI SaaS", "ai saas", "generative AI companies",
+                     "machine learning startups", "LLM infrastructure",
+                     "AI-powered CRM"):
+            self.assertTrue(main.semantic_terms_in(text), text)
+
+    def test_words_that_merely_contain_ai_are_not_ai_queries(self):
+        # \b would match the "ai" inside every one of these.
+        for text in ("email marketing", "retail founders", "supply chain",
+                     "chairman", "repair shops", "Dubai"):
+            self.assertEqual(main.semantic_terms_in(text), [], text)
+
+    def test_the_longest_term_wins(self):
+        # Not ["ai"], which would send a weaker query than the user typed.
+        self.assertEqual(main.semantic_terms_in("AI SaaS"), ["ai saas"])
+
+    def test_the_defining_term_survives_as_a_keyword(self):
+        filters = main.heuristic_parse_icp("AI SaaS founders")
+
+        # The taxonomy value is kept as a supporting filter...
+        self.assertEqual(filters["industry"], "computer software")
+        # ...but the word that actually defines the ICP is searchable.
+        self.assertEqual(filters["keywords"], "ai saas")
+
+    def test_a_segment_after_at_is_not_a_company_name(self):
+        # "VP Sales at AI SaaS startups" is not a request for a company called
+        # "AI SaaS"; searching one as a company name matches near-nothing.
+        filters = main.heuristic_parse_icp("VP Sales at AI SaaS startups")
+
+        self.assertNotIn("company", filters)
+        self.assertEqual(filters["keywords"], "ai saas")
+
+    def test_an_ordinary_industry_query_gains_no_keyword(self):
+        filters = main.heuristic_parse_icp("fintech CTOs in Germany")
+
+        self.assertEqual(filters["industry"], "financial services")
+        self.assertNotIn("keywords", filters)
+
+
+class KeywordExpressibilityTests(unittest.TestCase):
+    """A provider must search the free-text term or refuse the search."""
+
+    def test_wiza_refuses_keywords_rather_than_widening_the_search(self):
+        # Wiza ORs the values in a filter, so appending the keyword to job_title
+        # matched every Founder anywhere — the opposite of narrowing.
+        with self.assertRaises(main.ProviderUnsupported) as caught:
+            main.build_wiza_filters({"job_title": "Founder", "keywords": "ai saas"})
+
+        self.assertEqual(caught.exception.field, "keywords")
+
+    def test_wiza_refuses_an_industry_it_cannot_map(self):
+        # Wiza ignores an industry outside its vocabulary, so sending one and
+        # carrying on silently searched every industry.
+        with self.assertRaises(main.ProviderUnsupported) as caught:
+            main.build_wiza_filters({"job_title": "Founder", "industry": "ai saas"})
+
+        self.assertEqual(caught.exception.field, "industry")
+
+    def test_wiza_still_accepts_a_mappable_industry(self):
+        filters = main.build_wiza_filters({"industry": "artificial intelligence"})
+
+        self.assertEqual(filters["company_industry"][0]["v"], "computer software")
+
+    def test_bytemine_refuses_a_keyword_that_was_never_resolved(self):
+        # Reaching the filter builder with a keyword still set means it would be
+        # dropped — bytemine_person_search is meant to resolve it to domains.
+        with self.assertRaises(main.ProviderUnsupported) as caught:
+            main.build_bytemine_filters({"job_title": "Founder", "keywords": "ai saas"})
+
+        self.assertEqual(caught.exception.field, "keywords")
+
+    def test_bytemine_searches_resolved_companies_by_domain(self):
+        filters = main.build_bytemine_filters({
+            "job_title": "Founder",
+            "company_domains": ["anthropic.com", "openai.com"],
+        })
+
+        self.assertEqual(filters["urls"], ["anthropic.com", "openai.com"])
+
+
+class LocationClassificationTests(unittest.TestCase):
+    """A location is a US state, a country or a city — never a guess.
+
+    /contacts/search has no country field, and the old rule sent any token
+    longer than two characters as a city. "Germany" became a search for a city
+    called Germany and "Texas" a city called Texas: filters that match nothing,
+    silently, while the search still reports success.
+    """
+
+    def test_a_country_is_recognised_as_one(self):
+        for name in ("Germany", "United States", "Canada", "Japan"):
+            self.assertEqual(main.classify_location(name)[0], "country", name)
+
+    def test_a_state_name_becomes_its_code(self):
+        self.assertEqual(main.classify_location("Texas"), ("state", "TX"))
+        self.assertEqual(main.classify_location("New York"), ("state", "NY"))
+        self.assertEqual(main.classify_location("Ohio"), ("state", "OH"))
+
+    def test_an_unambiguous_state_code_is_kept(self):
+        self.assertEqual(main.classify_location("TX"), ("state", "TX"))
+        self.assertEqual(main.classify_location("NY"), ("state", "NY"))
+
+    def test_a_code_naming_both_a_state_and_a_country_reads_as_the_country(self):
+        # fetch-external-leads sets `location` from normalizeCountry(), so a
+        # two-letter location is always a country code. Reading "CA" as
+        # California sent every search for Canada to the wrong continent.
+        #
+        # Driven off the real set so a code added there cannot quietly go back
+        # to being read as a US state.
+        for code in main._STATE_CODE_IS_ALSO_A_COUNTRY:
+            kind, value = main.classify_location(code)
+            self.assertEqual((kind, value), ("country", code), code)
+
+    def test_the_colliding_codes_really_are_us_state_codes(self):
+        # If one of these stopped being a state code the entry would be dead
+        # weight, and the ordering it justifies would look arbitrary.
+        self.assertTrue(main._STATE_CODE_IS_ALSO_A_COUNTRY <= main._US_STATE_CODES)
+
+    def test_a_state_name_still_beats_a_country_code_spelling(self):
+        # "Georgia" the US state, not GE the country.
+        self.assertEqual(main.classify_location("Georgia"), ("state", "GA"))
+
+    def test_a_city_stays_a_city(self):
+        self.assertEqual(main.classify_location("Berlin"), ("city", "Berlin"))
+        self.assertEqual(main.classify_location("San Francisco"),
+                         ("city", "San Francisco"))
+
+    def test_a_country_is_refused_not_searched_as_a_city(self):
+        with self.assertRaises(main.ProviderUnsupported) as caught:
+            main.build_bytemine_filters({"job_title": "CEO", "location": "Germany"})
+
+        self.assertEqual(caught.exception.field, "location")
+
+    def test_a_state_reaches_bytemine_as_a_state(self):
+        # Previously cities:["Texas"], which matches nothing.
+        body = main.build_bytemine_filters({"job_title": "CEO", "location": "Texas"})
+
+        self.assertEqual(body["states"], ["TX"])
+        self.assertNotIn("cities", body)
+
+    def test_a_city_still_reaches_bytemine_as_a_city(self):
+        body = main.build_bytemine_filters({"job_title": "CEO", "location": "Berlin"})
+
+        self.assertEqual(body["cities"], ["Berlin"])
+
+    def test_the_parser_state_names_are_no_longer_shadowed(self):
+        # A second _US_STATES of 2-letter codes used to overwrite the parser's
+        # full-name set at module scope, so the names were unreachable.
+        self.assertIn("california", main._US_STATES)
+        self.assertIn("CA", main._US_STATE_CODES)
+
+
+class BytemineKeywordResolutionTests(unittest.IsolatedAsyncioTestCase):
+    """Bytemine carries a free-text term via the company graph.
+
+    /contacts/search has no free-text field, but /b2b-search matches company
+    descriptions — which is where a segment like "AI SaaS" is written down.
+    """
+
+    def setUp(self):
+        self.calls = []
+
+    def gateway(self, companies):
+        async def call(path, body, timeout=60.0):
+            self.calls.append((path, body))
+            if path == "/b2b-search":
+                return {"data": companies}
+            return {"data": [{"pid": "1"}], "pagination": {"total": 1}}
+        return call
+
+    async def test_a_keyword_becomes_a_company_domain_filter(self):
+        with patch.object(main, "bytemine_call", self.gateway(
+                [{"website": "https://anthropic.com"}, {"website": "openai.com"}])):
+            await main.bytemine_person_search(
+                {"keywords": "ai saas", "job_title": "Founder"}, 10)
+
+        paths = [path for path, _ in self.calls]
+        self.assertEqual(paths, ["/b2b-search", "/contacts/search"])
+        self.assertEqual(self.calls[0][1]["keywords"], "ai saas")
+        self.assertEqual(self.calls[1][1]["urls"], ["anthropic.com", "openai.com"])
+        # The term is spent on the domain filter, never sent as a raw keyword.
+        self.assertNotIn("keywords", self.calls[1][1])
+
+    async def test_a_keyword_matching_no_company_returns_no_leads(self):
+        # Searching on without the term would answer a different question.
+        with patch.object(main, "bytemine_call", self.gateway([])):
+            result = await main.bytemine_person_search(
+                {"keywords": "quantum abacus", "job_title": "CEO"}, 10)
+
+        self.assertEqual(result["profiles"], [])
+        self.assertEqual([path for path, _ in self.calls], ["/b2b-search"])
+
+    async def test_a_company_without_a_website_cannot_be_used(self):
+        with patch.object(main, "bytemine_call", self.gateway(
+                [{"name": "No Site"}, {"website": "scale.com"}])):
+            await main.bytemine_person_search({"keywords": "ai"}, 10)
+
+        self.assertEqual(self.calls[1][1]["urls"], ["scale.com"])
+
+    async def test_an_unexpressible_filter_is_refused_before_spending_credits(self):
+        # /b2b-search bills per company returned; a country location is going to
+        # be refused anyway, so the request must not reach the gateway.
+        async def must_not_call(*args, **kwargs):
+            raise AssertionError("gateway reached for a refused search")
+
+        with patch.object(main, "bytemine_call", must_not_call):
+            with self.assertRaises(main.ProviderUnsupported):
+                await main.bytemine_person_search(
+                    {"keywords": "ai saas", "location": "US"}, 10)
 
 
 if __name__ == "__main__":
