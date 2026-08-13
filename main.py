@@ -797,6 +797,8 @@ def build_wiza_filters(p: dict) -> dict:
     # venture firms. Refuse, and let the chain reach a provider with free text.
     if p.get("keywords"):
         raise ProviderUnsupported("keywords", p["keywords"])
+    if p.get("semantic_query"):
+        raise ProviderUnsupported("semantic_query", p["semantic_query"])
 
     # Seniority — only add if we have a known Wiza level
     if p.get("seniority"):
@@ -1808,6 +1810,16 @@ def build_bytemine_filters(p: dict) -> dict:
     if p.get("keywords"):
         raise ProviderUnsupported("keywords", p["keywords"])
 
+    # The user's own sentence. It is not resolvable here: a segment term like
+    # "AI SaaS" can be matched against company descriptions, but a whole request
+    # ("heads of RevOps at fintechs replacing Salesforce") matches nothing that
+    # way and would burn a company-search credit finding out. Stepping aside
+    # sends it to a provider with real semantic search, which is the difference
+    # between two different sentences returning two different sets of people and
+    # both returning the same page of whoever matched the coarse filters.
+    if p.get("semantic_query"):
+        raise ProviderUnsupported("semantic_query", p["semantic_query"])
+
     if not body:
         raise HTTPException(status_code=400, detail="At least one search parameter required")
     return body
@@ -2186,7 +2198,17 @@ async def crustdata_person_search(
 ) -> dict:
     """Call Crustdata POST /person/search with stable cursor pagination."""
     filters = build_crustdata_filters(params)
-    semantic_query = (params.get("keywords") or "").strip()
+    # Both carry free text. `keywords` is a filter the user stated; the
+    # semantic query is the sentence the structured filters were parsed out of.
+    # Crustdata takes one search string, so they are joined — with `mode:
+    # "exact"` below, the structured filters stay hard constraints either way
+    # and this only decides ranking within them.
+    semantic_query = " ".join(
+        part for part in (
+            (params.get("keywords") or "").strip(),
+            (params.get("semantic_query") or "").strip(),
+        ) if part
+    ).strip()
     if not filters and not semantic_query:
         raise HTTPException(status_code=400, detail="At least one search parameter required")
 
@@ -2914,6 +2936,25 @@ async def resolve_search_params(request: SearchRequest) -> dict:
     ):
         raw_query = params.pop("keywords")
 
+    # The sentence is retained, always.
+    #
+    # It used to be popped and then only used when no structured field was set —
+    # which is never, because the frontend parses the query into filters before
+    # sending and ships both. So the words the user actually typed were dropped
+    # on the floor, and every search with the same coarse filters became the
+    # same search: identical params, identical cache key, identical rows for the
+    # cache's whole hour. Three different sentences about three different
+    # segments returned the same people because by this point they were the same
+    # request.
+    #
+    # It stays as `semantic_query`, separate from `keywords`: keywords are a
+    # filter the user stated, this is the original phrasing the structured
+    # filters were derived from. Crustdata searches it; providers that cannot
+    # step aside — see build_bytemine_filters.
+    if raw_query and any(params.get(f) for f in STRUCTURED_FIELDS):
+        params["semantic_query"] = raw_query
+        print(f"Retaining semantic query alongside structured filters: {raw_query!r}")
+
     if raw_query and not any(params.get(f) for f in STRUCTURED_FIELDS):
         parsed_filters: dict = {}
         # The rule-based parser is free and deterministic — always run it. The
@@ -2961,6 +3002,9 @@ def enforce_crustdata_search_scope(params: dict, allow_broad_search: bool) -> No
         "company_size", "industry", "seniority", "keywords", "departments",
         "technologies", "intent_topics", "revenue_min", "revenue_max",
         "job_change_days",
+        # The user's sentence narrows a title-only search through Crustdata's
+        # semantic ranking, so it counts as a narrowing filter here.
+        "semantic_query",
     }
     if params.get("job_title") and not any(params.get(k) for k in narrowing_fields):
         if not allow_broad_search:

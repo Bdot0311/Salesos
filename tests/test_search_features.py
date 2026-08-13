@@ -865,5 +865,61 @@ class BytemineKeywordResolutionTests(unittest.IsolatedAsyncioTestCase):
                     {"keywords": "ai saas", "location": "US"}, 10)
 
 
+class SemanticQueryRetentionTests(unittest.IsolatedAsyncioTestCase):
+    """The sentence the user typed must survive into the search.
+
+    resolve_search_params popped `query` and then only used it when no
+    structured field was set — which is never, because the frontend parses the
+    query into filters before sending and ships both. So the words were dropped,
+    and every search with the same coarse filters became the same request:
+    identical params, identical cache key, identical rows for the cache's whole
+    hour. Different searches returned the same leads because by that point they
+    were the same search.
+    """
+
+    async def resolve(self, **kwargs):
+        return await main.resolve_search_params(main.SearchRequest(**kwargs))
+
+    async def test_the_sentence_survives_alongside_structured_filters(self):
+        params = await self.resolve(
+            query="heads of RevOps at fintechs replacing Salesforce",
+            job_title="VP Sales", industry="computer software", location="US")
+
+        self.assertEqual(params["semantic_query"],
+                         "heads of RevOps at fintechs replacing Salesforce")
+
+    async def test_two_different_sentences_are_two_different_searches(self):
+        common = {"job_title": "VP Sales", "industry": "computer software", "location": "US"}
+        a = await self.resolve(query="VP Sales at AI SaaS companies", **common)
+        b = await self.resolve(query="heads of RevOps at fintechs", **common)
+
+        self.assertNotEqual(main.generate_search_hash(a), main.generate_search_hash(b))
+
+    async def test_a_bare_query_still_gets_parsed_into_filters(self):
+        # The no-structured-fields path is unchanged: the parser runs and the
+        # sentence becomes filters rather than only a ranking hint.
+        params = await self.resolve(query="fintech CTOs in Germany")
+
+        self.assertEqual(params["industry"], "financial services")
+        self.assertEqual(params["job_title"], "CTO")
+
+    def test_crustdata_searches_the_sentence(self):
+        query = "heads of RevOps at fintechs replacing Salesforce"
+        joined = " ".join(x for x in ("", query) if x).strip()
+
+        self.assertEqual(joined, query)
+
+    def test_providers_without_free_text_step_aside(self):
+        # Bytemine's company-graph fallback matches a segment term like
+        # "AI SaaS" against company descriptions; a whole request matches
+        # nothing that way and would spend a company-search credit finding out.
+        params = {"job_title": "VP Sales", "semantic_query": "heads of RevOps at fintechs"}
+
+        for build in (main.build_bytemine_filters, main.build_wiza_filters):
+            with self.assertRaises(main.ProviderUnsupported) as caught:
+                build(params)
+            self.assertEqual(caught.exception.field, "semantic_query")
+
+
 if __name__ == "__main__":
     unittest.main()
