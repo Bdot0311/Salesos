@@ -4,6 +4,7 @@ A FastAPI application that caches Wiza API results to reduce costs.
 """
 
 import asyncio
+import base64
 import hashlib
 import json
 import re
@@ -103,6 +104,104 @@ def provider_chain() -> list[str]:
     # practice; the guard keeps a misconfigured environment from failing here
     # with an IndexError instead of a readable provider error.
     return chain or ["wiza"]
+
+
+def _dedupe_key(lead: dict) -> str:
+    """The strongest identity a transformed lead offers.
+
+    Providers overlap — the same person can come back from two of them with
+    different field names and different completeness — so merged results are
+    deduped on what actually identifies a person, in order of how much it
+    proves: a LinkedIn URL, then a work email, then name plus company.
+    """
+    linkedin = str(lead.get("linkedin_url") or "").strip().lower()
+    if linkedin:
+        return "li:" + linkedin.rstrip("/").split("linkedin.com/")[-1]
+    email = str(lead.get("contact_email") or lead.get("business_email") or "").strip().lower()
+    if email:
+        return "em:" + email
+    name = str(lead.get("contact_name") or "").strip().lower()
+    company = str(lead.get("company_name") or "").strip().lower()
+    return f"nc:{name}|{company}"
+
+
+def merge_provider_results(buckets: list, transform_for) -> tuple[list, list, int, dict]:
+    """Fold every provider's results into one list.
+
+    Returns (raw_rows, leads, total, cursors). Order is round-robin across the
+    providers that returned something rather than one provider's whole page
+    followed by another's: a merged page should not be all Bytemine at the top
+    just because it is first in the chain.
+
+    A duplicate keeps the copy that arrived first under that ordering, and the
+    total is summed across providers less the duplicates removed, so it stays
+    consistent with what was actually returned.
+    """
+    seen: set = set()
+    raw_rows: list = []
+    leads: list = []
+    cursors: dict = {}
+    duplicates = 0
+
+    for bucket in buckets:
+        if bucket.get("next_cursor"):
+            cursors[bucket["provider"]] = bucket["next_cursor"]
+
+    live = [b for b in buckets if b.get("profiles")]
+    depth = max((len(b["profiles"]) for b in live), default=0)
+    for index in range(depth):
+        for bucket in live:
+            profiles = bucket["profiles"]
+            if index >= len(profiles):
+                continue
+            raw = profiles[index]
+            lead = transform_for(bucket["provider"])(raw)
+            key = _dedupe_key(lead)
+            if key in seen:
+                duplicates += 1
+                continue
+            seen.add(key)
+            raw_rows.append(raw)
+            leads.append(lead)
+
+    total = max(sum(int(b.get("total") or 0) for b in buckets) - duplicates, len(leads))
+    return raw_rows, leads, total, cursors
+
+
+def encode_cursors(cursors: dict) -> Optional[str]:
+    """Pack per-provider cursors into the one opaque string the API exposes.
+
+    Every provider pages independently, so a merged search has one cursor per
+    contributor rather than one overall. Callers keep treating `next_cursor` as
+    an opaque token they echo back; only this function and its decoder know it
+    carries several.
+    """
+    live = {name: cur for name, cur in (cursors or {}).items() if cur}
+    if not live:
+        return None
+    raw = json.dumps(live, sort_keys=True).encode()
+    return "multi:" + base64.urlsafe_b64encode(raw).decode()
+
+
+def decode_cursors(cursor: Optional[str], chain: list) -> dict:
+    """Unpack a cursor into {provider: cursor}.
+
+    A plain string predates the merged search and can only have come from the
+    provider that led the chain, so it is handed to that one alone — giving it
+    to every provider would ask each to resume from a position in someone
+    else's result set.
+    """
+    if not cursor:
+        return {}
+    if cursor.startswith("multi:"):
+        try:
+            decoded = json.loads(base64.urlsafe_b64decode(cursor[6:]).decode())
+            if isinstance(decoded, dict):
+                return {k: v for k, v in decoded.items() if isinstance(v, str) and v}
+        except Exception as exc:
+            print(f"WARNING: unreadable cursor ({exc}) — starting from the first page")
+            return {}
+    return {chain[0]: cursor} if chain else {}
 
 
 def provider_state() -> tuple[str, bool]:
@@ -797,6 +896,8 @@ def build_wiza_filters(p: dict) -> dict:
     # venture firms. Refuse, and let the chain reach a provider with free text.
     if p.get("keywords"):
         raise ProviderUnsupported("keywords", p["keywords"])
+    if p.get("semantic_query"):
+        raise ProviderUnsupported("semantic_query", p["semantic_query"])
 
     # Seniority — only add if we have a known Wiza level
     if p.get("seniority"):
@@ -1808,6 +1909,16 @@ def build_bytemine_filters(p: dict) -> dict:
     if p.get("keywords"):
         raise ProviderUnsupported("keywords", p["keywords"])
 
+    # The user's own sentence. It is not resolvable here: a segment term like
+    # "AI SaaS" can be matched against company descriptions, but a whole request
+    # ("heads of RevOps at fintechs replacing Salesforce") matches nothing that
+    # way and would burn a company-search credit finding out. Stepping aside
+    # sends it to a provider with real semantic search, which is the difference
+    # between two different sentences returning two different sets of people and
+    # both returning the same page of whoever matched the coarse filters.
+    if p.get("semantic_query"):
+        raise ProviderUnsupported("semantic_query", p["semantic_query"])
+
     if not body:
         raise HTTPException(status_code=400, detail="At least one search parameter required")
     return body
@@ -2186,7 +2297,17 @@ async def crustdata_person_search(
 ) -> dict:
     """Call Crustdata POST /person/search with stable cursor pagination."""
     filters = build_crustdata_filters(params)
-    semantic_query = (params.get("keywords") or "").strip()
+    # Both carry free text. `keywords` is a filter the user stated; the
+    # semantic query is the sentence the structured filters were parsed out of.
+    # Crustdata takes one search string, so they are joined — with `mode:
+    # "exact"` below, the structured filters stay hard constraints either way
+    # and this only decides ranking within them.
+    semantic_query = " ".join(
+        part for part in (
+            (params.get("keywords") or "").strip(),
+            (params.get("semantic_query") or "").strip(),
+        ) if part
+    ).strip()
     if not filters and not semantic_query:
         raise HTTPException(status_code=400, detail="At least one search parameter required")
 
@@ -2914,6 +3035,25 @@ async def resolve_search_params(request: SearchRequest) -> dict:
     ):
         raw_query = params.pop("keywords")
 
+    # The sentence is retained, always.
+    #
+    # It used to be popped and then only used when no structured field was set —
+    # which is never, because the frontend parses the query into filters before
+    # sending and ships both. So the words the user actually typed were dropped
+    # on the floor, and every search with the same coarse filters became the
+    # same search: identical params, identical cache key, identical rows for the
+    # cache's whole hour. Three different sentences about three different
+    # segments returned the same people because by this point they were the same
+    # request.
+    #
+    # It stays as `semantic_query`, separate from `keywords`: keywords are a
+    # filter the user stated, this is the original phrasing the structured
+    # filters were derived from. Crustdata searches it; providers that cannot
+    # step aside — see build_bytemine_filters.
+    if raw_query and any(params.get(f) for f in STRUCTURED_FIELDS):
+        params["semantic_query"] = raw_query
+        print(f"Retaining semantic query alongside structured filters: {raw_query!r}")
+
     if raw_query and not any(params.get(f) for f in STRUCTURED_FIELDS):
         parsed_filters: dict = {}
         # The rule-based parser is free and deterministic — always run it. The
@@ -2961,6 +3101,9 @@ def enforce_crustdata_search_scope(params: dict, allow_broad_search: bool) -> No
         "company_size", "industry", "seniority", "keywords", "departments",
         "technologies", "intent_topics", "revenue_min", "revenue_max",
         "job_change_days",
+        # The user's sentence narrows a title-only search through Crustdata's
+        # semantic ranking, so it counts as a narrowing filter here.
+        "semantic_query",
     }
     if params.get("job_title") and not any(params.get(k) for k in narrowing_fields):
         if not allow_broad_search:
@@ -3023,13 +3166,18 @@ async def search_leads(request: SearchRequest):
     print(f"Search hash: {search_hash} (chain={'+'.join(chain)})")
 
     def transform_for(name: str):
+        """The transform that reads one provider's row shape.
+
+        Bound to `params` so a merged result can transform each row with its own
+        provider's reader — the rows are not interchangeable.
+        """
         if name == "bytemine":
-            return transform_bytemine_profile
+            return lambda profile: transform_bytemine_profile(profile, params)
         if name == "crustdata":
-            return transform_crustdata_profile
+            return lambda profile: transform_crustdata_profile(profile, params)
         if degraded:
-            return lambda profile, _params=None: transform_preview_profile(profile)
-        return transform_wiza_contact
+            return lambda profile: transform_preview_profile(profile)
+        return lambda profile: transform_wiza_contact(profile, params)
 
     transform = transform_for(prov)
 
@@ -3052,21 +3200,26 @@ async def search_leads(request: SearchRequest):
         print(f"Cache HIT for hash: {search_hash}")
         cached_payload = json.loads(cached.results)
         served_by = prov
-        if isinstance(cached_payload, dict):
+        next_cursor = None
+        if isinstance(cached_payload, dict) and cached_payload.get("buckets") is not None:
+            # Merged shape: rebuild through each provider's own transform.
+            data, leads, total, _ = merge_provider_results(
+                cached_payload["buckets"], transform_for)
+            total = cached_payload.get("total", total)
+            next_cursor = cached_payload.get("next_cursor")
+            served_by = cached_payload.get("provider") or prov
+        elif isinstance(cached_payload, dict):
+            # Written before the merge: one provider's rows, one transform.
             data = cached_payload.get("profiles") or []
             total = cached_payload.get("total", len(data))
             next_cursor = cached_payload.get("next_cursor")
-            # Rows written before the chain existed have no provider recorded;
-            # they can only have come from the head of the chain.
             served_by = cached_payload.get("provider") or prov
-            transform = transform_for(served_by)
+            leads = [transform_for(served_by)(r) for r in data]
         else:
-            # Backwards compatibility with cache rows written before cursor
-            # metadata was persisted.
+            # Written before cursor metadata was persisted.
             data = cached_payload
             total = len(data)
-            next_cursor = None
-        leads = [transform(r, params) for r in data]
+            leads = [transform_for(prov)(r) for r in data]
         return SearchResponse(
             success=True, source="cache", from_cache=True,
             count=len(leads), total=total, leads=leads, data=data,
@@ -3076,12 +3229,16 @@ async def search_leads(request: SearchRequest):
 
     print(f"Cache MISS — walking chain {'+'.join(chain)}")
 
+    # Each provider resumes from its own position — see decode_cursors.
+    cursor_by_provider = decode_cursors(request.cursor, chain)
+
     async def run_provider(name: str):
         """One provider's search. Returns (raw_results, total, next_cursor)."""
+        provider_cursor = cursor_by_provider.get(name)
         if name == "bytemine":
             result = await bytemine_person_search(
                 params, max(min(params.get("limit", 10), 100), 1),
-                cursor=request.cursor, offset=request.start_offset)
+                cursor=provider_cursor, offset=request.start_offset)
             return result["profiles"], result["total"], result.get("next_cursor")
 
         if name == "crustdata":
@@ -3094,7 +3251,7 @@ async def search_leads(request: SearchRequest):
             # numbered page without one, over-fetch and slice rather than hand
             # back the first page again. Its ceiling is 100 rows per call, so
             # past that the only honest answer is to ask for the cursor.
-            skip = 0 if request.cursor else request.start_offset
+            skip = 0 if provider_cursor else request.start_offset
             if skip:
                 if skip + page_size > 100:
                     raise HTTPException(
@@ -3109,7 +3266,7 @@ async def search_leads(request: SearchRequest):
             result = await crustdata_person_search(
                 params,
                 fetch_size,
-                cursor=request.cursor,
+                cursor=provider_cursor,
                 exclude_profiles=exclusions,
             )
             found = dedupe_crustdata_profiles(result["profiles"])
@@ -3138,71 +3295,93 @@ async def search_leads(request: SearchRequest):
         total = len(found)
         return (found[skip:] if skip else found), total, None
 
-    raw_results: list = []
-    total = 0
-    next_cursor = None
-    served_by = chain[0]
+    # Every configured provider runs, and everything they surface is shown.
+    #
+    # This used to stop at the first provider that returned anything, so the
+    # rest never contributed: a search Bytemine could answer thinly never saw
+    # the deeper matches Crustdata had for the same ICP. They hold different
+    # data, which is the reason for having more than one — so they are called
+    # together and their results merged, and a provider that returns nothing
+    # simply adds nothing rather than deciding the search for everyone else.
+    #
+    # Concurrent because they are independent network calls; sequentially this
+    # would cost the sum of three timeouts on a bad day.
+    outcomes = await asyncio.gather(
+        *(run_provider(name) for name in chain), return_exceptions=True,
+    )
+
     attempts: list = []
-    ran = False
+    buckets: list = []
     refused: dict[str, str] = {}
+    failures: dict[str, object] = {}
+    ran = False
 
-    for index, name in enumerate(chain):
-        is_last = index == len(chain) - 1
-        try:
-            raw_results, total, next_cursor = await run_provider(name)
-            ran = True
-        except ProviderUnsupported as unsupported:
-            # The provider cannot express one of the requested filters. Moving on
-            # keeps the ICP intact; dropping the filter would not.
-            refused[name] = unsupported.field
-            print(f"{name} cannot express {unsupported} — trying next provider")
+    for name, outcome in zip(chain, outcomes):
+        if isinstance(outcome, ProviderUnsupported):
+            # This provider cannot express one of the requested filters. It sits
+            # this search out; the others still answer it.
+            print(f"{name} cannot express {outcome} — it contributes nothing here")
+            refused[name] = outcome.field
             attempts.append({"provider": name, "outcome": "unsupported_filter",
-                             "detail": unsupported.field})
+                             "detail": outcome.field})
             continue
-        except HTTPException as exc:
-            # 4xx about the request itself will fail identically everywhere, so
-            # they surface rather than burning a call on every provider.
-            if exc.status_code in (400, 422) or is_last:
-                raise
-            print(f"{name} failed ({exc.status_code}) — trying next provider")
+        if isinstance(outcome, HTTPException):
+            print(f"{name} failed ({outcome.status_code})")
+            failures[name] = outcome
             attempts.append({"provider": name, "outcome": "error",
-                             "detail": exc.status_code})
+                             "detail": outcome.status_code})
+            continue
+        if isinstance(outcome, BaseException):
+            print(f"{name} raised {type(outcome).__name__}: {outcome}")
+            failures[name] = outcome
+            attempts.append({"provider": name, "outcome": "error", "detail": "exception"})
             continue
 
-        if raw_results:
-            served_by = name
-            break
+        found, provider_total, provider_cursor = outcome
+        ran = True
+        attempts.append({"provider": name,
+                         "outcome": "results" if found else "no_results",
+                         "count": len(found)})
+        if found or provider_cursor:
+            buckets.append({"provider": name, "profiles": found,
+                            "total": provider_total, "next_cursor": provider_cursor})
 
-        # An empty result is not an error, but the next provider may hold the
-        # data this one lacks. Cheap to try: providers charge per result.
-        attempts.append({"provider": name, "outcome": "no_results"})
-        if not is_last:
-            print(f"{name} returned 0 leads — trying next provider")
-        else:
-            served_by = name
-
-    # Every provider refused, so nothing actually ran. Returning an empty
-    # success here would read as "no such leads exist" when the truth is that no
-    # configured provider can express the filter — a different answer, and the
-    # only one that tells the user what to change.
+    # Nothing ran at all. Distinguish the two ways that happens: every provider
+    # refused the filter, or every provider errored. An empty success would
+    # report "no such people" for both, which is true of neither.
     if not ran:
-        fields = sorted({field for field in refused.values()})
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"No configured provider can search by {', '.join(fields)}. "
-                f"Tried {', '.join(f'{p} ({f})' for p, f in refused.items())}. "
-                "Your search credit was not used — remove that filter or add a "
-                "provider that supports it."
-            ),
-        )
+        if refused and not failures:
+            fields = sorted({field for field in refused.values()})
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"No configured provider can search by {', '.join(fields)}. "
+                    f"Tried {', '.join(f'{p} ({f})' for p, f in refused.items())}. "
+                    "Your search credit was not used — remove that filter or add a "
+                    "provider that supports it."
+                ),
+            )
+        if failures:
+            # Surface a real upstream error rather than inventing an empty page.
+            first = next(iter(failures.values()))
+            if isinstance(first, HTTPException):
+                raise first
+            raise HTTPException(status_code=502, detail="Every lead provider failed for this search")
 
-    transform = transform_for(served_by)
+    raw_results, leads, total, cursor_map = merge_provider_results(buckets, transform_for)
+    next_cursor = encode_cursors(cursor_map)
+    contributors = [b["provider"] for b in buckets if b["profiles"]]
+    served_by = "+".join(contributors) if contributors else (chain[0] if chain else "none")
+
+    summary = ", ".join(
+        f"{a['provider']}:{a.get('count', a['outcome'])}" for a in attempts
+    )
     print(f"{served_by}{' (degraded preview)' if degraded and served_by == 'wiza' else ''} "
-          f"returned {len(raw_results)} leads")
+          f"returned {len(leads)} leads ({summary})")
 
-    leads = [transform(r, params) for r in raw_results]
-    cache_payload = {"profiles": raw_results, "total": total,
+    # Stored per provider, because a merged page can only be rebuilt by reading
+    # each provider's rows with its own transform.
+    cache_payload = {"buckets": buckets, "total": total,
                      "next_cursor": next_cursor, "provider": served_by}
     if not request.campaign_id:
         await cache_store(search_hash, cache_params, cache_payload)

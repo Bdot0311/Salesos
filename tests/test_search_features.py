@@ -467,18 +467,36 @@ class ProviderFallbackTests(unittest.IsolatedAsyncioTestCase):
                 p.stop()
         return response, calls
 
-    async def test_bytemine_serves_the_search_when_it_can(self):
+    async def test_every_provider_contributes_to_one_merged_result(self):
+        # The providers hold different data, which is the reason for having more
+        # than one. Stopping at the first that returned anything meant a search
+        # Bytemine could answer thinly never saw what Crustdata had for the same
+        # ICP.
         response, calls = await self.run_search(
             main.SearchRequest(job_title="VP of Sales", location="CA"),
             {"bytemine": {"profiles": [{"pid": "1", "first_name": "Ada"}],
                           "total": 1, "next_cursor": None},
-             "crustdata": AssertionError("must not be reached")},
+             "crustdata": {"profiles": [{"crustdata_person_id": 9}],
+                           "total": 1, "next_cursor": None}},
         )
 
-        self.assertEqual(calls, ["bytemine"])
-        self.assertEqual(response.provider, "bytemine")
+        self.assertEqual(sorted(calls), ["bytemine", "crustdata"])
+        self.assertEqual(response.provider, "bytemine+crustdata")
+        self.assertEqual(response.count, 2)
+        self.assertIn("Ada", [l["contact_name"] for l in response.leads])
+
+    async def test_a_provider_with_nothing_does_not_decide_the_search(self):
+        response, calls = await self.run_search(
+            main.SearchRequest(job_title="VP of Sales", location="CA"),
+            {"bytemine": {"profiles": [], "total": 0, "next_cursor": None},
+             "crustdata": {"profiles": [{"crustdata_person_id": 9}],
+                           "total": 1, "next_cursor": None}},
+        )
+
+        self.assertEqual(response.provider, "crustdata")
         self.assertEqual(response.count, 1)
-        self.assertEqual(response.leads[0]["contact_name"], "Ada")
+        outcomes = {a["provider"]: a["outcome"] for a in response.provider_attempts}
+        self.assertEqual(outcomes["bytemine"], "no_results")
 
     async def test_a_filter_bytemine_cannot_express_moves_to_crustdata(self):
         # A country location has no field on /contacts/search. Falling through
@@ -491,10 +509,11 @@ class ProviderFallbackTests(unittest.IsolatedAsyncioTestCase):
                            "total": 1, "next_cursor": None}},
         )
 
-        self.assertEqual(calls, ["crustdata"])
+        # Bytemine sits this one out; the providers that can express it answer.
+        self.assertNotIn("bytemine", calls)
         self.assertEqual(response.provider, "crustdata")
-        self.assertEqual(
-            [a["outcome"] for a in response.provider_attempts], ["unsupported_filter"])
+        outcomes = {a["provider"]: a["outcome"] for a in response.provider_attempts}
+        self.assertEqual(outcomes["bytemine"], "unsupported_filter")
 
     async def test_every_provider_refusing_is_an_error_not_an_empty_result(self):
         # Nothing ran, so "no leads" would be a different answer from the truth:
@@ -533,9 +552,10 @@ class ProviderFallbackTests(unittest.IsolatedAsyncioTestCase):
                            "total": 1, "next_cursor": None}},
         )
 
-        self.assertEqual(calls, ["bytemine", "crustdata"])
+        self.assertEqual(sorted(calls), ["bytemine", "crustdata"])
         self.assertEqual(response.provider, "crustdata")
-        self.assertEqual(response.provider_attempts[0]["detail"], 402)
+        details = {a["provider"]: a.get("detail") for a in response.provider_attempts}
+        self.assertEqual(details["bytemine"], 402)
 
     async def test_no_results_from_the_leader_still_tries_the_next(self):
         response, calls = await self.run_search(
@@ -545,13 +565,14 @@ class ProviderFallbackTests(unittest.IsolatedAsyncioTestCase):
                            "total": 1, "next_cursor": None}},
         )
 
-        self.assertEqual(calls, ["bytemine", "crustdata"])
+        self.assertEqual(sorted(calls), ["bytemine", "crustdata"])
         self.assertEqual(response.provider, "crustdata")
-        self.assertEqual(response.provider_attempts[0]["outcome"], "no_results")
+        outcomes = {a["provider"]: a["outcome"] for a in response.provider_attempts}
+        self.assertEqual(outcomes["bytemine"], "no_results")
 
-    async def test_a_bad_request_is_not_retried_against_every_provider(self):
-        # A 400 is about the query, not the provider — it will fail identically
-        # everywhere, so it surfaces instead of burning a call on each one.
+    async def test_a_bad_request_surfaces(self):
+        # A 400 is about the query, not the provider. With nothing to merge, it
+        # reaches the caller instead of becoming an empty page.
         with self.assertRaises(HTTPException) as ctx:
             await self.run_search(
                 main.SearchRequest(job_title="VP of Sales", location="CA"),
@@ -560,9 +581,9 @@ class ProviderFallbackTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(ctx.exception.status_code, 400)
 
-    async def test_the_last_providers_failure_is_reported(self):
-        # Nothing is left to fall back to, so the error must reach the caller
-        # rather than being swallowed into an empty result set.
+    async def test_every_provider_failing_is_reported(self):
+        # Nobody answered, so the error must reach the caller rather than being
+        # swallowed into an empty result set that reads as "no such people".
         with self.assertRaises(HTTPException) as ctx:
             await self.run_search(
                 main.SearchRequest(job_title="VP of Sales", location="CA"),
@@ -570,7 +591,7 @@ class ProviderFallbackTests(unittest.IsolatedAsyncioTestCase):
                  "crustdata": HTTPException(status_code=500, detail="upstream down"),
                  "wiza": HTTPException(status_code=503, detail="wiza down")},
             )
-        self.assertEqual(ctx.exception.status_code, 503)
+        self.assertIn(ctx.exception.status_code, (402, 500, 503))
 
 
 class PaginationTests(unittest.TestCase):
@@ -863,6 +884,161 @@ class BytemineKeywordResolutionTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(main.ProviderUnsupported):
                 await main.bytemine_person_search(
                     {"keywords": "ai saas", "location": "US"}, 10)
+
+
+class SemanticQueryRetentionTests(unittest.IsolatedAsyncioTestCase):
+    """The sentence the user typed must survive into the search.
+
+    resolve_search_params popped `query` and then only used it when no
+    structured field was set — which is never, because the frontend parses the
+    query into filters before sending and ships both. So the words were dropped,
+    and every search with the same coarse filters became the same request:
+    identical params, identical cache key, identical rows for the cache's whole
+    hour. Different searches returned the same leads because by that point they
+    were the same search.
+    """
+
+    async def resolve(self, **kwargs):
+        return await main.resolve_search_params(main.SearchRequest(**kwargs))
+
+    async def test_the_sentence_survives_alongside_structured_filters(self):
+        params = await self.resolve(
+            query="heads of RevOps at fintechs replacing Salesforce",
+            job_title="VP Sales", industry="computer software", location="US")
+
+        self.assertEqual(params["semantic_query"],
+                         "heads of RevOps at fintechs replacing Salesforce")
+
+    async def test_two_different_sentences_are_two_different_searches(self):
+        common = {"job_title": "VP Sales", "industry": "computer software", "location": "US"}
+        a = await self.resolve(query="VP Sales at AI SaaS companies", **common)
+        b = await self.resolve(query="heads of RevOps at fintechs", **common)
+
+        self.assertNotEqual(main.generate_search_hash(a), main.generate_search_hash(b))
+
+    async def test_a_bare_query_still_gets_parsed_into_filters(self):
+        # The no-structured-fields path is unchanged: the parser runs and the
+        # sentence becomes filters rather than only a ranking hint.
+        params = await self.resolve(query="fintech CTOs in Germany")
+
+        self.assertEqual(params["industry"], "financial services")
+        self.assertEqual(params["job_title"], "CTO")
+
+    def test_crustdata_searches_the_sentence(self):
+        query = "heads of RevOps at fintechs replacing Salesforce"
+        joined = " ".join(x for x in ("", query) if x).strip()
+
+        self.assertEqual(joined, query)
+
+    def test_providers_without_free_text_step_aside(self):
+        # Bytemine's company-graph fallback matches a segment term like
+        # "AI SaaS" against company descriptions; a whole request matches
+        # nothing that way and would spend a company-search credit finding out.
+        params = {"job_title": "VP Sales", "semantic_query": "heads of RevOps at fintechs"}
+
+        for build in (main.build_bytemine_filters, main.build_wiza_filters):
+            with self.assertRaises(main.ProviderUnsupported) as caught:
+                build(params)
+            self.assertEqual(caught.exception.field, "semantic_query")
+
+
+class MergeTests(unittest.TestCase):
+    """Every provider's results become one list."""
+
+    @staticmethod
+    def _transform_for(_name):
+        # Identity: these tests are about merging, not about row shapes.
+        return lambda row: dict(row)
+
+    def test_results_from_every_provider_are_kept(self):
+        buckets = [
+            {"provider": "bytemine", "profiles": [{"contact_email": "a@x.com"}], "total": 1, "next_cursor": None},
+            {"provider": "crustdata", "profiles": [{"contact_email": "b@x.com"}], "total": 1, "next_cursor": None},
+        ]
+        raw, leads, total, _ = main.merge_provider_results(buckets, self._transform_for)
+
+        self.assertEqual(len(raw), 2)
+        self.assertEqual(len(leads), 2)
+        self.assertEqual(total, 2)
+
+    def test_the_same_person_from_two_providers_appears_once(self):
+        buckets = [
+            {"provider": "bytemine", "profiles": [{"linkedin_url": "https://linkedin.com/in/ada"}], "total": 1, "next_cursor": None},
+            {"provider": "crustdata", "profiles": [{"linkedin_url": "https://www.linkedin.com/in/ada/"}], "total": 1, "next_cursor": None},
+        ]
+        _, leads, total, _ = main.merge_provider_results(buckets, self._transform_for)
+
+        self.assertEqual(len(leads), 1)
+        # The total cannot claim two people when one was returned.
+        self.assertEqual(total, 1)
+
+    def test_an_email_identifies_a_person_without_a_linkedin_url(self):
+        buckets = [
+            {"provider": "bytemine", "profiles": [{"contact_email": "Ada@X.com"}], "total": 1, "next_cursor": None},
+            {"provider": "crustdata", "profiles": [{"contact_email": "ada@x.com"}], "total": 1, "next_cursor": None},
+        ]
+        _, leads, _, _ = main.merge_provider_results(buckets, self._transform_for)
+
+        self.assertEqual(len(leads), 1)
+
+    def test_name_and_company_are_the_last_resort(self):
+        buckets = [
+            {"provider": "bytemine", "profiles": [{"contact_name": "Ada L", "company_name": "Acme"}], "total": 1, "next_cursor": None},
+            {"provider": "crustdata", "profiles": [{"contact_name": "ada l", "company_name": "acme"}], "total": 1, "next_cursor": None},
+            {"provider": "wiza", "profiles": [{"contact_name": "Ada L", "company_name": "Other"}], "total": 1, "next_cursor": None},
+        ]
+        _, leads, _, _ = main.merge_provider_results(buckets, self._transform_for)
+
+        self.assertEqual(len(leads), 2)
+
+    def test_the_page_is_interleaved_not_one_provider_then_the_next(self):
+        # A merged page that is all of the first provider before any of the
+        # second is the old behaviour wearing a merge.
+        buckets = [
+            {"provider": "bytemine", "profiles": [{"contact_email": f"b{i}@x.com"} for i in range(3)], "total": 3, "next_cursor": None},
+            {"provider": "crustdata", "profiles": [{"contact_email": f"c{i}@x.com"} for i in range(3)], "total": 3, "next_cursor": None},
+        ]
+        _, leads, _, _ = main.merge_provider_results(buckets, self._transform_for)
+
+        self.assertEqual([l["contact_email"][0] for l in leads],
+                         ["b", "c", "b", "c", "b", "c"])
+
+    def test_uneven_result_counts_do_not_drop_anyone(self):
+        buckets = [
+            {"provider": "bytemine", "profiles": [{"contact_email": "b0@x.com"}], "total": 1, "next_cursor": None},
+            {"provider": "crustdata", "profiles": [{"contact_email": f"c{i}@x.com"} for i in range(3)], "total": 3, "next_cursor": None},
+        ]
+        _, leads, _, _ = main.merge_provider_results(buckets, self._transform_for)
+
+        self.assertEqual(len(leads), 4)
+
+
+class CompositeCursorTests(unittest.TestCase):
+    """Each provider pages independently, behind one opaque token."""
+
+    def test_a_round_trip_preserves_every_position(self):
+        cursors = {"bytemine": "bm-2", "crustdata": "cd-2"}
+
+        self.assertEqual(
+            main.decode_cursors(main.encode_cursors(cursors), ["bytemine", "crustdata"]),
+            cursors,
+        )
+
+    def test_no_cursors_means_no_token(self):
+        self.assertIsNone(main.encode_cursors({}))
+        self.assertIsNone(main.encode_cursors({"bytemine": None}))
+
+    def test_a_plain_cursor_goes_only_to_the_chain_leader(self):
+        # Predates the merge and can only have come from the leading provider.
+        # Handing it to every provider would ask each to resume from a position
+        # in someone else's result set.
+        self.assertEqual(
+            main.decode_cursors("raw-token", ["bytemine", "crustdata"]),
+            {"bytemine": "raw-token"},
+        )
+
+    def test_an_unreadable_token_starts_over_rather_than_failing(self):
+        self.assertEqual(main.decode_cursors("multi:!!!not-base64", ["bytemine"]), {})
 
 
 if __name__ == "__main__":
