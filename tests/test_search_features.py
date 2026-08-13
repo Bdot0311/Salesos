@@ -260,7 +260,9 @@ class BytemineFilterTests(unittest.TestCase):
             "industry": "Information Technology and Services",
             "company_size": "51-200",
             "company_domain": "stripe.com",
-            "location": "CA",
+            # A state by name. "CA" would be Canada here — see
+            # classify_location — and Bytemine has no country field.
+            "location": "California",
         })
 
         self.assertEqual(body["jobTitles"], ["VP of Sales"])
@@ -395,7 +397,7 @@ class BytemineRequestTests(unittest.IsolatedAsyncioTestCase):
             })
             try:
                 result = await main.bytemine_person_search(
-                    {"job_title": "VP of Sales", "location": "CA"}, 25)
+                    {"job_title": "VP of Sales", "location": "California"}, 25)
             finally:
                 FakeResponse.text = json.dumps({
                     "profiles": [{"crustdata_person_id": 7}],
@@ -611,7 +613,7 @@ class BytemineePaginationTests(unittest.IsolatedAsyncioTestCase):
             try:
                 for offset, expected_page in ((0, 0), (10, 1), (25, 2), (100, 10)):
                     await main.bytemine_person_search(
-                        {"job_title": "CEO", "location": "CA"}, 10, offset=offset)
+                        {"job_title": "CEO", "location": "California"}, 10, offset=offset)
                     self.assertEqual(
                         FakeClient.last_json["body"]["page"], expected_page,
                         f"offset {offset}")
@@ -730,6 +732,78 @@ class KeywordExpressibilityTests(unittest.TestCase):
         })
 
         self.assertEqual(filters["urls"], ["anthropic.com", "openai.com"])
+
+
+class LocationClassificationTests(unittest.TestCase):
+    """A location is a US state, a country or a city — never a guess.
+
+    /contacts/search has no country field, and the old rule sent any token
+    longer than two characters as a city. "Germany" became a search for a city
+    called Germany and "Texas" a city called Texas: filters that match nothing,
+    silently, while the search still reports success.
+    """
+
+    def test_a_country_is_recognised_as_one(self):
+        for name in ("Germany", "United States", "Canada", "Japan"):
+            self.assertEqual(main.classify_location(name)[0], "country", name)
+
+    def test_a_state_name_becomes_its_code(self):
+        self.assertEqual(main.classify_location("Texas"), ("state", "TX"))
+        self.assertEqual(main.classify_location("New York"), ("state", "NY"))
+        self.assertEqual(main.classify_location("Ohio"), ("state", "OH"))
+
+    def test_an_unambiguous_state_code_is_kept(self):
+        self.assertEqual(main.classify_location("TX"), ("state", "TX"))
+        self.assertEqual(main.classify_location("NY"), ("state", "NY"))
+
+    def test_a_code_naming_both_a_state_and_a_country_reads_as_the_country(self):
+        # fetch-external-leads sets `location` from normalizeCountry(), so a
+        # two-letter location is always a country code. Reading "CA" as
+        # California sent every search for Canada to the wrong continent.
+        #
+        # Driven off the real set so a code added there cannot quietly go back
+        # to being read as a US state.
+        for code in main._STATE_CODE_IS_ALSO_A_COUNTRY:
+            kind, value = main.classify_location(code)
+            self.assertEqual((kind, value), ("country", code), code)
+
+    def test_the_colliding_codes_really_are_us_state_codes(self):
+        # If one of these stopped being a state code the entry would be dead
+        # weight, and the ordering it justifies would look arbitrary.
+        self.assertTrue(main._STATE_CODE_IS_ALSO_A_COUNTRY <= main._US_STATE_CODES)
+
+    def test_a_state_name_still_beats_a_country_code_spelling(self):
+        # "Georgia" the US state, not GE the country.
+        self.assertEqual(main.classify_location("Georgia"), ("state", "GA"))
+
+    def test_a_city_stays_a_city(self):
+        self.assertEqual(main.classify_location("Berlin"), ("city", "Berlin"))
+        self.assertEqual(main.classify_location("San Francisco"),
+                         ("city", "San Francisco"))
+
+    def test_a_country_is_refused_not_searched_as_a_city(self):
+        with self.assertRaises(main.ProviderUnsupported) as caught:
+            main.build_bytemine_filters({"job_title": "CEO", "location": "Germany"})
+
+        self.assertEqual(caught.exception.field, "location")
+
+    def test_a_state_reaches_bytemine_as_a_state(self):
+        # Previously cities:["Texas"], which matches nothing.
+        body = main.build_bytemine_filters({"job_title": "CEO", "location": "Texas"})
+
+        self.assertEqual(body["states"], ["TX"])
+        self.assertNotIn("cities", body)
+
+    def test_a_city_still_reaches_bytemine_as_a_city(self):
+        body = main.build_bytemine_filters({"job_title": "CEO", "location": "Berlin"})
+
+        self.assertEqual(body["cities"], ["Berlin"])
+
+    def test_the_parser_state_names_are_no_longer_shadowed(self):
+        # A second _US_STATES of 2-letter codes used to overwrite the parser's
+        # full-name set at module scope, so the names were unreachable.
+        self.assertIn("california", main._US_STATES)
+        self.assertIn("CA", main._US_STATE_CODES)
 
 
 class BytemineKeywordResolutionTests(unittest.IsolatedAsyncioTestCase):

@@ -1627,12 +1627,103 @@ _BM_EMPLOYEE_BANDS = [
 ]
 _BM_TOP_BAND = "10000+"
 
-_US_STATES = {
+# Named separately from the parser's _US_STATES (full lowercase names, line ~262)
+# which this used to shadow at module scope.
+_US_STATE_CODES = {
     "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA", "HI", "ID", "IL",
     "IN", "IA", "KS", "KY", "LA", "ME", "MD", "MA", "MI", "MN", "MS", "MO", "MT",
     "NE", "NV", "NH", "NJ", "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI",
     "SC", "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY", "DC",
 }
+
+_US_STATE_NAME_TO_CODE = {
+    "alabama": "AL", "alaska": "AK", "arizona": "AZ", "arkansas": "AR",
+    "california": "CA", "colorado": "CO", "connecticut": "CT", "delaware": "DE",
+    "florida": "FL", "georgia": "GA", "hawaii": "HI", "idaho": "ID",
+    "illinois": "IL", "indiana": "IN", "iowa": "IA", "kansas": "KS",
+    "kentucky": "KY", "louisiana": "LA", "maine": "ME", "maryland": "MD",
+    "massachusetts": "MA", "michigan": "MI", "minnesota": "MN",
+    "mississippi": "MS", "missouri": "MO", "montana": "MT", "nebraska": "NE",
+    "nevada": "NV", "new hampshire": "NH", "new jersey": "NJ",
+    "new mexico": "NM", "new york": "NY", "north carolina": "NC",
+    "north dakota": "ND", "ohio": "OH", "oklahoma": "OK", "oregon": "OR",
+    "pennsylvania": "PA", "rhode island": "RI", "south carolina": "SC",
+    "south dakota": "SD", "tennessee": "TN", "texas": "TX", "utah": "UT",
+    "vermont": "VT", "virginia": "VA", "washington": "WA",
+    "west virginia": "WV", "wisconsin": "WI", "wyoming": "WY",
+    "district of columbia": "DC",
+}
+
+
+# Country name (or code) -> ISO 3166 alpha-2. /contacts/search has no country
+# field, so these are refused there rather than searched as a city called
+# "Germany"; /b2b-search does have one and uses the code.
+_BM_COUNTRY_CODE = {
+    "us": "US", "usa": "US", "u.s.": "US", "u.s.a.": "US",
+    "united states": "US", "america": "US",
+    "gb": "GB", "uk": "GB", "united kingdom": "GB", "great britain": "GB",
+    "britain": "GB", "england": "GB", "scotland": "GB", "wales": "GB",
+    "ca": "CA", "canada": "CA", "au": "AU", "australia": "AU",
+    "de": "DE", "germany": "DE", "fr": "FR", "france": "FR",
+    "es": "ES", "spain": "ES", "it": "IT", "italy": "IT",
+    "nl": "NL", "netherlands": "NL", "se": "SE", "sweden": "SE",
+    "no": "NO", "norway": "NO", "dk": "DK", "denmark": "DK",
+    "fi": "FI", "finland": "FI", "ch": "CH", "switzerland": "CH",
+    "at": "AT", "austria": "AT", "be": "BE", "belgium": "BE",
+    "ie": "IE", "ireland": "IE", "in": "IN", "india": "IN",
+    "sg": "SG", "singapore": "SG", "il": "IL", "israel": "IL",
+    "br": "BR", "brazil": "BR", "mx": "MX", "mexico": "MX",
+    "ar": "AR", "argentina": "AR", "co": "CO", "colombia": "CO",
+    "cl": "CL", "chile": "CL", "jp": "JP", "japan": "JP",
+    "kr": "KR", "south korea": "KR", "korea": "KR",
+    "cn": "CN", "china": "CN", "tw": "TW", "taiwan": "TW",
+    "nz": "NZ", "new zealand": "NZ", "za": "ZA", "south africa": "ZA",
+    "ng": "NG", "nigeria": "NG", "ke": "KE", "kenya": "KE",
+    "pl": "PL", "poland": "PL", "pt": "PT", "portugal": "PT",
+    "cz": "CZ", "czechia": "CZ", "czech republic": "CZ",
+    "ro": "RO", "romania": "RO", "hu": "HU", "hungary": "HU",
+    "ua": "UA", "ukraine": "UA", "ae": "AE", "united arab emirates": "AE",
+    "sa": "SA", "saudi arabia": "SA", "tr": "TR", "turkey": "TR",
+    "ru": "RU", "russia": "RU",
+}
+
+# Two-letter codes that name a US state *and* a country we recognise — CA, DE,
+# IN, IL and so on. They are read as countries, because that is what produces
+# them: fetch-external-leads sets `location` from normalizeCountry(), so a
+# two-letter location is always an ISO country code. Reading "CA" as California
+# meant every search for Canada came back from the wrong continent. A US state
+# arrives by name ("Texas"), which is unambiguous.
+#
+# Derived rather than listed: written by hand it drifts from the country map it
+# describes, and a code in one but not the other is a silent misread.
+_STATE_CODE_IS_ALSO_A_COUNTRY = _US_STATE_CODES & set(_BM_COUNTRY_CODE.values())
+
+
+def classify_location(token: str) -> tuple[str, str]:
+    """Read one location string as a US state, a country or a city.
+
+    Returns (kind, value) where kind is "state" (2-letter code), "country"
+    (ISO alpha-2), "city" (the token as given), or "unknown" for a two-letter
+    token that is neither a state nor a country we recognise.
+
+    State names are checked before country codes so "Georgia" the state and "GA"
+    the code do not collide, and two-letter codes resolve to countries — see
+    _STATE_CODE_IS_ALSO_A_COUNTRY for why.
+    """
+    token = (token or "").strip()
+    lowered = token.lower()
+    upper = token.upper()
+
+    state_code = _US_STATE_NAME_TO_CODE.get(lowered)
+    if state_code:
+        return "state", state_code
+    if lowered in _BM_COUNTRY_CODE:
+        return "country", _BM_COUNTRY_CODE[lowered]
+    if upper in _US_STATE_CODES:
+        return "state", upper
+    if len(token) > 2:
+        return "city", token
+    return "unknown", token
 
 
 def bytemine_employee_band(size: str):
@@ -1692,18 +1783,22 @@ def build_bytemine_filters(p: dict) -> dict:
             raise ProviderUnsupported("company_size", p["company_size"])
         body["employeeSizes"] = [band]
 
-    # /contacts/search filters location by US state or city only. A country —
-    # which is what the ICP parser usually produces — has no field, so rather
-    # than search the whole world under a country filter the user set, hand the
-    # query to a provider that supports it.
+    # /contacts/search filters location by US state or city only — there is no
+    # country field. Anything that is not one of those two is refused so the
+    # chain reaches a provider that can express it.
+    #
+    # The old rule sent any token longer than two characters as a city, so
+    # "Germany" became cities:["Germany"] and "Texas" a city too: a filter that
+    # matches nothing, silently, while reporting a successful search.
     location = p.get("location") or p.get("company_location")
     if location:
-        token = str(location).strip()
-        if token.upper() in _US_STATES:
-            body["states"] = [token.upper()]
-        elif len(token) > 2 and token.upper() not in {"US", "USA", "GB", "UK"}:
-            body["cities"] = [token]
+        kind, value = classify_location(str(location))
+        if kind == "state":
+            body["states"] = [value]
+        elif kind == "city":
+            body["cities"] = [value]
         else:
+            # A country, or a code that could be either. Neither is expressible.
             raise ProviderUnsupported("location", location)
 
     # /contacts/search has no free-text field. Keywords are meant to be resolved
@@ -1793,17 +1888,21 @@ async def bytemine_resolve_keywords(params: dict) -> dict:
         if hi is not None:
             body["max_employees"] = hi
 
+    # /b2b-search does have a country field, so unlike /contacts/search it can
+    # narrow the company list by one — but a code that names both a state and a
+    # country is no more resolvable here, and picking wrong would seed the
+    # contact search with companies on the wrong continent.
     location = params.get("company_location") or params.get("location")
     if location:
-        token = str(location).strip()
-        if token.upper() in _US_STATES:
-            body["state"] = token.upper()
-        elif len(token) == 2:
-            body["country"] = token.upper()
-        elif token.lower() in _LOCATION_ALIASES:
-            body["country"] = "US" if _LOCATION_ALIASES[token.lower()] == "United States" else "GB"
+        kind, value = classify_location(str(location))
+        if kind == "state":
+            body["state"] = value
+        elif kind == "country":
+            body["country"] = value
+        elif kind == "city":
+            body["city"] = value
         else:
-            body["city"] = token
+            raise ProviderUnsupported("location", location)
 
     data = await bytemine_call("/b2b-search", body)
     companies = data.get("data") or data.get("results") or []
