@@ -394,6 +394,59 @@ _INDUSTRY_MAP = {
     "nonprofit": "non-profit organization management",
 }
 
+# Query terms no provider taxonomy can express.
+#
+# All three providers classify companies with LinkedIn's industry list, which
+# has no AI category — the nearest value is "computer software", meaning every
+# software company there is. Mapping "AI SaaS" onto it and stopping there is how
+# a search for AI companies returned CEOs at Boeing and VC firms: the word that
+# defined the ICP was spent on a filter that cannot carry it.
+#
+# A term listed here keeps its taxonomy value as a supporting filter *and* is
+# emitted as `keywords`. Every provider must then either search it as free text
+# or refuse the search outright, so the chain moves to one that can — see
+# ProviderUnsupported.
+_SEMANTIC_ONLY_TERMS = (
+    "artificial intelligence", "computer vision", "machine learning",
+    "deep learning", "generative ai", "ai saas", "gen ai", "genai", "mlops",
+    "ai/ml", "llms", "llm", "nlp", "ai", "ml",
+)
+
+
+def semantic_terms_in(text: str) -> list[str]:
+    """The parts of a query that no industry taxonomy can express.
+
+    Matched longest-first so "ai saas" wins over the bare "ai" inside it, and
+    with non-alphanumeric boundaries rather than \\b so that "email", "chair" and
+    "retail" do not read as an AI query — which is exactly the collapse that
+    made every "AI SaaS" search return generic software leads.
+    """
+    low = (text or "").lower()
+    found: list[str] = []
+    for term in sorted(_SEMANTIC_ONLY_TERMS, key=len, reverse=True):
+        if not re.search(rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])", low):
+            continue
+        # A longer match already covers this one ("ai" inside "ai saas").
+        if any(term in seen for seen in found):
+            continue
+        found.append(term)
+    return found
+
+
+class ProviderUnsupported(Exception):
+    """This provider cannot express one of the requested filters.
+
+    Raised instead of quietly dropping it: the chain moves to the next provider,
+    which is the whole reason a fallback exists. Silently ignoring the filter
+    would return leads outside the requested ICP.
+    """
+
+    def __init__(self, field: str, value):
+        super().__init__(f"{field}={value!r}")
+        self.field = field
+        self.value = value
+
+
 # Wiza's complete, fixed company_industry vocabulary (from the prospect-search
 # docs). Anything outside this set is silently ignored by Wiza, so we validate
 # against it before sending — see normalize_industry.
@@ -579,8 +632,12 @@ def heuristic_parse_icp(text: str) -> dict:
             cand = re.sub(r"\b(compan(?:y|ies)|startups?|inc\.?|llc|corp\.?)\b.*$", "",
                           m.group(1), flags=re.I).strip()
             cl = cand.lower()
+            # "VP Sales at AI SaaS startups" is not a request for a company
+            # named "AI SaaS" — the phrase after "at" can just as easily be the
+            # segment, and searching it as a company name matches near-nothing.
             if cand and cl not in _INDUSTRY_MAP and cl not in _COUNTRIES \
-                    and cl not in _US_STATES and cl not in _LOCATION_ALIASES:
+                    and cl not in _US_STATES and cl not in _LOCATION_ALIASES \
+                    and not semantic_terms_in(cand):
                 filters["company"] = cand
 
     # --- Location (people location; "hq/headquartered" -> company_location) ----
@@ -646,6 +703,15 @@ def heuristic_parse_icp(text: str) -> dict:
         if re.search(rf"\b{re.escape(kw)}\b(?!\s+(?:{_role_alt})s?\b)", low):
             filters["industry"] = _INDUSTRY_MAP[kw]
             break
+
+    # --- Terms the taxonomy cannot carry --------------------------------------
+    # "AI SaaS" resolves to industry=computer software above, which is every
+    # software company on earth. Keep that as a supporting filter but also send
+    # the defining words as free text, so a provider either searches them or
+    # refuses — see _SEMANTIC_ONLY_TERMS.
+    semantic = semantic_terms_in(orig)
+    if semantic:
+        filters["keywords"] = " ".join(semantic)
 
     # --- Company size ----------------------------------------------------------
     size = None
@@ -724,9 +790,13 @@ def build_wiza_filters(p: dict) -> dict:
     if p.get("job_title"):
         fil["job_title"] = [f(p["job_title"])]
 
-    # Keywords merged into job_title search (Wiza has no generic keyword field)
+    # Wiza has no free-text field. Merging keywords into job_title looked like a
+    # workaround but did the opposite of narrowing: Wiza ORs the values in a
+    # filter, so job_title=["Founder", "AI SaaS"] matches every Founder
+    # anywhere — which is how an AI search returned founders at aerospace and
+    # venture firms. Refuse, and let the chain reach a provider with free text.
     if p.get("keywords"):
-        fil["job_title"] = fil.get("job_title", []) + [f(p["keywords"])]
+        raise ProviderUnsupported("keywords", p["keywords"])
 
     # Seniority — only add if we have a known Wiza level
     if p.get("seniority"):
@@ -775,14 +845,14 @@ def build_wiza_filters(p: dict) -> dict:
     if values:
         fil["job_company"] = [f(c) for c in values]
 
-    # company_industry must be one of Wiza's fixed values or it's silently
-    # ignored; normalize (handles free-form LLM output) and drop if unmappable.
+    # company_industry must be one of Wiza's fixed values or Wiza ignores it.
+    # An unmappable industry used to be dropped with a log line, which turned a
+    # narrow request into a broad search without telling anyone. Refuse instead.
     if p.get("industry"):
         industry = normalize_industry(p["industry"])
-        if industry:
-            fil["company_industry"] = [f(industry)]
-        else:
-            print(f"Dropping unrecognized industry filter: {p['industry']!r}")
+        if not industry:
+            raise ProviderUnsupported("industry", p["industry"])
+        fil["company_industry"] = [f(industry)]
 
     if p.get("company_size"):
         sizes = COMPANY_SIZE_MAP.get(p["company_size"], [])
@@ -1584,20 +1654,6 @@ def bytemine_employee_band(size: str):
     return _BM_TOP_BAND
 
 
-class ProviderUnsupported(Exception):
-    """This provider cannot express one of the requested filters.
-
-    Raised instead of quietly dropping it: the chain moves to the next provider,
-    which is the whole reason a fallback exists. Silently ignoring the filter
-    would return leads outside the requested ICP.
-    """
-
-    def __init__(self, field: str, value):
-        super().__init__(f"{field}={value!r}")
-        self.field = field
-        self.value = value
-
-
 def build_bytemine_filters(p: dict) -> dict:
     """Translate internal search params into a Bytemine /contacts/search body.
 
@@ -1620,8 +1676,15 @@ def build_bytemine_filters(p: dict) -> dict:
         body["industries"] = [p["industry"]]
     if p.get("company"):
         body["companyNames"] = [p["company"]]
+
+    # Domains from an explicit company_domain and from a keyword resolved
+    # against the company graph (see bytemine_resolve_keywords) are the same
+    # constraint to /contacts/search, so they share one field.
+    urls = list(p.get("company_domains") or [])
     if p.get("company_domain"):
-        body["urls"] = [p["company_domain"]]
+        urls.insert(0, p["company_domain"])
+    if urls:
+        body["urls"] = list(dict.fromkeys(urls))
 
     if p.get("company_size"):
         band = bytemine_employee_band(p["company_size"])
@@ -1643,7 +1706,10 @@ def build_bytemine_filters(p: dict) -> dict:
         else:
             raise ProviderUnsupported("location", location)
 
-    # No free-text field exists on contact search; keywords would be dropped.
+    # /contacts/search has no free-text field. Keywords are meant to be resolved
+    # to company domains first — bytemine_resolve_keywords does that and clears
+    # the key. Reaching here with one still set means an unresolved term would
+    # be silently dropped, so refuse rather than run a broader search.
     if p.get("keywords"):
         raise ProviderUnsupported("keywords", p["keywords"])
 
@@ -1686,6 +1752,73 @@ async def bytemine_call(path: str, body: dict, timeout: float = 60.0) -> dict:
         return resp.json()
 
 
+# How many companies a keyword is allowed to resolve to. /b2b-search bills one
+# credit per company returned, so this is a real cost per keyword search; it is
+# also the ceiling on how many accounts the contact search can then draw from.
+BYTEMINE_KEYWORD_COMPANIES = 50
+
+
+async def bytemine_resolve_keywords(params: dict) -> dict:
+    """Turn a free-text term into the company domains it describes.
+
+    /contacts/search has no free-text field, which is why keywords used to be
+    refused outright. /b2b-search does: `keywords` matches company descriptions,
+    which is where a segment like "AI SaaS" is actually written down. Resolving
+    the term to companies first and then filtering contacts to those domains
+    keeps it a hard constraint instead of dropping it.
+
+    Returns params unchanged when there is nothing to resolve. On a resolved
+    keyword the key is replaced by `company_domains`; an empty list there means
+    the term genuinely matched no company, which is a real no-results answer
+    rather than a reason to search without it.
+    """
+    keywords = (params.get("keywords") or "").strip()
+    if not keywords:
+        return params
+
+    body: dict = {
+        "keywords": keywords,
+        "page": 1,
+        "page_size": BYTEMINE_KEYWORD_COMPANIES,
+        # A contact search filters by domain, so a company without one cannot
+        # be used and would only consume credits.
+        "has_website": True,
+    }
+    if params.get("industry"):
+        body["industry"] = params["industry"]
+    if params.get("company_size"):
+        lo, hi = _size_bounds(params["company_size"])
+        if lo is not None:
+            body["min_employees"] = lo
+        if hi is not None:
+            body["max_employees"] = hi
+
+    location = params.get("company_location") or params.get("location")
+    if location:
+        token = str(location).strip()
+        if token.upper() in _US_STATES:
+            body["state"] = token.upper()
+        elif len(token) == 2:
+            body["country"] = token.upper()
+        elif token.lower() in _LOCATION_ALIASES:
+            body["country"] = "US" if _LOCATION_ALIASES[token.lower()] == "United States" else "GB"
+        else:
+            body["city"] = token
+
+    data = await bytemine_call("/b2b-search", body)
+    companies = data.get("data") or data.get("results") or []
+    domains = []
+    for company in companies:
+        host = domain_host(company.get("website") or company.get("domain") or "")
+        if host and host not in domains:
+            domains.append(host)
+
+    print(f"Bytemine keyword {keywords!r} resolved to {len(domains)} company domains")
+    resolved = {k: v for k, v in params.items() if k != "keywords"}
+    resolved["company_domains"] = domains
+    return resolved
+
+
 async def bytemine_person_search(params: dict, limit: int, cursor: str = None,
                                  offset: int = 0) -> dict:
     """Search Bytemine prospects. Results come back masked; /enrich unlocks them.
@@ -1694,6 +1827,24 @@ async def bytemine_person_search(params: dict, limit: int, cursor: str = None,
     than ignored — returning page 1 for every page is what made every search
     look like it had the same handful of leads.
     """
+    # Check the rest of the request is expressible before resolving keywords:
+    # /b2b-search bills per company returned, and spending that on a search
+    # about to be refused for an unrelated filter is money for nothing. A
+    # keyword on its own is a complete search once resolved, so there is nothing
+    # to pre-check and an empty body here would be the wrong error.
+    others = {k: v for k, v in params.items() if k != "keywords"}
+    if params.get("keywords") and any(
+            others.get(k) for k in ("job_title", "seniority", "departments",
+                                    "industry", "company", "company_domain",
+                                    "company_size", "location", "company_location")):
+        build_bytemine_filters(others)
+
+    params = await bytemine_resolve_keywords(params)
+    # The keyword described companies and none exist; a contact search without
+    # it would answer a different question.
+    if params.get("company_domains") == []:
+        return {"profiles": [], "total": 0, "next_cursor": None, "credits_used": None}
+
     body = build_bytemine_filters(params)
     size = max(min(limit, 100), 1)
     body["pageSize"] = size
@@ -2614,8 +2765,12 @@ async def parse_icp(request: ICPParseRequest):
         except Exception as e:
             print(f"ICP parser: LLM booster skipped, using rule-based result ({e})")
 
-    # Drop a bare keyword fallback if the rules (or LLM) found real filters.
-    if len(filters) > 1 and filters.get("keywords") == request.text:
+    # Drop a bare keyword fallback if the rules (or LLM) found real filters —
+    # but never drop a term the taxonomy cannot express. For "AI SaaS" the
+    # keyword *is* the query, and discarding it here left industry=computer
+    # software as the entire search.
+    if (len(filters) > 1 and filters.get("keywords") == request.text
+            and not semantic_terms_in(request.text)):
         filters.pop("keywords", None)
 
     return {"success": True, "filters": filters}
@@ -2889,14 +3044,18 @@ async def search_leads(request: SearchRequest):
     next_cursor = None
     served_by = chain[0]
     attempts: list = []
+    ran = False
+    refused: dict[str, str] = {}
 
     for index, name in enumerate(chain):
         is_last = index == len(chain) - 1
         try:
             raw_results, total, next_cursor = await run_provider(name)
+            ran = True
         except ProviderUnsupported as unsupported:
             # The provider cannot express one of the requested filters. Moving on
             # keeps the ICP intact; dropping the filter would not.
+            refused[name] = unsupported.field
             print(f"{name} cannot express {unsupported} — trying next provider")
             attempts.append({"provider": name, "outcome": "unsupported_filter",
                              "detail": unsupported.field})
@@ -2922,6 +3081,22 @@ async def search_leads(request: SearchRequest):
             print(f"{name} returned 0 leads — trying next provider")
         else:
             served_by = name
+
+    # Every provider refused, so nothing actually ran. Returning an empty
+    # success here would read as "no such leads exist" when the truth is that no
+    # configured provider can express the filter — a different answer, and the
+    # only one that tells the user what to change.
+    if not ran:
+        fields = sorted({field for field in refused.values()})
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"No configured provider can search by {', '.join(fields)}. "
+                f"Tried {', '.join(f'{p} ({f})' for p, f in refused.items())}. "
+                "Your search credit was not used — remove that filter or add a "
+                "provider that supports it."
+            ),
+        )
 
     transform = transform_for(served_by)
     print(f"{served_by}{' (degraded preview)' if degraded and served_by == 'wiza' else ''} "
@@ -2962,7 +3137,18 @@ async def prospects_preview(request: SearchRequest):
         if prov == "crustdata":
             data = await crustdata_person_search(params, size)
         else:
-            data = await wiza_prospect_search(params, size)
+            try:
+                data = await wiza_prospect_search(params, size)
+            except ProviderUnsupported as unsupported:
+                # There is no chain to fall through to here, so say plainly that
+                # this provider cannot size that audience rather than returning
+                # a count for a broader search than the one that was asked for.
+                raise HTTPException(
+                    status_code=422,
+                    detail=(f"{prov} cannot preview a search filtered by "
+                            f"{unsupported.field}. Run the full search instead, "
+                            "which can use a provider that supports it."),
+                ) from unsupported
         # Store total alongside profiles so it survives caching
         return [{"_total": data.get("total", 0)}] + (data.get("profiles") or [])
 
@@ -3016,7 +3202,16 @@ async def company_search(request: SearchRequest, enrich: bool = True, enrich_lim
             data = await crustdata_person_search(params, size)
             return aggregate_companies_crustdata(data.get("profiles") or [])
 
-        data = await wiza_prospect_search(params, size)
+        try:
+            data = await wiza_prospect_search(params, size)
+        except ProviderUnsupported as unsupported:
+            # No chain here either — a company list built without the filter
+            # would be a list of the wrong companies.
+            raise HTTPException(
+                status_code=422,
+                detail=(f"{prov} cannot search companies by {unsupported.field}. "
+                        "Remove that filter or configure a provider that supports it."),
+            ) from unsupported
         companies = aggregate_companies(data.get("profiles") or [])
         if not enrich:
             return companies
