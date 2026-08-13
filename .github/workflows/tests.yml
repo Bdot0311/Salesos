@@ -1,0 +1,51 @@
+name: Tests
+
+# The search pipeline is the product: which provider gets called, which filters
+# survive the trip, and what happens when one of them cannot express a filter.
+# Every one of those is a silent-wrong-results bug when it breaks — the search
+# still returns leads, they are just the wrong leads — so it has to be caught
+# here rather than by someone reading their results and noticing.
+#
+# To make this BLOCK merges, add it as a required status check in
+# Settings → Branches → branch protection for main.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Matches runtime.txt, so a version-dependent failure shows up here
+          # rather than on Railway.
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tests
+        # Plain unittest: the suite uses IsolatedAsyncioTestCase and needs no
+        # test runner beyond the standard library, so CI installs nothing that
+        # production does not already have.
+        run: python -m unittest discover -s tests -v
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Check main.py compiles
+        # Catches a syntax error or a bad import reaching main, which would
+        # otherwise fail at container boot with the service already deploying.
+        run: python -m compileall -q main.py
