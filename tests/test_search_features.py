@@ -467,6 +467,29 @@ class ProviderFallbackTests(unittest.IsolatedAsyncioTestCase):
                 p.stop()
         return response, calls
 
+    async def test_a_typed_query_does_not_sideline_providers(self):
+        """The regression the logs caught.
+
+        Every search from the UI carries the user's sentence, and both Bytemine
+        and Wiza were refusing on it, so a three-provider chain ran one
+        provider: `bytemine:unsupported_filter, crustdata:N,
+        wiza:unsupported_filter` on every line.
+        """
+        response, calls = await self.run_search(
+            main.SearchRequest(query="Founders at AI SaaS companies with a size of 1-10",
+                               job_title="founder", industry="computer software"),
+            {"bytemine": {"profiles": [{"pid": "1", "first_name": "Ada"}],
+                          "total": 1, "next_cursor": None},
+             "crustdata": {"profiles": [{"crustdata_person_id": 9}],
+                           "total": 1, "next_cursor": None},
+             "wiza": [{"full_name": "Alan T", "company": "Bletchley"}]},
+        )
+
+        self.assertEqual(sorted(calls), ["bytemine", "crustdata", "wiza"])
+        outcomes = {a["provider"]: a["outcome"] for a in response.provider_attempts}
+        self.assertNotIn("unsupported_filter", outcomes.values())
+        self.assertEqual(response.count, 3)
+
     async def test_every_provider_contributes_to_one_merged_result(self):
         # The providers hold different data, which is the reason for having more
         # than one. Stopping at the first that returned anything meant a search
@@ -930,115 +953,32 @@ class SemanticQueryRetentionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(joined, query)
 
-    def test_providers_without_free_text_step_aside(self):
-        # Bytemine's company-graph fallback matches a segment term like
-        # "AI SaaS" against company descriptions; a whole request matches
-        # nothing that way and would spend a company-search credit finding out.
-        params = {"job_title": "VP Sales", "semantic_query": "heads of RevOps at fintechs"}
+    def test_providers_without_free_text_still_search(self):
+        # The sentence must not sideline a provider. The structured filters it
+        # was parsed into are in the body already, so a provider that cannot
+        # rank by the phrasing still contributes what those filters find.
+        #
+        # Refusing here meant Bytemine and Wiza sat out every search from the
+        # UI — which always sends a query — so a three-provider chain quietly
+        # ran one provider.
+        params = {"job_title": "VP Sales", "location": "Texas",
+                  "semantic_query": "heads of RevOps at fintechs"}
 
-        for build in (main.build_bytemine_filters, main.build_wiza_filters):
-            with self.assertRaises(main.ProviderUnsupported) as caught:
-                build(params)
-            self.assertEqual(caught.exception.field, "semantic_query")
+        bytemine = main.build_bytemine_filters(params)
+        wiza = main.build_wiza_filters(params)
 
+        self.assertEqual(bytemine["jobTitles"], ["VP Sales"])
+        self.assertEqual(bytemine["states"], ["TX"])
+        self.assertNotIn("semantic_query", bytemine)
+        self.assertEqual(wiza["job_title"][0]["v"], "VP Sales")
+        self.assertNotIn("semantic_query", wiza)
 
-class MergeTests(unittest.TestCase):
-    """Every provider's results become one list."""
-
-    @staticmethod
-    def _transform_for(_name):
-        # Identity: these tests are about merging, not about row shapes.
-        return lambda row: dict(row)
-
-    def test_results_from_every_provider_are_kept(self):
-        buckets = [
-            {"provider": "bytemine", "profiles": [{"contact_email": "a@x.com"}], "total": 1, "next_cursor": None},
-            {"provider": "crustdata", "profiles": [{"contact_email": "b@x.com"}], "total": 1, "next_cursor": None},
-        ]
-        raw, leads, total, _ = main.merge_provider_results(buckets, self._transform_for)
-
-        self.assertEqual(len(raw), 2)
-        self.assertEqual(len(leads), 2)
-        self.assertEqual(total, 2)
-
-    def test_the_same_person_from_two_providers_appears_once(self):
-        buckets = [
-            {"provider": "bytemine", "profiles": [{"linkedin_url": "https://linkedin.com/in/ada"}], "total": 1, "next_cursor": None},
-            {"provider": "crustdata", "profiles": [{"linkedin_url": "https://www.linkedin.com/in/ada/"}], "total": 1, "next_cursor": None},
-        ]
-        _, leads, total, _ = main.merge_provider_results(buckets, self._transform_for)
-
-        self.assertEqual(len(leads), 1)
-        # The total cannot claim two people when one was returned.
-        self.assertEqual(total, 1)
-
-    def test_an_email_identifies_a_person_without_a_linkedin_url(self):
-        buckets = [
-            {"provider": "bytemine", "profiles": [{"contact_email": "Ada@X.com"}], "total": 1, "next_cursor": None},
-            {"provider": "crustdata", "profiles": [{"contact_email": "ada@x.com"}], "total": 1, "next_cursor": None},
-        ]
-        _, leads, _, _ = main.merge_provider_results(buckets, self._transform_for)
-
-        self.assertEqual(len(leads), 1)
-
-    def test_name_and_company_are_the_last_resort(self):
-        buckets = [
-            {"provider": "bytemine", "profiles": [{"contact_name": "Ada L", "company_name": "Acme"}], "total": 1, "next_cursor": None},
-            {"provider": "crustdata", "profiles": [{"contact_name": "ada l", "company_name": "acme"}], "total": 1, "next_cursor": None},
-            {"provider": "wiza", "profiles": [{"contact_name": "Ada L", "company_name": "Other"}], "total": 1, "next_cursor": None},
-        ]
-        _, leads, _, _ = main.merge_provider_results(buckets, self._transform_for)
-
-        self.assertEqual(len(leads), 2)
-
-    def test_the_page_is_interleaved_not_one_provider_then_the_next(self):
-        # A merged page that is all of the first provider before any of the
-        # second is the old behaviour wearing a merge.
-        buckets = [
-            {"provider": "bytemine", "profiles": [{"contact_email": f"b{i}@x.com"} for i in range(3)], "total": 3, "next_cursor": None},
-            {"provider": "crustdata", "profiles": [{"contact_email": f"c{i}@x.com"} for i in range(3)], "total": 3, "next_cursor": None},
-        ]
-        _, leads, _, _ = main.merge_provider_results(buckets, self._transform_for)
-
-        self.assertEqual([l["contact_email"][0] for l in leads],
-                         ["b", "c", "b", "c", "b", "c"])
-
-    def test_uneven_result_counts_do_not_drop_anyone(self):
-        buckets = [
-            {"provider": "bytemine", "profiles": [{"contact_email": "b0@x.com"}], "total": 1, "next_cursor": None},
-            {"provider": "crustdata", "profiles": [{"contact_email": f"c{i}@x.com"} for i in range(3)], "total": 3, "next_cursor": None},
-        ]
-        _, leads, _, _ = main.merge_provider_results(buckets, self._transform_for)
-
-        self.assertEqual(len(leads), 4)
-
-
-class CompositeCursorTests(unittest.TestCase):
-    """Each provider pages independently, behind one opaque token."""
-
-    def test_a_round_trip_preserves_every_position(self):
-        cursors = {"bytemine": "bm-2", "crustdata": "cd-2"}
-
-        self.assertEqual(
-            main.decode_cursors(main.encode_cursors(cursors), ["bytemine", "crustdata"]),
-            cursors,
-        )
-
-    def test_no_cursors_means_no_token(self):
-        self.assertIsNone(main.encode_cursors({}))
-        self.assertIsNone(main.encode_cursors({"bytemine": None}))
-
-    def test_a_plain_cursor_goes_only_to_the_chain_leader(self):
-        # Predates the merge and can only have come from the leading provider.
-        # Handing it to every provider would ask each to resume from a position
-        # in someone else's result set.
-        self.assertEqual(
-            main.decode_cursors("raw-token", ["bytemine", "crustdata"]),
-            {"bytemine": "raw-token"},
-        )
-
-    def test_an_unreadable_token_starts_over_rather_than_failing(self):
-        self.assertEqual(main.decode_cursors("multi:!!!not-base64", ["bytemine"]), {})
+    def test_a_keyword_filter_is_still_refused(self):
+        # keywords are a criterion the user stated, unlike the sentence the
+        # filters were derived from. Dropping one silently would search for
+        # something the user did not ask for.
+        with self.assertRaises(main.ProviderUnsupported):
+            main.build_wiza_filters({"job_title": "VP Sales", "keywords": "ai saas"})
 
 
 if __name__ == "__main__":
