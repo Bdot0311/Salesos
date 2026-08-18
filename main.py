@@ -896,8 +896,12 @@ def build_wiza_filters(p: dict) -> dict:
     # venture firms. Refuse, and let the chain reach a provider with free text.
     if p.get("keywords"):
         raise ProviderUnsupported("keywords", p["keywords"])
-    if p.get("semantic_query"):
-        raise ProviderUnsupported("semantic_query", p["semantic_query"])
+    # semantic_query is deliberately NOT refused. It is the sentence the
+    # structured filters were parsed out of, not an additional criterion the
+    # user stated — those filters are already in this body. Refusing it made
+    # Wiza sit out every search from the UI, which always sends a query, so a
+    # three-provider chain quietly became a one-provider chain. Wiza cannot rank
+    # by the sentence; it searches the filters, which is a real contribution.
 
     # Seniority — only add if we have a known Wiza level
     if p.get("seniority"):
@@ -1909,15 +1913,14 @@ def build_bytemine_filters(p: dict) -> dict:
     if p.get("keywords"):
         raise ProviderUnsupported("keywords", p["keywords"])
 
-    # The user's own sentence. It is not resolvable here: a segment term like
-    # "AI SaaS" can be matched against company descriptions, but a whole request
-    # ("heads of RevOps at fintechs replacing Salesforce") matches nothing that
-    # way and would burn a company-search credit finding out. Stepping aside
-    # sends it to a provider with real semantic search, which is the difference
-    # between two different sentences returning two different sets of people and
-    # both returning the same page of whoever matched the coarse filters.
-    if p.get("semantic_query"):
-        raise ProviderUnsupported("semantic_query", p["semantic_query"])
+    # The user's sentence is not sent to Bytemine and not refused either. It is
+    # not resolvable here — a segment term like "AI SaaS" can be matched against
+    # company descriptions, but a whole request matches nothing that way and
+    # would burn a company-search credit finding out — but it is also not an
+    # extra criterion being dropped: the structured filters it was parsed into
+    # are in this body already. Refusing made Bytemine sit out every search from
+    # the UI, which always sends a query, so the chain quietly ran one provider
+    # instead of three. It searches the filters and contributes what it finds.
 
     if not body:
         raise HTTPException(status_code=400, detail="At least one search parameter required")
