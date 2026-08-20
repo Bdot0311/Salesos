@@ -41,6 +41,7 @@ class Settings(BaseSettings):
     # matches how the app bills. Wiza's list workflow returns enriched contacts
     # and spends an email credit per search, so it sits last.
     bytemine_api_key: Optional[str] = None
+    coldiq_api_key: Optional[str] = None
     crustdata_api_key: Optional[str] = None
     search_provider: str = "bytemine"
     # ICP parsing is rule-based by default (no API credits needed). Set
@@ -75,7 +76,7 @@ BYTEMINE_GATEWAY = "https://bvjmtgaxijpyasjtaqiv.supabase.co/functions/v1/api-ga
 
 # Default order, best-fit first. Filtered down to configured providers by
 # provider_chain().
-PROVIDER_ORDER = ("bytemine", "crustdata", "wiza")
+PROVIDER_ORDER = ("bytemine", "crustdata", "coldiq", "wiza")
 
 
 def provider_configured(name: str) -> bool:
@@ -84,6 +85,8 @@ def provider_configured(name: str) -> bool:
         return bool(settings.bytemine_api_key)
     if name == "crustdata":
         return bool(settings.crustdata_api_key)
+    if name == "coldiq":
+        return bool(settings.coldiq_api_key)
     if name == "wiza":
         return bool(settings.wiza_api_key)
     return False
@@ -1850,6 +1853,210 @@ def bytemine_employee_band(size: str):
     return _BM_TOP_BAND
 
 
+# =============================================================================
+# ColdIQ  (https://api.coldiq.com)
+# =============================================================================
+#
+# ColdIQ is a meta-provider: one API in front of Apollo, Prospeo, Wiza and
+# others, with its own managed waterfall behind `provider: "auto"`. That means
+# it can return the same person our own Wiza leg returns — the merge dedupes on
+# LinkedIn URL, email, then name+company, so an overlap costs a duplicate call
+# rather than a duplicate lead.
+#
+# Its people search is deliberately narrow: it finds decision-makers *at
+# companies*, keyed on domain or LinkedIn company URL, plus title, seniority and
+# location. There is no industry filter and no headcount filter on the input, so
+# an ICP stated in those terms is not expressible here — see
+# build_coldiq_filters, which refuses rather than returning people from the
+# wrong segment.
+
+COLDIQ_BASE = "https://api.coldiq.com"
+
+# ColdIQ's documented seniority vocabulary, from the FindPeopleInput examples
+# ("c_suite", "vp"). Ours is mapped onto it; anything unmapped is left out
+# rather than guessed, and the title filter still narrows the search.
+_CIQ_SENIORITY = {
+    "c_suite": "c_suite", "cxo": "c_suite", "c-level": "c_suite",
+    "c-suite": "c_suite", "executive": "c_suite",
+    "vp": "vp", "vice president": "vp",
+    "director": "director",
+    "manager": "manager",
+    "senior": "senior",
+    "entry": "entry", "junior": "entry",
+    "owner": "owner", "founder": "owner",
+    "partner": "partner",
+}
+
+
+def build_coldiq_filters(p: dict) -> dict:
+    """Translate internal search params into a ColdIQ FindPeopleInput.
+
+    Raises ProviderUnsupported for the filters its input has no field for.
+    `industry` and `company_size` are the significant ones: an ICP that names a
+    segment or a headcount band cannot be expressed here, and returning
+    whoever matched the remaining filters would be answering a different
+    question.
+    """
+    body: dict = {}
+
+    if p.get("job_title"):
+        body["job_titles"] = [p["job_title"]]
+    if p.get("keywords"):
+        body["keywords"] = [p["keywords"]]
+
+    if p.get("seniority"):
+        mapped = _CIQ_SENIORITY.get(str(p["seniority"]).strip().lower())
+        if mapped:
+            body["seniorities"] = [mapped]
+
+    # Domain is the filter ColdIQ is built around — it finds people *at* a
+    # company. A bare company name is not accepted, so it is not sent.
+    domain = p.get("company_domain")
+    company = p.get("company")
+    if company and not domain and looks_like_domain(company):
+        domain, company = company, None
+    if domain:
+        body["company_domains"] = [domain_host(domain)]
+    elif company:
+        raise ProviderUnsupported("company", company)
+
+    # `locations` takes ISO-2 codes or country names, for the *person*.
+    location = p.get("location") or p.get("company_location")
+    if location:
+        kind, value = classify_location(str(location))
+        if kind == "country":
+            body["locations"] = [value]
+        elif kind in ("state", "city"):
+            # A sub-national place would be read as a country name and silently
+            # match nothing; the whole point of the filter is to narrow.
+            raise ProviderUnsupported("location", location)
+        else:
+            raise ProviderUnsupported("location", location)
+
+    # No field exists for either. Refusing keeps the ICP intact — the merge
+    # simply gets nothing from ColdIQ for this search, and the providers that
+    # can express a segment still answer it.
+    if p.get("industry"):
+        raise ProviderUnsupported("industry", p["industry"])
+    if p.get("company_size"):
+        raise ProviderUnsupported("company_size", p["company_size"])
+
+    if not body:
+        raise HTTPException(status_code=400, detail="At least one search parameter required")
+    return body
+
+
+def transform_coldiq_profile(profile: dict, search_params: dict = None) -> dict:
+    """Map one ColdIQ record onto our lead shape.
+
+    Read tolerantly on purpose. ColdIQ's OpenAPI declares the search response as
+    `data: nullable` with the description "Normalized, provider-agnostic
+    result" — the per-person field names are not in the spec, and the API is
+    unreachable from CI, so the exact keys cannot be confirmed here. Every
+    spelling ColdIQ uses for the same idea elsewhere in its own schemas
+    (first_name/last_name, full_name, linkedin_url, company_name, domain) is
+    accepted, and `coldiq_person_search` logs the keys of the first record it
+    ever sees so the real shape is one production search away.
+    """
+    p = profile or {}
+    first = p.get("first_name") or p.get("firstName") or ""
+    last = p.get("last_name") or p.get("lastName") or ""
+    name = (p.get("full_name") or p.get("fullName") or p.get("name")
+            or f"{first} {last}".strip())
+    company = (p.get("company_name") or p.get("companyName") or p.get("company")
+               or p.get("organization") or "")
+    if isinstance(company, dict):
+        company = company.get("name") or company.get("company_name") or ""
+
+    return {
+        "contact_name": name or None,
+        "first_name": first or None,
+        "last_name": last or None,
+        "job_title": p.get("job_title") or p.get("jobTitle") or p.get("title")
+                     or p.get("position") or None,
+        "company_name": company or None,
+        "company_domain": domain_host(
+            p.get("company_domain") or p.get("domain") or p.get("website") or ""
+        ) or None,
+        "business_email": p.get("email") or p.get("work_email") or p.get("business_email") or None,
+        "linkedin_url": p.get("linkedin_url") or p.get("linkedinUrl")
+                        or p.get("profile_url") or p.get("linkedin") or None,
+        "industry": p.get("industry") or p.get("company_industry") or None,
+        "country": p.get("country") or p.get("location") or None,
+        "provider": "coldiq",
+    }
+
+
+async def coldiq_person_search(params: dict, limit: int) -> dict:
+    """Call ColdIQ POST /v1/people/search and return raw records.
+
+    `fields: "compact"` is the documented default and the shape our transform
+    reads. `provider: "auto"` uses ColdIQ's own managed waterfall — pinning a
+    single vendor would make this leg a second, worse copy of a provider we
+    already call directly.
+    """
+    body = {
+        "input": {**build_coldiq_filters(params), "limit": max(min(limit, 100), 1)},
+        "provider": "auto",
+        "fields": "compact",
+    }
+    headers = {
+        "Authorization": f"Bearer {settings.coldiq_api_key or ''}",
+        "Content-Type": "application/json",
+    }
+    print(f"ColdIQ people search body: {json.dumps(body)[:400]}")
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.post(
+            f"{COLDIQ_BASE}/v1/people/search", headers=headers, json=body,
+        )
+        print(f"ColdIQ search status: {resp.status_code} {resp.text[:300]}")
+        if resp.status_code == 401:
+            raise HTTPException(status_code=502, detail="ColdIQ rejected the API key")
+        if resp.status_code == 402:
+            raise HTTPException(
+                status_code=402,
+                detail="ColdIQ credits exhausted — top up the ColdIQ account to keep searching",
+            )
+        if resp.status_code not in (200, 201):
+            raise HTTPException(
+                status_code=resp.status_code if resp.status_code < 500 else 502,
+                detail=f"ColdIQ search error: {resp.text[:300]}",
+            )
+        data = resp.json()
+
+    # `data` for a single call, `results` for a bulk one. Accept a bare list too:
+    # the spec types neither, so the shape is confirmed by what arrives.
+    payload = data.get("data") if isinstance(data, dict) else data
+    if payload is None and isinstance(data, dict):
+        payload = data.get("results")
+    if isinstance(payload, dict):
+        payload = (payload.get("people") or payload.get("contacts")
+                   or payload.get("results") or payload.get("data") or [])
+    profiles = [x for x in (payload or []) if isinstance(x, dict)]
+
+    # Shape only, never values — this is how the documented-but-untyped record
+    # gets confirmed from a real response instead of from a guess.
+    if profiles:
+        print(f"ColdIQ record keys: {sorted(profiles[0].keys())}")
+    else:
+        print("ColdIQ returned no usable records; "
+              f"top-level keys were {sorted(data.keys()) if isinstance(data, dict) else type(data).__name__}")
+
+    meta = data.get("_meta") if isinstance(data, dict) else None
+    if meta:
+        print(f"ColdIQ _meta: {json.dumps(meta)[:200]}")
+
+    return {"profiles": profiles, "total": len(profiles), "next_cursor": None}
+
+
+async def fetch_from_coldiq(params: dict) -> list:
+    """People-search fetcher for /search — returns raw ColdIQ records."""
+    limit = max(min(params.get("limit", 10), 100), 1)
+    data = await coldiq_person_search(params, limit)
+    return data["profiles"]
+
+
 def build_bytemine_filters(p: dict) -> dict:
     """Translate internal search params into a Bytemine /contacts/search body.
 
@@ -3176,6 +3383,8 @@ async def search_leads(request: SearchRequest):
         """
         if name == "bytemine":
             return lambda profile: transform_bytemine_profile(profile, params)
+        if name == "coldiq":
+            return lambda profile: transform_coldiq_profile(profile, params)
         if name == "crustdata":
             return lambda profile: transform_crustdata_profile(profile, params)
         if degraded:
@@ -3282,6 +3491,16 @@ async def search_leads(request: SearchRequest):
             if request.campaign_id:
                 found = await record_new_campaign_profiles(request.campaign_id, found)
             return found, result["total"], result.get("next_cursor")
+
+        if name == "coldiq":
+            # No cursor and no offset on ColdIQ's people search, so a numbered
+            # page is served by over-fetching and slicing. Its own `limit` caps
+            # at 100, which is the ceiling for this leg.
+            skip = request.start_offset
+            data = await coldiq_person_search(
+                params, max(min(params.get("limit", 10) + skip, 100), 1))
+            found = data["profiles"]
+            return (found[skip:] if skip else found), data["total"], None
 
         if degraded:
             # Credit-free preview search — see provider_state(). Wiza caps this

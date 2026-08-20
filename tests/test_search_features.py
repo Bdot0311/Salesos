@@ -981,5 +981,165 @@ class SemanticQueryRetentionTests(unittest.IsolatedAsyncioTestCase):
             main.build_wiza_filters({"job_title": "VP Sales", "keywords": "ai saas"})
 
 
+class ColdiqFilterTests(unittest.TestCase):
+    """ColdIQ finds decision-makers at companies, and says so.
+
+    Its FindPeopleInput has company_domains, company_linkedin_urls, job_titles,
+    seniorities, locations, keywords, limit and max_per_company. There is no
+    industry field and no headcount field, so an ICP stated in those terms is
+    not expressible and must be refused rather than answered with whoever
+    matched the remaining filters.
+    """
+
+    def test_core_filters_map_onto_coldiq_fields(self):
+        body = main.build_coldiq_filters({
+            "job_title": "VP of Sales",
+            "seniority": "vp",
+            "company_domain": "https://www.stripe.com/pricing",
+            "location": "United States",
+        })
+
+        self.assertEqual(body["job_titles"], ["VP of Sales"])
+        self.assertEqual(body["seniorities"], ["vp"])
+        self.assertEqual(body["company_domains"], ["stripe.com"])
+        self.assertEqual(body["locations"], ["US"])
+
+    def test_our_seniorities_map_onto_coldiqs_vocabulary(self):
+        for ours, theirs in (("cxo", "c_suite"), ("c-suite", "c_suite"),
+                             ("founder", "owner"), ("vp", "vp")):
+            body = main.build_coldiq_filters({"job_title": "X", "seniority": ours})
+            self.assertEqual(body["seniorities"], [theirs], ours)
+
+    def test_an_unmapped_seniority_is_left_out_rather_than_guessed(self):
+        body = main.build_coldiq_filters({"job_title": "X", "seniority": "grand poobah"})
+
+        self.assertNotIn("seniorities", body)
+        self.assertEqual(body["job_titles"], ["X"])
+
+    def test_industry_is_refused(self):
+        with self.assertRaises(main.ProviderUnsupported) as caught:
+            main.build_coldiq_filters({"job_title": "VP Sales", "industry": "computer software"})
+
+        self.assertEqual(caught.exception.field, "industry")
+
+    def test_company_size_is_refused(self):
+        with self.assertRaises(main.ProviderUnsupported) as caught:
+            main.build_coldiq_filters({"job_title": "VP Sales", "company_size": "51-200"})
+
+        self.assertEqual(caught.exception.field, "company_size")
+
+    def test_a_sub_national_location_is_refused_not_sent_as_a_country(self):
+        # `locations` takes ISO-2 codes or country names. "Texas" would be read
+        # as a country name and match nothing, which is a silent miss.
+        with self.assertRaises(main.ProviderUnsupported):
+            main.build_coldiq_filters({"job_title": "VP Sales", "location": "Texas"})
+
+    def test_a_bare_company_name_is_refused(self):
+        # ColdIQ keys on domain or LinkedIn company URL, not a name.
+        with self.assertRaises(main.ProviderUnsupported) as caught:
+            main.build_coldiq_filters({"job_title": "VP Sales", "company": "Acme Corp"})
+
+        self.assertEqual(caught.exception.field, "company")
+
+    def test_a_company_value_that_is_really_a_domain_is_used_as_one(self):
+        body = main.build_coldiq_filters({"company": "workflows.io"})
+
+        self.assertEqual(body["company_domains"], ["workflows.io"])
+
+
+class ColdiqTransformTests(unittest.TestCase):
+    """The record shape is not in ColdIQ's spec, so the reader is tolerant.
+
+    /v1/people/search declares `data: nullable` described only as "Normalized,
+    provider-agnostic result". Every spelling ColdIQ uses for the same idea
+    elsewhere in its own schemas is accepted, and the search logs the first
+    record's keys so the real shape is one production search away.
+    """
+
+    def test_snake_case_record(self):
+        lead = main.transform_coldiq_profile({
+            "first_name": "Ada", "last_name": "Lovelace",
+            "job_title": "VP of Sales", "company_name": "Acme",
+            "domain": "acme.com", "email": "ada@acme.com",
+            "linkedin_url": "https://linkedin.com/in/ada",
+        })
+
+        self.assertEqual(lead["contact_name"], "Ada Lovelace")
+        self.assertEqual(lead["company_domain"], "acme.com")
+        self.assertEqual(lead["business_email"], "ada@acme.com")
+        self.assertEqual(lead["provider"], "coldiq")
+
+    def test_camel_case_record(self):
+        lead = main.transform_coldiq_profile({
+            "fullName": "Grace Hopper", "jobTitle": "CTO",
+            "companyName": "Navy", "linkedinUrl": "https://linkedin.com/in/grace",
+        })
+
+        self.assertEqual(lead["contact_name"], "Grace Hopper")
+        self.assertEqual(lead["job_title"], "CTO")
+        self.assertEqual(lead["company_name"], "Navy")
+
+    def test_a_nested_company_object(self):
+        lead = main.transform_coldiq_profile({
+            "name": "Alan Turing", "title": "Lead",
+            "company": {"name": "Bletchley", "domain": "bletchley.uk"},
+        })
+
+        self.assertEqual(lead["company_name"], "Bletchley")
+
+    def test_an_unrecognised_record_yields_nulls_rather_than_junk(self):
+        # A record we cannot read must not become a lead with a name like
+        # "None None" — the merge dedupes on name+company as a last resort.
+        lead = main.transform_coldiq_profile({"unexpected": "shape"})
+
+        self.assertIsNone(lead["contact_name"])
+        self.assertIsNone(lead["company_name"])
+
+
+class ColdiqRequestTests(unittest.IsolatedAsyncioTestCase):
+    @patch.object(main.httpx, "AsyncClient", FakeClient)
+    async def test_the_search_body_matches_coldiqs_envelope(self):
+        with patch.object(main.settings, "coldiq_api_key", "key"):
+            FakeResponse.text = json.dumps({
+                "data": [{"first_name": "Ada", "company_name": "Acme"}],
+                "_meta": {"provider": "prospeo", "credits": 1},
+            })
+            try:
+                result = await main.coldiq_person_search(
+                    {"job_title": "VP of Sales", "company_domain": "acme.com"}, 25)
+            finally:
+                FakeResponse.text = json.dumps({
+                    "profiles": [{"crustdata_person_id": 7}],
+                    "total_count": 12, "next_cursor": "next-page"})
+
+        body = FakeClient.last_json
+        self.assertEqual(body["input"]["job_titles"], ["VP of Sales"])
+        self.assertEqual(body["input"]["company_domains"], ["acme.com"])
+        self.assertEqual(body["input"]["limit"], 25)
+        # auto uses ColdIQ's own waterfall; pinning one vendor would make this
+        # leg a worse copy of a provider we already call directly.
+        self.assertEqual(body["provider"], "auto")
+        self.assertEqual(body["fields"], "compact")
+        self.assertEqual(len(result["profiles"]), 1)
+
+
+class ColdiqChainTests(unittest.TestCase):
+    def test_coldiq_joins_the_chain_when_configured(self):
+        with patch.object(main.settings, "bytemine_api_key", "b"), \
+             patch.object(main.settings, "crustdata_api_key", "c"), \
+             patch.object(main.settings, "coldiq_api_key", "q"), \
+             patch.object(main.settings, "search_provider", "bytemine"):
+            self.assertIn("coldiq", main.provider_chain())
+
+    def test_no_key_removes_it_rather_than_breaking_the_chain(self):
+        with patch.object(main.settings, "bytemine_api_key", "b"), \
+             patch.object(main.settings, "crustdata_api_key", "c"), \
+             patch.object(main.settings, "coldiq_api_key", None), \
+             patch.object(main.settings, "search_provider", "bytemine"):
+            chain = main.provider_chain()
+            self.assertNotIn("coldiq", chain)
+            self.assertIn("crustdata", chain)
+
+
 if __name__ == "__main__":
     unittest.main()
