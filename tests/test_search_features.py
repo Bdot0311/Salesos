@@ -1016,17 +1016,39 @@ class ColdiqFilterTests(unittest.TestCase):
         self.assertNotIn("seniorities", body)
         self.assertEqual(body["job_titles"], ["X"])
 
-    def test_industry_is_refused(self):
-        with self.assertRaises(main.ProviderUnsupported) as caught:
-            main.build_coldiq_filters({"job_title": "VP Sales", "industry": "computer software"})
+    def test_industry_becomes_a_keyword_hint_rather_than_a_refusal(self):
+        # FindPeopleInput has no industry field. Refusing outright made ColdIQ
+        # inert — nearly every real search names an industry, so it sat out all
+        # of them and contributed nothing. It goes in as a ranking hint, and the
+        # rows say which dimensions were only ranked.
+        body = main.build_coldiq_filters(
+            {"job_title": "Founder", "industry": "computer software"})
 
-        self.assertEqual(caught.exception.field, "industry")
+        self.assertEqual(body["job_titles"], ["Founder"])
+        self.assertIn("computer software", body["keywords"])
+        self.assertEqual(body["_unverified_dimensions"], ["industry"])
 
-    def test_company_size_is_refused(self):
-        with self.assertRaises(main.ProviderUnsupported) as caught:
-            main.build_coldiq_filters({"job_title": "VP Sales", "company_size": "51-200"})
+    def test_company_size_becomes_a_keyword_hint_too(self):
+        body = main.build_coldiq_filters(
+            {"job_title": "Founder", "company_size": "1-10"})
 
-        self.assertEqual(caught.exception.field, "company_size")
+        self.assertIn("1-10 employees", body["keywords"])
+        self.assertEqual(body["_unverified_dimensions"], ["company_size"])
+
+    def test_a_search_with_nothing_exact_to_anchor_it_is_still_refused(self):
+        # Keywords alone are a hint, not a constraint: with no title, seniority,
+        # location or domain, ColdIQ's waterfall would return whoever it liked.
+        with self.assertRaises(main.ProviderUnsupported):
+            main.build_coldiq_filters({"industry": "computer software"})
+
+    def test_the_marker_never_reaches_the_api(self):
+        # _unverified_dimensions is ours, not a FindPeopleInput field.
+        body = main.build_coldiq_filters(
+            {"job_title": "Founder", "industry": "computer software"})
+        sent = {k: v for k, v in body.items() if not k.startswith("_")}
+
+        self.assertNotIn("_unverified_dimensions", sent)
+        self.assertIn("job_titles", sent)
 
     def test_a_sub_national_location_is_refused_not_sent_as_a_country(self):
         # `locations` takes ISO-2 codes or country names. "Texas" would be read
@@ -1139,6 +1161,239 @@ class ColdiqChainTests(unittest.TestCase):
             chain = main.provider_chain()
             self.assertNotIn("coldiq", chain)
             self.assertIn("crustdata", chain)
+
+
+class RoutedResponse:
+    def __init__(self, status_code, payload):
+        self.status_code = status_code
+        self.text = json.dumps(payload)
+
+    def json(self):
+        return json.loads(self.text)
+
+
+class RoutedClient:
+    """Fake httpx client that answers per-path and records what it was sent.
+
+    ColdIQ's verbs all share one envelope, so the interesting assertions are
+    which path was called, in what order, and with what body.
+    """
+    routes = {}
+    calls = []
+    raise_on = None
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def post(self, url, headers=None, json=None):
+        path = url.replace(main.COLDIQ_BASE, "")
+        self.__class__.calls.append((path, json))
+        if self.__class__.raise_on and self.__class__.raise_on in path:
+            raise main.httpx.ConnectError("boom")
+        status, payload = self.__class__.routes.get(path, (404, {"error": "no route"}))
+        return RoutedResponse(status, payload)
+
+    @classmethod
+    def reset(cls, routes=None, raise_on=None):
+        cls.routes = routes or {}
+        cls.calls = []
+        cls.raise_on = raise_on
+
+
+class ColdiqVerdictTests(unittest.TestCase):
+    """The verify result is untyped in ColdIQ's spec, so the reader is tolerant."""
+
+    def test_the_four_documented_states_map_to_themselves(self):
+        for state in ("deliverable", "risky", "undeliverable", "unknown"):
+            self.assertEqual(main.read_coldiq_verdict({"status": state})["status"], state)
+
+    def test_vendor_spellings_are_folded_onto_our_vocabulary(self):
+        for raw, expected in (("valid", "deliverable"), ("VERIFIED", "deliverable"),
+                              ("invalid", "undeliverable"), ("bounced", "undeliverable"),
+                              ("catch-all", "catch_all"), ("accept_all", "catch_all"),
+                              ("disposable", "risky")):
+            self.assertEqual(main.read_coldiq_verdict({"state": raw})["status"],
+                             expected, raw)
+
+    def test_an_unrecognised_verdict_is_unknown_not_a_pass(self):
+        # Guessing "sendable" from a word we do not know is how a domain gets
+        # burned; unknown leaves the decision to the caller.
+        v = main.read_coldiq_verdict({"status": "wibble"})
+
+        self.assertEqual(v["status"], "unknown")
+        self.assertIsNone(v["sendable"])
+
+    def test_flags_stand_in_for_a_missing_verdict(self):
+        self.assertEqual(main.read_coldiq_verdict({"is_catch_all": True})["status"],
+                         "catch_all")
+        self.assertEqual(main.read_coldiq_verdict({"disposable": True})["status"], "risky")
+
+    def test_catch_all_and_risky_are_sendable_but_undeliverable_is_not(self):
+        # ColdIQ's own bulk docs call catch_all and risky conclusive and
+        # sendable. Treating them as failures would drop most B2B addresses.
+        self.assertTrue(main.read_coldiq_verdict({"status": "catch_all"})["sendable"])
+        self.assertTrue(main.read_coldiq_verdict({"status": "risky"})["sendable"])
+        self.assertFalse(main.read_coldiq_verdict({"status": "invalid"})["sendable"])
+
+    def test_the_answering_vendor_is_carried_through(self):
+        v = main.read_coldiq_verdict(
+            {"status": "deliverable", "_meta": {"provider": "bounceban"}})
+
+        self.assertEqual(v["vendor"], "bounceban")
+        self.assertEqual(v["checked_by"], "coldiq")
+
+
+class ColdiqVerifyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_a_verdict_is_fetched_and_normalized(self):
+        RoutedClient.reset({"/v1/email/verify": (200, {
+            "data": {"status": "deliverable"}, "_meta": {"provider": "bounceban"}})})
+        with patch.object(main.httpx, "AsyncClient", RoutedClient), \
+             patch.object(main.settings, "coldiq_api_key", "key"):
+            v = await main.coldiq_verify_email("ada@acme.com")
+
+        self.assertEqual(RoutedClient.calls[0][0], "/v1/email/verify")
+        self.assertEqual(RoutedClient.calls[0][1]["input"], {"email": "ada@acme.com"})
+        self.assertEqual(v["status"], "deliverable")
+        self.assertTrue(v["sendable"])
+        self.assertIn("checked_at", v)
+
+    async def test_an_undeliverable_address_is_reported_not_hidden(self):
+        RoutedClient.reset({"/v1/email/verify": (200, {"data": {"status": "invalid"}})})
+        with patch.object(main.httpx, "AsyncClient", RoutedClient), \
+             patch.object(main.settings, "coldiq_api_key", "key"):
+            v = await main.coldiq_verify_email("nobody@acme.com")
+
+        self.assertEqual(v["status"], "undeliverable")
+        self.assertFalse(v["sendable"])
+
+    async def test_no_email_is_unverified_and_costs_nothing(self):
+        RoutedClient.reset({})
+        with patch.object(main.httpx, "AsyncClient", RoutedClient), \
+             patch.object(main.settings, "coldiq_api_key", "key"):
+            v = await main.coldiq_verify_email("")
+
+        self.assertEqual(v["status"], "unverified")
+        self.assertEqual(RoutedClient.calls, [])
+
+    async def test_without_a_key_nothing_is_called(self):
+        RoutedClient.reset({})
+        with patch.object(main.httpx, "AsyncClient", RoutedClient), \
+             patch.object(main.settings, "coldiq_api_key", None):
+            v = await main.coldiq_verify_email("ada@acme.com")
+
+        self.assertEqual(v["status"], "unverified")
+        self.assertEqual(RoutedClient.calls, [])
+
+    async def test_a_dead_verifier_never_costs_the_caller_the_reveal(self):
+        # The reveal has already been paid for. A verification outage must
+        # downgrade the verdict, not turn a successful enrich into an error.
+        RoutedClient.reset({}, raise_on="/v1/email/verify")
+        with patch.object(main.httpx, "AsyncClient", RoutedClient), \
+             patch.object(main.settings, "coldiq_api_key", "key"):
+            v = await main.coldiq_verify_email("ada@acme.com")
+
+        self.assertEqual(v["status"], "unknown")
+        self.assertIsNone(v["sendable"])
+
+    async def test_a_404_is_a_miss_rather_than_a_failure(self):
+        RoutedClient.reset({"/v1/email/verify": (404, {"error": "no usable result"})})
+        with patch.object(main.httpx, "AsyncClient", RoutedClient), \
+             patch.object(main.settings, "coldiq_api_key", "key"):
+            v = await main.coldiq_verify_email("ada@acme.com")
+
+        self.assertEqual(v["status"], "unknown")
+
+    async def test_every_providers_lead_gets_the_same_check(self):
+        RoutedClient.reset({"/v1/email/verify": (200, {"data": {"status": "catch_all"}})})
+        for provider in ("bytemine", "crustdata", "coldiq", "wiza"):
+            with patch.object(main.httpx, "AsyncClient", RoutedClient), \
+                 patch.object(main.settings, "coldiq_api_key", "key"):
+                lead = await main.verify_revealed_lead(
+                    {"provider": provider, "business_email": "ada@acme.com"})
+
+            self.assertEqual(lead["email_verification"]["status"], "catch_all", provider)
+            self.assertTrue(lead["email_verified"], provider)
+
+    async def test_a_lead_with_no_email_still_comes_back_whole(self):
+        RoutedClient.reset({})
+        with patch.object(main.httpx, "AsyncClient", RoutedClient), \
+             patch.object(main.settings, "coldiq_api_key", "key"):
+            lead = await main.verify_revealed_lead(
+                {"provider": "wiza", "contact_name": "Ada"})
+
+        self.assertEqual(lead["contact_name"], "Ada")
+        self.assertEqual(lead["email_verification"]["status"], "unverified")
+        self.assertIsNone(lead["email_verified"])
+
+
+class ColdiqRevealTests(unittest.IsolatedAsyncioTestCase):
+    def _request(self, **kwargs):
+        return main.EnrichRequest(**kwargs)
+
+    async def test_the_finder_is_tried_first_because_a_miss_is_free(self):
+        RoutedClient.reset({"/v1/email/find": (200, {"data": {
+            "email": "ada@acme.com", "first_name": "Ada", "company_name": "Acme"}})})
+        with patch.object(main.httpx, "AsyncClient", RoutedClient), \
+             patch.object(main.settings, "coldiq_api_key", "key"):
+            lead = await main.coldiq_reveal(
+                self._request(linkedin_url="https://linkedin.com/in/ada"))
+
+        self.assertEqual([c[0] for c in RoutedClient.calls], ["/v1/email/find"])
+        self.assertEqual(lead["business_email"], "ada@acme.com")
+        self.assertEqual(lead["provider"], "coldiq")
+
+    async def test_a_finder_miss_falls_back_to_the_profile_enrich(self):
+        RoutedClient.reset({
+            "/v1/email/find": (404, {"error": "no usable result"}),
+            "/v1/person/enrich": (200, {"data": {
+                "full_name": "Ada Lovelace", "title": "CTO", "company_name": "Acme"}}),
+        })
+        with patch.object(main.httpx, "AsyncClient", RoutedClient), \
+             patch.object(main.settings, "coldiq_api_key", "key"):
+            lead = await main.coldiq_reveal(
+                self._request(linkedin_url="https://linkedin.com/in/ada"))
+
+        self.assertEqual([c[0] for c in RoutedClient.calls],
+                         ["/v1/email/find", "/v1/person/enrich"])
+        self.assertEqual(lead["contact_name"], "Ada Lovelace")
+        self.assertEqual(lead["job_title"], "CTO")
+
+    async def test_a_name_without_a_company_is_not_sent_to_the_finder(self):
+        # PersonIdentity needs a LinkedIn URL or a name paired with a company;
+        # a bare name would be charged for a lookup that cannot resolve.
+        RoutedClient.reset({"/v1/person/enrich": (404, {})})
+        with patch.object(main.httpx, "AsyncClient", RoutedClient), \
+             patch.object(main.settings, "coldiq_api_key", "key"):
+            await main.coldiq_reveal(self._request(full_name="Ada Lovelace"))
+
+        self.assertNotIn("/v1/email/find", [c[0] for c in RoutedClient.calls])
+
+    async def test_a_name_and_domain_is_enough_to_look_up(self):
+        RoutedClient.reset({"/v1/email/find": (200, {"data": {"email": "ada@acme.com"}})})
+        with patch.object(main.httpx, "AsyncClient", RoutedClient), \
+             patch.object(main.settings, "coldiq_api_key", "key"):
+            await main.coldiq_reveal(
+                self._request(full_name="Ada Lovelace", company_domain="acme.com"))
+
+        sent = RoutedClient.calls[0][1]["input"]
+        self.assertEqual(sent["first_name"], "Ada")
+        self.assertEqual(sent["last_name"], "Lovelace")
+        self.assertEqual(sent["domain"], "acme.com")
+
+    async def test_nothing_found_returns_nothing_rather_than_an_empty_lead(self):
+        RoutedClient.reset({"/v1/email/find": (404, {}), "/v1/person/enrich": (404, {})})
+        with patch.object(main.httpx, "AsyncClient", RoutedClient), \
+             patch.object(main.settings, "coldiq_api_key", "key"):
+            lead = await main.coldiq_reveal(
+                self._request(linkedin_url="https://linkedin.com/in/ada"))
+
+        self.assertEqual(lead, {})
 
 
 if __name__ == "__main__":

@@ -8,7 +8,7 @@ import base64
 import hashlib
 import json
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import anthropic
@@ -1866,9 +1866,12 @@ def bytemine_employee_band(size: str):
 # Its people search is deliberately narrow: it finds decision-makers *at
 # companies*, keyed on domain or LinkedIn company URL, plus title, seniority and
 # location. There is no industry filter and no headcount filter on the input, so
-# an ICP stated in those terms is not expressible here — see
-# build_coldiq_filters, which refuses rather than returning people from the
-# wrong segment.
+# an ICP stated in those terms cannot be applied exactly — see
+# build_coldiq_filters, which sends them as ranking hints and flags the rows.
+#
+# It has a second job here that the other three providers do not: /v1/email/verify
+# is the deliverability check every revealed email goes through, whichever
+# provider sourced it (see coldiq_verify_email and verify_revealed_lead).
 
 COLDIQ_BASE = "https://api.coldiq.com"
 
@@ -1933,13 +1936,35 @@ def build_coldiq_filters(p: dict) -> dict:
         else:
             raise ProviderUnsupported("location", location)
 
-    # No field exists for either. Refusing keeps the ICP intact — the merge
-    # simply gets nothing from ColdIQ for this search, and the providers that
-    # can express a segment still answer it.
+    # Neither has a field on FindPeopleInput, but refusing outright made ColdIQ
+    # inert: nearly every real search names an industry or a headcount band, so
+    # it sat out every one and contributed nothing at all.
+    #
+    # They go in as keywords instead, which is a ranking hint to ColdIQ's own
+    # provider waterfall rather than a hard filter. That is a real weakening —
+    # a ColdIQ result is title/seniority/location-exact but only
+    # segment-*probable* — so its rows are flagged (see transform_coldiq_profile)
+    # and the caller can tell them apart from a row that matched a stated
+    # industry outright.
+    hints: list = []
     if p.get("industry"):
-        raise ProviderUnsupported("industry", p["industry"])
+        hints.append(str(p["industry"]))
     if p.get("company_size"):
-        raise ProviderUnsupported("company_size", p["company_size"])
+        hints.append(f"{p['company_size']} employees")
+    if hints:
+        body["keywords"] = list(dict.fromkeys((body.get("keywords") or []) + hints))
+        body["_unverified_dimensions"] = [
+            d for d in ("industry", "company_size") if p.get(d)
+        ]
+
+    # Titles, seniorities, locations and domains are the filters ColdIQ applies
+    # exactly. With none of them there is nothing holding the search to the ICP
+    # at all — keywords alone would return whoever the waterfall liked.
+    anchored = any(body.get(k) for k in
+                   ("job_titles", "seniorities", "locations", "company_domains"))
+    if not anchored:
+        raise ProviderUnsupported("industry" if p.get("industry") else "company_size",
+                                  p.get("industry") or p.get("company_size"))
 
     if not body:
         raise HTTPException(status_code=400, detail="At least one search parameter required")
@@ -1984,6 +2009,9 @@ def transform_coldiq_profile(profile: dict, search_params: dict = None) -> dict:
         "industry": p.get("industry") or p.get("company_industry") or None,
         "country": p.get("country") or p.get("location") or None,
         "provider": "coldiq",
+        # Which stated ICP dimensions ColdIQ could only rank by, not filter on.
+        # Empty for a search it matched exactly.
+        "unverified_dimensions": profile.get("_unverified_dimensions") or [],
     }
 
 
@@ -1995,8 +2023,15 @@ async def coldiq_person_search(params: dict, limit: int) -> dict:
     single vendor would make this leg a second, worse copy of a provider we
     already call directly.
     """
+    search_input = {**build_coldiq_filters(params), "limit": max(min(limit, 100), 1)}
+    # Internal marker, not an API field: which ICP dimensions went in as a
+    # keyword hint rather than a hard filter. Popped before the request and
+    # carried onto the returned rows so a caller can see they are
+    # segment-probable rather than segment-exact.
+    unverified = search_input.pop("_unverified_dimensions", [])
+
     body = {
-        "input": {**build_coldiq_filters(params), "limit": max(min(limit, 100), 1)},
+        "input": search_input,
         "provider": "auto",
         "fields": "compact",
     }
@@ -2034,6 +2069,9 @@ async def coldiq_person_search(params: dict, limit: int) -> dict:
         payload = (payload.get("people") or payload.get("contacts")
                    or payload.get("results") or payload.get("data") or [])
     profiles = [x for x in (payload or []) if isinstance(x, dict)]
+    if unverified:
+        for record in profiles:
+            record["_unverified_dimensions"] = unverified
 
     # Shape only, never values — this is how the documented-but-untyped record
     # gets confirmed from a real response instead of from a guess.
@@ -2057,6 +2095,263 @@ async def fetch_from_coldiq(params: dict) -> list:
     return data["profiles"]
 
 
+async def coldiq_reveal(request: "EnrichRequest") -> dict:
+    """Reveal one ColdIQ lead: find the email, enrich the profile if that misses.
+
+    /v1/email/find is tried first because it is "charged only on a found, valid
+    email" — a miss costs nothing, where /v1/person/enrich is charged whether or
+    not it turns up contact details. On a miss we fall back to the enrich call,
+    which still returns title/company/location and sometimes an email the finder
+    would not commit to.
+
+    Returns our lead shape, or {} when neither call produced anything.
+    """
+    identity: dict = {}
+    if request.linkedin_url:
+        identity["linkedin_url"] = request.linkedin_url
+    if request.full_name:
+        parts = request.full_name.split(" ")
+        identity["first_name"] = parts[0]
+        if len(parts) > 1:
+            identity["last_name"] = " ".join(parts[1:])
+    if request.company_domain:
+        identity["domain"] = domain_host(request.company_domain)
+    elif request.company:
+        identity["company_name"] = request.company
+
+    # PersonIdentity needs a LinkedIn URL, or a name paired with a company.
+    findable = bool(identity.get("linkedin_url") or (
+        identity.get("first_name") and
+        (identity.get("domain") or identity.get("company_name"))))
+
+    record: dict = {}
+    if findable:
+        found = await coldiq_verb("/v1/email/find", identity)
+        if isinstance(found, dict):
+            record = found
+
+    if not record.get("email") and (identity or request.email):
+        enrich_identity = dict(identity)
+        if request.email:
+            enrich_identity["email"] = request.email
+        enriched = await coldiq_verb("/v1/person/enrich", enrich_identity)
+        if isinstance(enriched, dict):
+            # The finder's email wins if it had one; otherwise take everything.
+            record = {**enriched, **{k: v for k, v in record.items() if v}}
+
+    if not record:
+        return {}
+    return transform_coldiq_profile(record)
+
+
+async def coldiq_verb(path: str, identity: dict) -> Optional[dict]:
+    """POST one record to a ColdIQ GTM verb and return its normalized `data`.
+
+    Every verb shares the same envelope — {input, provider, ...} in, a
+    VerbResponse out — so one caller covers find/enrich/verify. Returns None on
+    anything that is not a usable result, including 404 ("No usable result found
+    across providers"), which is a legitimate miss rather than an error.
+    """
+    body = {"input": identity, "provider": "auto"}
+    headers = {
+        "Authorization": f"Bearer {settings.coldiq_api_key or ''}",
+        "Content-Type": "application/json",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            resp = await client.post(f"{COLDIQ_BASE}{path}", headers=headers, json=body)
+    except httpx.HTTPError as exc:
+        print(f"ColdIQ {path} unreachable: {exc}")
+        return None
+
+    print(f"ColdIQ {path} status: {resp.status_code} {resp.text[:300]}")
+    if resp.status_code == 404:
+        return None
+    if resp.status_code not in (200, 201):
+        return None
+    try:
+        payload = resp.json()
+    except ValueError:
+        return None
+
+    data = payload.get("data") if isinstance(payload, dict) else payload
+    if data is None and isinstance(payload, dict):
+        results = payload.get("results")
+        if isinstance(results, list) and results:
+            data = results[0]
+    if isinstance(data, dict):
+        meta = payload.get("_meta") if isinstance(payload, dict) else None
+        if isinstance(meta, dict):
+            data.setdefault("_meta", meta)
+        return data
+    return None
+
+
+# =============================================================================
+# Email verification  (ColdIQ, over every provider's leads)
+# =============================================================================
+#
+# Every provider we call sells contact data, and none of them agree on what a
+# usable email is: Bytemine and Crustdata hand back whatever their index holds,
+# Wiza grades its own reveals, and ColdIQ's search inherits whichever vendor its
+# waterfall picked. Sending on that mix is how a domain's reputation gets spent.
+#
+# So one check sits in front of all four: whatever the reveal produced goes
+# through ColdIQ /v1/email/verify before it is returned, and the verdict rides on
+# the lead. The check is advisory, never destructive — an address that comes back
+# undeliverable is still returned, flagged, because the caller may already have
+# it and needs to be told it is bad rather than told nothing.
+
+# ColdIQ's documented verification states (from the bulk-results `state` filter):
+# deliverable, risky, undeliverable, unknown. Vendors behind the waterfall spell
+# the same verdicts a dozen ways, so their spellings are mapped onto those four
+# plus catch_all, which ColdIQ documents as conclusive and sendable.
+_CIQ_VERDICT = {
+    "deliverable": "deliverable", "valid": "deliverable", "verified": "deliverable",
+    "ok": "deliverable", "safe": "deliverable", "good": "deliverable",
+    "undeliverable": "undeliverable", "invalid": "undeliverable",
+    "bad": "undeliverable", "bounced": "undeliverable", "not_found": "undeliverable",
+    "catch_all": "catch_all", "catch-all": "catch_all", "catchall": "catch_all",
+    "accept_all": "catch_all", "accept-all": "catch_all",
+    "risky": "risky", "disposable": "risky", "role": "risky", "role_based": "risky",
+    "spam_trap": "risky", "unverifiable": "risky",
+    "unknown": "unknown", "pending": "unknown", "none": "unknown",
+}
+
+# What may be sent. catch_all and risky are sendable on purpose: ColdIQ's own
+# bulk docs call them conclusive, and refusing them would drop most addresses at
+# companies that run a catch-all server, which is a large share of B2B.
+_CIQ_SENDABLE = {"deliverable": True, "catch_all": True, "risky": True,
+                 "undeliverable": False, "unknown": None}
+
+
+def read_coldiq_verdict(data: dict) -> dict:
+    """Normalize one /v1/email/verify result into our verification shape.
+
+    Untyped in the spec (`data: nullable`), so this reads every spelling ColdIQ's
+    own schemas use for the idea — status/state/result/email_status — and treats
+    an unrecognized one as `unknown` rather than as a pass or a fail.
+    """
+    d = data or {}
+    raw = (d.get("status") or d.get("state") or d.get("result")
+           or d.get("email_status") or d.get("verification_status")
+           or d.get("deliverability") or "")
+    if isinstance(raw, bool):
+        raw = "deliverable" if raw else "undeliverable"
+    status = _CIQ_VERDICT.get(str(raw).strip().lower().replace(" ", "_"), "unknown")
+
+    # A verdict-less result that still says the address is a catch-all or a role
+    # account is not "unknown" — those are the two flags worth carrying.
+    if status == "unknown":
+        if d.get("catch_all") or d.get("is_catch_all") or d.get("accept_all"):
+            status = "catch_all"
+        elif d.get("disposable") or d.get("is_disposable") or d.get("is_role"):
+            status = "risky"
+
+    meta = d.get("_meta") if isinstance(d.get("_meta"), dict) else {}
+    score = d.get("score") or d.get("confidence")
+    return {
+        "status": status,
+        "sendable": _CIQ_SENDABLE.get(status),
+        "checked_by": "coldiq",
+        "vendor": meta.get("provider") or d.get("provider"),
+        "score": score if isinstance(score, (int, float)) else None,
+        "raw_status": str(raw) or None,
+    }
+
+
+async def coldiq_verify_email(email: str) -> dict:
+    """Verify one address. Never raises: a failed check is `unknown`, not an error.
+
+    Verification is a quality gate on a reveal that has already been paid for. If
+    ColdIQ is down, out of credits or unconfigured, the right outcome is the lead
+    with an honest "we could not check this" on it — not a 502 that loses the
+    reveal the user was charged for.
+    """
+    if not email or "@" not in email:
+        return {"status": "unverified", "sendable": None, "checked_by": None,
+                "reason": "no email to check"}
+    if not provider_configured("coldiq"):
+        return {"status": "unverified", "sendable": None, "checked_by": None,
+                "reason": "coldiq not configured"}
+
+    data = await coldiq_verb("/v1/email/verify", {"email": email})
+    if data is None:
+        return {"status": "unknown", "sendable": None, "checked_by": "coldiq",
+                "reason": "coldiq returned no verdict"}
+    verdict = read_coldiq_verdict(data)
+    verdict["checked_at"] = datetime.now(timezone.utc).isoformat()
+    return verdict
+
+
+async def verify_revealed_lead(lead: dict) -> dict:
+    """Attach a deliverability verdict to a revealed lead, whoever sourced it.
+
+    Mutates and returns the lead. `email_verified` is the one field a caller has
+    to read: True to send, False to hold, None when nobody could say.
+    """
+    email = (lead or {}).get("business_email") or (lead or {}).get("email")
+    verdict = await coldiq_verify_email(email or "")
+    lead["email_verification"] = verdict
+    lead["email_verified"] = verdict.get("sendable")
+    if email:
+        print(f"ColdIQ verify {lead.get('provider')} lead: "
+              f"{verdict.get('status')} (sendable={verdict.get('sendable')})")
+    return lead
+
+
+# Our industries are lowercase PDL/LinkedIn values; Bytemine wants LinkedIn's
+# own Title Case spelling. Only the mappings the docs actually evidence are
+# listed — an industry that is not here is refused rather than guessed at, so a
+# wrong casing can never silently zero a search again.
+_BM_INDUSTRY = {
+    "information technology and services": "Information Technology and Services",
+    "computer software": "Computer Software",
+    "internet": "Internet",
+    "financial services": "Financial Services",
+    "banking": "Banking",
+    "hospital & health care": "Hospital & Health Care",
+    "health care": "Health Care",
+    "biotechnology": "Biotechnology",
+    "pharmaceuticals": "Pharmaceuticals",
+    "manufacturing": "Manufacturing",
+    "retail": "Retail",
+    "construction": "Construction",
+    "real estate": "Real Estate",
+    "education management": "Education",
+    "e-learning": "E-Learning",
+    "marketing and advertising": "Marketing and Advertising",
+    "management consulting": "Management Consulting",
+    "insurance": "Insurance",
+    "automotive": "Automotive",
+    "telecommunications": "Telecommunications",
+    "food & beverages": "Food & Beverages",
+    "hospitality": "Hospitality",
+    "legal services": "Legal Services",
+    "logistics and supply chain": "Logistics and Supply Chain",
+    "computer & network security": "Computer & Network Security",
+    "computer games": "Computer Games",
+    "media production": "Media Production",
+    "oil & energy": "Oil & Energy",
+    "staffing and recruiting": "Staffing and Recruiting",
+    "non-profit organization management": "Non-Profit Organization Management",
+    "government administration": "Government Administration",
+}
+
+
+def bytemine_industry(value: str) -> Optional[str]:
+    """Bytemine's spelling of an industry, or None when we cannot map it."""
+    key = str(value or "").strip().lower()
+    if not key:
+        return None
+    if key in _BM_INDUSTRY:
+        return _BM_INDUSTRY[key]
+    # Already Title Case and one of theirs.
+    if value in _BM_INDUSTRY.values():
+        return value
+    return None
+
+
 def build_bytemine_filters(p: dict) -> dict:
     """Translate internal search params into a Bytemine /contacts/search body.
 
@@ -2075,8 +2370,17 @@ def build_bytemine_filters(p: dict) -> dict:
     if p.get("departments"):
         depts = p["departments"]
         body["departments"] = depts if isinstance(depts, list) else [depts]
+    # Bytemine names industries the way LinkedIn does — "Information Technology
+    # and Services", "Financial Services". We hold them lowercase PDL-style, and
+    # sending those through unmapped matched nothing: every contact search in
+    # production came back totalCount 0, for every ICP, since the provider was
+    # added. A filter that silently zeroes the search is worse than one that
+    # refuses, because the chain reads it as "this provider has no such people".
     if p.get("industry"):
-        body["industries"] = [p["industry"]]
+        mapped = bytemine_industry(p["industry"])
+        if not mapped:
+            raise ProviderUnsupported("industry", p["industry"])
+        body["industries"] = [mapped]
     if p.get("company"):
         body["companyNames"] = [p["company"]]
 
@@ -3001,8 +3305,13 @@ async def enrich_lead(request: EnrichRequest):
     Each provider reveals from the identifier its own search hands back, so the
     order follows what the lead is carrying rather than a fixed preference: a
     Bytemine PID unlocks the exact record that was shown, a LinkedIn URL goes to
-    Crustdata, and anything left (email-only, or name + company) falls through to
-    the Wiza reveal, which accepts the widest set of identifiers.
+    Crustdata, ColdIQ takes a LinkedIn URL or a name paired with a company, and
+    anything left (email-only) falls through to the Wiza reveal, which accepts
+    the widest set of identifiers.
+
+    Whichever provider answers, the email it returns is verified through ColdIQ
+    before this returns — see verify_revealed_lead. The verdict rides on the lead
+    as `email_verification`; a bad address is flagged, never dropped.
     """
     chain = provider_chain()
 
@@ -3028,11 +3337,12 @@ async def enrich_lead(request: EnrichRequest):
             print(f"Bytemine reveal failed ({exc.status_code}); trying next provider")
             record = {}
         if record:
-            lead = transform_bytemine_unlocked(record)
+            lead = await verify_revealed_lead(transform_bytemine_unlocked(record))
             return {
                 "success": True,
                 "provider": "bytemine",
                 "enrichment_status": "complete" if lead.get("business_email") else "no_email",
+                "email_verification": lead["email_verification"],
                 "lead": lead,
             }
 
@@ -3045,14 +3355,42 @@ async def enrich_lead(request: EnrichRequest):
             print(f"Crustdata reveal failed ({exc.status_code}); falling through to Wiza")
             person = {}
         if person:
-            lead = transform_crustdata_enrich(person)
+            lead = await verify_revealed_lead(transform_crustdata_enrich(person))
             return {
                 "success": True,
                 "provider": "crustdata",
                 "enrichment_status": "complete" if lead.get("business_email") else "no_email",
+                "email_verification": lead["email_verification"],
                 "lead": lead,
             }
-        # No Crustdata match — fall through to Wiza with whatever identifiers we have.
+        # No Crustdata match — fall through with whatever identifiers we have.
+
+    # ColdIQ reveal: its own managed waterfall behind one call, keyed on the
+    # LinkedIn URL or the name + company its search hands back. Reached whether
+    # or not the lead came from ColdIQ — a reveal is about the person, not about
+    # which index found them.
+    if "coldiq" in chain and (
+        request.linkedin_url
+        or request.email
+        or (request.full_name and (request.company or request.company_domain))
+    ):
+        try:
+            lead = await coldiq_reveal(request)
+        except HTTPException as exc:
+            print(f"ColdIQ reveal failed ({exc.status_code}); falling through to Wiza")
+            lead = {}
+        # An emailless ColdIQ hit is not worth ending the chain on while Wiza is
+        # still there to try — the point of a reveal is the address.
+        if lead and (lead.get("business_email")
+                     or (lead.get("contact_name") and "wiza" not in chain)):
+            lead = await verify_revealed_lead(lead)
+            return {
+                "success": True,
+                "provider": "coldiq",
+                "enrichment_status": "complete" if lead.get("business_email") else "no_email",
+                "email_verification": lead["email_verification"],
+                "lead": lead,
+            }
 
     headers = {
         "Authorization": f"Bearer {settings.wiza_api_key}",
@@ -3121,11 +3459,13 @@ async def enrich_lead(request: EnrichRequest):
                 contact = {k: v for k, v in data.items()
                            if k not in ("id", "status", "is_complete", "enrichment_level",
                                         "email_credits", "phone_credits", "export_credits", "api_credits")}
+                lead = await verify_revealed_lead(transform_reveal_contact(contact))
                 return {
                     "success": True,
                     "provider": "wiza",
                     "enrichment_status": "complete" if data.get("status") != "failed" else "failed",
-                    "lead": transform_reveal_contact(contact),
+                    "email_verification": lead["email_verification"],
+                    "lead": lead,
                 }
 
         raise HTTPException(status_code=504, detail="Wiza enrichment timed out")
