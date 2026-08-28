@@ -1396,5 +1396,71 @@ class ColdiqRevealTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(lead, {})
 
 
+class PhoneTests(unittest.TestCase):
+    """Line type is the closest thing to a WhatsApp signal the providers sell.
+
+    None of them expose a WhatsApp flag, so "mobile" is what can honestly be
+    reported. That makes it worth getting right: a wrongly-labelled office line
+    is worse than an unlabelled number.
+    """
+
+    def test_each_providers_key_names_carry_the_line_type(self):
+        # Wiza splits mobile_phone from phone_number, Bytemine mobile_phone
+        # from direct_dial. Reading whichever came first threw that away.
+        self.assertEqual(main.pick_phone({"mobile_phone": "+3247"}), ("+3247", "mobile"))
+        self.assertEqual(main.pick_phone({"phone_number": "+3229"}), ("+3229", "office"))
+        self.assertEqual(main.pick_phone({"direct_dial": "+3229"}), ("+3229", "office"))
+
+    def test_a_mobile_wins_when_a_contact_has_both(self):
+        number, kind = main.pick_phone(
+            {"direct_dial": "+3229990000", "mobile_phone": "+32470123456"})
+
+        self.assertEqual((number, kind), ("+32470123456", "mobile"))
+
+    def test_a_bare_number_is_untyped_rather_than_assumed_mobile(self):
+        # Claiming "mobile" for a number nobody typed would put a WhatsApp
+        # badge on a switchboard.
+        self.assertEqual(main.pick_phone({"phone": "+3229990000"}),
+                         ("+3229990000", None))
+
+    def test_an_array_entrys_own_type_is_read(self):
+        contact = {"phones": [
+            {"number": "+3229990000", "type": "work"},
+            {"pretty_number": "+32 470 12 34 56", "type": "mobile"},
+        ]}
+
+        self.assertEqual(main.pick_phone(contact), ("+32 470 12 34 56", "mobile"))
+
+    def test_crustdata_spells_the_array_differently(self):
+        contact = {"phone_numbers": [{"number": "+12125551234", "type": "cell"}]}
+
+        self.assertEqual(main.pick_phone(contact), ("+12125551234", "mobile"))
+
+    def test_a_masked_number_is_no_number(self):
+        # Bytemine masks withheld numbers with asterisks. Storing those as a
+        # phone number is worse than storing nothing.
+        self.assertEqual(main.pick_phone({"mobile_phone": "+3247*****"}), (None, None))
+        self.assertEqual(main.pick_phone({"phones": [{"number": "***"}]}), (None, None))
+
+    def test_nothing_at_all(self):
+        self.assertEqual(main.pick_phone({}), (None, None))
+        self.assertEqual(main.pick_phone(None), (None, None))
+
+    def test_an_unknown_line_type_word_is_not_guessed_at(self):
+        self.assertIsNone(main.classify_phone_type("satellite"))
+        self.assertIsNone(main.classify_phone_type(""))
+        self.assertEqual(main.classify_phone_type("Cellular"), "mobile")
+        self.assertEqual(main.classify_phone_type("LANDLINE"), "office")
+
+    def test_the_transforms_all_report_a_type(self):
+        wiza = main.transform_wiza_contact({"full_name": "Ada", "mobile_phone": "+3247"})
+        reveal = main.transform_reveal_contact({"name": "Ada", "phone_number": "+3229"})
+        coldiq = main.transform_coldiq_profile({"first_name": "Ada", "mobile_phone": "+3247"})
+
+        self.assertEqual((wiza["phone"], wiza["phone_type"]), ("+3247", "mobile"))
+        self.assertEqual((reveal["phone"], reveal["phone_type"]), ("+3229", "office"))
+        self.assertEqual((coldiq["phone"], coldiq["phone_type"]), ("+3247", "mobile"))
+
+
 if __name__ == "__main__":
     unittest.main()

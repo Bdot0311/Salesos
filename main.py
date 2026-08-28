@@ -1155,6 +1155,114 @@ class SearchResponse(BaseModel):
 
 
 # =============================================================================
+# Phone numbers
+# =============================================================================
+#
+# Every provider returns a number under a different key, and each of those keys
+# already says what kind of line it is — Wiza splits mobile_phone from
+# phone_number, Bytemine splits mobile_phone from direct_dial. We were reading
+# whichever key happened to be first and throwing that distinction away, so a
+# switchboard and a personal mobile arrived indistinguishable.
+#
+# The distinction is worth keeping for two reasons. A mobile is the more useful
+# number to a salesperson. And WhatsApp runs on mobile numbers only, so "is this
+# a mobile" is the closest thing to a WhatsApp signal these providers actually
+# sell: none of them expose a WhatsApp flag, and checking numbers against
+# WhatsApp in bulk is not something its API permits. "mobile" is an honest
+# answer to that question; "has WhatsApp" would not be.
+
+_MOBILE_KEYS = ("mobile_phone", "mobile", "cell_phone", "cell", "personal_phone")
+_OFFICE_KEYS = ("direct_dial", "phone_number", "work_phone", "office_phone",
+                "company_phone", "hq_phone")
+# Keys that carry a number without saying which kind it is.
+_UNTYPED_KEYS = ("phone", "telephone", "contact_phone")
+
+_PHONE_TYPE_WORDS = (
+    ("mobile", "mobile"), ("cell", "mobile"), ("personal", "mobile"),
+    ("direct", "office"), ("landline", "office"), ("office", "office"),
+    ("work", "office"), ("company", "office"), ("business", "office"),
+)
+
+
+def classify_phone_type(value) -> Optional[str]:
+    """Map a provider's line-type word onto "mobile" or "office".
+
+    None when the word is missing or unrecognised — an unknown line type is
+    reported as unknown rather than guessed at, because the whole value of the
+    field is that "mobile" can be trusted.
+    """
+    if not value:
+        return None
+    word = str(value).strip().lower()
+    for token, kind in _PHONE_TYPE_WORDS:
+        if token in word:
+            return kind
+    return None
+
+
+def clean_phone(value) -> Optional[str]:
+    """Return a real number, or None for a missing or masked one.
+
+    Bytemine returns withheld numbers as asterisks from search; an unlock that
+    fails quietly can leave those in place, and a string of asterisks stored as
+    a phone number is worse than an empty field.
+    """
+    text = str(value).strip() if value is not None else ""
+    if not text or "*" in text:
+        return None
+    return text
+
+
+def pick_phone(contact: dict) -> tuple:
+    """Choose the best number on a provider record and say what kind it is.
+
+    Returns (number, type) with type "mobile", "office", or None when a number
+    came with nothing to identify it. A mobile wins over an office line when a
+    contact has both.
+    """
+    c = contact or {}
+    mobile = office = untyped = None
+
+    # An array of numbers carries its own per-entry type. Wiza's list search
+    # calls it `phones`, Crustdata's enrich calls it `phone_numbers`.
+    entries = list(c.get("phones") or []) + list(c.get("phone_numbers") or [])
+    for entry in entries:
+        if not isinstance(entry, dict):
+            number = clean_phone(entry)
+            if number and not untyped:
+                untyped = number
+            continue
+        number = clean_phone(entry.get("pretty_number") or entry.get("number"))
+        if not number:
+            continue
+        kind = classify_phone_type(
+            entry.get("type") or entry.get("phone_type") or entry.get("line_type"))
+        if kind == "mobile" and not mobile:
+            mobile = number
+        elif kind == "office" and not office:
+            office = number
+        elif not kind and not untyped:
+            untyped = number
+
+    # Flat keys, where the key name is itself the line type.
+    for key in _MOBILE_KEYS:
+        if not mobile:
+            mobile = clean_phone(c.get(key))
+    for key in _OFFICE_KEYS:
+        if not office:
+            office = clean_phone(c.get(key))
+    for key in _UNTYPED_KEYS:
+        if not untyped:
+            untyped = clean_phone(c.get(key))
+
+    if mobile:
+        return mobile, "mobile"
+    if office:
+        return office, "office"
+    return untyped, None
+
+
+# =============================================================================
 # Transform
 # =============================================================================
 
@@ -1169,11 +1277,7 @@ def transform_wiza_contact(contact: dict, search_params: dict = None) -> dict:
         or contact.get("email")
     )
 
-    phones = contact.get("phones") or []
-    primary_phone = (
-        phones[0].get("pretty_number") or phones[0].get("number")
-        if phones else contact.get("mobile_phone") or contact.get("phone_number")
-    )
+    primary_phone, phone_type = pick_phone(contact)
 
     return {
         "contact_name": contact.get("full_name"),
@@ -1184,6 +1288,7 @@ def transform_wiza_contact(contact: dict, search_params: dict = None) -> dict:
         "business_email": primary_email,
         "email_status": contact.get("email_status"),
         "phone": primary_phone,
+        "phone_type": phone_type,
         "location": contact.get("location"),
         "company_name": contact.get("name"),
         "company_domain": contact.get("domain"),
@@ -1231,11 +1336,7 @@ def transform_reveal_contact(contact: dict) -> dict:
         or contact.get("email")
     )
 
-    phones = contact.get("phones") or []
-    primary_phone = (
-        (phones[0].get("pretty_number") or phones[0].get("number")) if phones
-        else contact.get("mobile_phone") or contact.get("phone_number") or contact.get("phone")
-    )
+    primary_phone, phone_type = pick_phone(contact)
 
     return {
         "contact_name": full_name,
@@ -1246,6 +1347,7 @@ def transform_reveal_contact(contact: dict) -> dict:
         "business_email": primary_email,
         "email_status": contact.get("email_status"),
         "phone": primary_phone,
+        "phone_type": phone_type,
         "location": contact.get("location"),
         "company_name": contact.get("company") or contact.get("company_name"),
         "company_domain": contact.get("domain") or contact.get("company_domain"),
@@ -1992,6 +2094,7 @@ def transform_coldiq_profile(profile: dict, search_params: dict = None) -> dict:
                or p.get("organization") or "")
     if isinstance(company, dict):
         company = company.get("name") or company.get("company_name") or ""
+    phone, phone_type = pick_phone(p)
 
     return {
         "contact_name": name or None,
@@ -2004,6 +2107,9 @@ def transform_coldiq_profile(profile: dict, search_params: dict = None) -> dict:
             p.get("company_domain") or p.get("domain") or p.get("website") or ""
         ) or None,
         "business_email": p.get("email") or p.get("work_email") or p.get("business_email") or None,
+        "phone": phone,
+        "phone_type": phone_type,
+        "phone_available": bool(phone),
         "linkedin_url": p.get("linkedin_url") or p.get("linkedinUrl")
                         or p.get("profile_url") or p.get("linkedin") or None,
         "industry": p.get("industry") or p.get("company_industry") or None,
@@ -2631,6 +2737,7 @@ def transform_bytemine_profile(profile: dict, search_params: dict = None) -> dic
         "email_status": "available" if _bm_masked(profile.get("email")) else None,
         "email_available": _bm_masked(profile.get("email")),
         "phone": None,
+        "phone_type": None,
         "phone_available": _bm_masked(profile.get("phone")),
         "location": location,
         "company_name": profile.get("company_name"),
@@ -2658,15 +2765,16 @@ def transform_bytemine_unlocked(record: dict) -> dict:
     lead = transform_bytemine_profile(record)
     email = (record.get("work_email") or record.get("email")
              or record.get("personal_email"))
-    phone = (record.get("phone") or record.get("direct_dial")
-             or record.get("mobile_phone"))
+    # Bytemine names the line type in the key: mobile_phone vs direct_dial.
+    phone, phone_type = pick_phone(record)
     lead.update({
         "contact_name": record.get("full_name") or lead["contact_name"],
         "business_email": email if email and "*" not in str(email) else None,
         "email_status": "verified" if email and "*" not in str(email) else "no_email",
         "email_available": bool(email and "*" not in str(email)),
-        "phone": phone if phone and "*" not in str(phone) else None,
-        "phone_available": bool(phone and "*" not in str(phone)),
+        "phone": phone,
+        "phone_type": phone_type,
+        "phone_available": bool(phone),
         "linkedin_url": record.get("linkedin_profile") or lead["linkedin_url"],
         "company_linkedin": record.get("company_linkedin_profile"),
     })
@@ -2929,6 +3037,7 @@ def transform_crustdata_profile(profile: dict, search_params: dict = None) -> di
         "email_status": "available" if contact.get("has_business_email") else None,
         "email_available": bool(contact.get("has_business_email")),
         "phone": None,
+        "phone_type": None,
         "phone_available": bool(contact.get("has_phone_number")),
         "location": loc.get("raw"),
         "company_name": cur.get("name"),
@@ -2996,14 +3105,14 @@ def transform_crustdata_enrich(person_data: dict) -> dict:
     if not primary:
         personal = contact.get("personal_emails") or []
         primary = personal[0] if personal else None
-    phones = contact.get("phone_numbers") or []
+    phone, phone_type = pick_phone(contact)
 
     lead["business_email"] = primary.get("email") if primary else None
     lead["email_status"] = primary.get("status") if primary else None
     lead["email_available"] = bool(biz)
-    lead["phone"] = (phones[0].get("number") or phones[0].get("phone_number")
-                     or (phones[0] if isinstance(phones[0], str) else None)) if phones else None
-    lead["phone_available"] = bool(phones)
+    lead["phone"] = phone
+    lead["phone_type"] = phone_type
+    lead["phone_available"] = bool(phone)
     return lead
 
 
