@@ -55,6 +55,24 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
 
+    # Credentials arrive from a dashboard's paste box, and a stray space or
+    # newline on the end survives the round trip. httpx then refuses to build the
+    # header at all — "Illegal header value b'Bearer ciq_live_… '" — so every
+    # call to that provider fails, while the key still reads as configured and
+    # the provider stays in the chain looking healthy.
+    #
+    # That is exactly what happened to ColdIQ: one trailing space meant it never
+    # returned a single lead, and the email verification that runs through it
+    # answered "unknown" for every address, for as long as it had been deployed.
+    # Stripping here fixes every call site at once and cannot be forgotten by the
+    # next one.
+    @field_validator("wiza_api_key", "anthropic_api_key", "bytemine_api_key",
+                     "coldiq_api_key", "crustdata_api_key", "database_url",
+                     mode="after")
+    @classmethod
+    def _strip_credential(cls, value):
+        return value.strip() if isinstance(value, str) else value
+
     @property
     def async_database_url(self) -> str:
         url = self.database_url
@@ -2390,18 +2408,24 @@ async def coldiq_verify_email(email: str) -> dict:
     return verdict
 
 
-async def verify_revealed_lead(lead: dict) -> dict:
+async def verify_revealed_lead(lead: dict, provider: str = None) -> dict:
     """Attach a deliverability verdict to a revealed lead, whoever sourced it.
 
     Mutates and returns the lead. `email_verified` is the one field a caller has
     to read: True to send, False to hold, None when nobody could say.
+
+    `provider` names the leg that revealed this lead, for the log. It is passed
+    in rather than read off the lead because only ColdIQ's transform sets a
+    provider key — the others left the line reading "verify None lead", which
+    told you a verdict happened but not what it was about.
     """
     email = (lead or {}).get("business_email") or (lead or {}).get("email")
     verdict = await coldiq_verify_email(email or "")
     lead["email_verification"] = verdict
     lead["email_verified"] = verdict.get("sendable")
     if email:
-        print(f"ColdIQ verify {lead.get('provider')} lead: "
+        source = provider or lead.get("provider") or "unknown provider"
+        print(f"ColdIQ verify {source} lead: "
               f"{verdict.get('status')} (sendable={verdict.get('sendable')})")
     return lead
 
@@ -3446,7 +3470,7 @@ async def enrich_lead(request: EnrichRequest):
             print(f"Bytemine reveal failed ({exc.status_code}); trying next provider")
             record = {}
         if record:
-            lead = await verify_revealed_lead(transform_bytemine_unlocked(record))
+            lead = await verify_revealed_lead(transform_bytemine_unlocked(record), "bytemine")
             return {
                 "success": True,
                 "provider": "bytemine",
@@ -3464,7 +3488,7 @@ async def enrich_lead(request: EnrichRequest):
             print(f"Crustdata reveal failed ({exc.status_code}); falling through to Wiza")
             person = {}
         if person:
-            lead = await verify_revealed_lead(transform_crustdata_enrich(person))
+            lead = await verify_revealed_lead(transform_crustdata_enrich(person), "crustdata")
             return {
                 "success": True,
                 "provider": "crustdata",
@@ -3492,7 +3516,7 @@ async def enrich_lead(request: EnrichRequest):
         # still there to try — the point of a reveal is the address.
         if lead and (lead.get("business_email")
                      or (lead.get("contact_name") and "wiza" not in chain)):
-            lead = await verify_revealed_lead(lead)
+            lead = await verify_revealed_lead(lead, "coldiq")
             return {
                 "success": True,
                 "provider": "coldiq",
@@ -3568,7 +3592,7 @@ async def enrich_lead(request: EnrichRequest):
                 contact = {k: v for k, v in data.items()
                            if k not in ("id", "status", "is_complete", "enrichment_level",
                                         "email_credits", "phone_credits", "export_credits", "api_credits")}
-                lead = await verify_revealed_lead(transform_reveal_contact(contact))
+                lead = await verify_revealed_lead(transform_reveal_contact(contact), "wiza")
                 return {
                     "success": True,
                     "provider": "wiza",
