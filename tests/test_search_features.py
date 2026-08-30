@@ -1206,6 +1206,35 @@ class RoutedClient:
         cls.raise_on = raise_on
 
 
+class CredentialStrippingTests(unittest.TestCase):
+    """A pasted key keeps whatever whitespace came with it.
+
+    httpx refuses to build a header whose value has trailing whitespace, so the
+    provider fails on every single call — while the key still reads as
+    configured and the provider stays in the chain looking healthy. ColdIQ ran
+    that way from the day it was added: no leads, and every email verification
+    answering "unknown".
+    """
+
+    def test_whitespace_is_stripped_from_every_credential(self):
+        for field in ("wiza_api_key", "coldiq_api_key", "crustdata_api_key",
+                      "bytemine_api_key", "anthropic_api_key"):
+            cleaned = main.Settings._strip_credential(f"  secret_{field} \n")
+            self.assertEqual(cleaned, f"secret_{field}", field)
+
+    def test_a_stripped_key_makes_a_legal_header_value(self):
+        # The exact failure: LocalProtocolError, Illegal header value.
+        key = main.Settings._strip_credential("ciq_live_f2a8d598 ")
+        header = f"Bearer {key}"
+
+        self.assertEqual(header, "Bearer ciq_live_f2a8d598")
+        self.assertEqual(header, header.strip())
+
+    def test_none_and_non_strings_pass_through_untouched(self):
+        self.assertIsNone(main.Settings._strip_credential(None))
+        self.assertEqual(main.Settings._strip_credential(123), 123)
+
+
 class ColdiqVerdictTests(unittest.TestCase):
     """The verify result is untyped in ColdIQ's spec, so the reader is tolerant."""
 
