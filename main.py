@@ -2188,6 +2188,98 @@ def build_coldiq_filters(p: dict) -> dict:
     return body
 
 
+# Corporate suffixes that mark the tail of a headline as a company rather than
+# more of the job title. "Owner, WitWerx, Inc." is a company; "Engineer, Senior"
+# is not, and guessing on a bare comma would invent employers.
+_COMPANY_SUFFIX = re.compile(
+    r"\b(inc|llc|ltd|limited|corp|corporation|co|gmbh|ag|bv|nv|sa|srl|spa|plc|"
+    r"pty|llp|lp|group|holdings|labs|studio|studios|agency|partners)\b\.?$",
+    re.IGNORECASE,
+)
+
+
+def name_from_linkedin_url(url: str) -> Optional[str]:
+    """Recover a display name from a LinkedIn profile slug.
+
+    "/in/seb-hall" is "Seb Hall"; "/in/mark-lucovsky-5280034" is Mark Lucovsky
+    with LinkedIn's disambiguating id on the end, which is dropped. A slug that
+    is one unbroken token ("juliendanjou") cannot be split into a name and is
+    left alone rather than mangled.
+    """
+    if not url:
+        return None
+    match = re.search(r"/(?:in|pub)/([^/?#]+)", str(url))
+    if not match:
+        return None
+    parts = [p for p in match.group(1).split("-") if p]
+    # Trailing hash-like fragments are LinkedIn's, not the person's.
+    while parts and any(ch.isdigit() for ch in parts[-1]):
+        parts.pop()
+    if len(parts) < 2:
+        return None
+    return " ".join(p.capitalize() for p in parts)
+
+
+def read_headline_record(profile: dict) -> tuple:
+    """Pull a name, job title and company out of a search-result headline.
+
+    ColdIQ's `provider: "auto"` waterfall can answer a people search from a live
+    LinkedIn profile search, which returns snippets rather than person records:
+
+        {"title": "Seb Hall - Founder @ Cloud Employee | Helping US & UK ...",
+         "linkedin_url": "https://www.linkedin.com/in/seb-hall"}
+
+    Two fields, and the name is glued to the front of `title`. Read literally
+    that produced a lead with no name, no company, and the whole headline as the
+    job title — which the frontend then dropped for having neither name nor
+    company, so a search the logs reported as "coldiq returned 6 leads" showed
+    the user nothing.
+
+    Returns (name, job_title, company), any of which may be None. Nothing is
+    guessed: the company is only taken from an explicit "@"/"at" marker or a
+    tail that names a corporate form.
+    """
+    p = profile or {}
+    raw = str(p.get("title") or p.get("headline") or "").strip()
+    linked_name = name_from_linkedin_url(p.get("linkedin_url") or p.get("linkedinUrl"))
+
+    if not raw:
+        return linked_name, None, None
+
+    # "<Name> - <headline>". Only the first separator splits: a headline can
+    # contain more of them ("Founder - building X - hiring").
+    name, sep, headline = raw.partition(" - ")
+    if not sep:
+        # No separator: the whole string is a headline, or it is just a title.
+        name, headline = None, raw
+    name = (name or "").strip() or None
+
+    # A "name" of four or more words is a headline that happened to contain a
+    # dash, not somebody's name.
+    if name and len(name.split()) > 3:
+        name, headline = None, raw
+
+    # Everything after a pipe is positioning copy, not a role.
+    headline = headline.split("|")[0].strip()
+
+    company = None
+    for marker in (" @ ", " at "):
+        if marker in headline:
+            headline, _, company = headline.partition(marker)
+            headline, company = headline.strip(), company.strip()
+            break
+    else:
+        # "Owner, WitWerx, Inc." — only when the tail names a corporate form.
+        head, comma, tail = headline.partition(", ")
+        if comma and _COMPANY_SUFFIX.search(tail.strip()):
+            headline, company = head.strip(), tail.strip()
+        elif comma:
+            # A comma with nothing company-shaped after it still ends the title.
+            headline = head.strip()
+
+    return (name or linked_name), (headline or None), (company or None)
+
+
 def transform_coldiq_profile(profile: dict, search_params: dict = None) -> dict:
     """Map one ColdIQ record onto our lead shape.
 
@@ -2199,6 +2291,12 @@ def transform_coldiq_profile(profile: dict, search_params: dict = None) -> dict:
     (first_name/last_name, full_name, linkedin_url, company_name, domain) is
     accepted, and `coldiq_person_search` logs the keys of the first record it
     ever sees so the real shape is one production search away.
+
+    That log is what turned up the case this now handles: the waterfall can
+    answer from a live LinkedIn profile search, whose records are only
+    {title, linkedin_url} with the name glued to the front of the title. Those
+    fields are read first where they exist, and read_headline_record fills the
+    gaps only where they do not — a proper person record is unaffected.
     """
     p = profile or {}
     first = p.get("first_name") or p.get("firstName") or ""
@@ -2209,14 +2307,25 @@ def transform_coldiq_profile(profile: dict, search_params: dict = None) -> dict:
                or p.get("organization") or "")
     if isinstance(company, dict):
         company = company.get("name") or company.get("company_name") or ""
+    job_title = (p.get("job_title") or p.get("jobTitle") or p.get("position")
+                 or "")
     phone, phone_type = pick_phone(p)
+
+    # Only for the thin shape: every structured field above wins outright.
+    if not (name and company and job_title):
+        headline_name, headline_title, headline_company = read_headline_record(p)
+        name = name or headline_name or ""
+        job_title = job_title or headline_title or ""
+        company = company or headline_company or ""
+    # `title` is the raw headline on a thin record and a real job title on a
+    # full one, so it is only trusted after the headline reader has had a look.
+    job_title = job_title or p.get("title") or ""
 
     return {
         "contact_name": name or None,
         "first_name": first or None,
         "last_name": last or None,
-        "job_title": p.get("job_title") or p.get("jobTitle") or p.get("title")
-                     or p.get("position") or None,
+        "job_title": job_title or None,
         "company_name": company or None,
         "company_domain": domain_host(
             p.get("company_domain") or p.get("domain") or p.get("website") or ""
@@ -2310,10 +2419,27 @@ async def coldiq_person_search(params: dict, limit: int) -> dict:
 
 
 async def fetch_from_coldiq(params: dict) -> list:
-    """People-search fetcher for /search — returns raw ColdIQ records."""
+    """People-search fetcher for /search — returns raw ColdIQ records.
+
+    Records that cannot become a lead are dropped here rather than counted.
+    A lead needs a name or a company: the frontend shows nothing for a row with
+    neither, so counting them made the log say "coldiq returned 6 leads" for a
+    search the user saw as empty. The count and the screen have to agree, or the
+    logs point away from the bug instead of at it.
+    """
     limit = max(min(params.get("limit", 10), 100), 1)
     data = await coldiq_person_search(params, limit)
-    return data["profiles"]
+
+    usable, dropped = [], 0
+    for record in data["profiles"]:
+        lead = transform_coldiq_profile(record, params)
+        if lead.get("contact_name") or lead.get("company_name"):
+            usable.append(record)
+        else:
+            dropped += 1
+    if dropped:
+        print(f"ColdIQ dropped {dropped} record(s) with no name or company")
+    return usable
 
 
 async def coldiq_reveal(request: "EnrichRequest") -> dict:
