@@ -1663,5 +1663,106 @@ class EnrichPlaceholderTests(unittest.TestCase):
         self.assertEqual(request.email, "ada@acme.com")
 
 
+class ColdiqHeadlineRecordTests(unittest.TestCase):
+    """The waterfall can answer a people search with LinkedIn search snippets.
+
+    Confirmed from production once the key was fixed and ColdIQ ran for the
+    first time:
+
+        ColdIQ record keys: ['_unverified_dimensions', 'linkedin_url', 'title']
+        {"title": "Seb Hall - Founder @ Cloud Employee | Helping US & UK ...",
+         "linkedin_url": "https://www.linkedin.com/in/seb-hall"}
+
+    Two fields, with the name glued to the front of the title. Read literally
+    that is a lead with no name and no company, which the frontend drops — so
+    the log said "coldiq returned 6 leads" and the user saw an empty page.
+
+    Every string below is a real one from that log.
+    """
+
+    def test_the_records_that_showed_the_user_nothing(self):
+        for headline, expected in (
+            ("Seb Hall - Founder @ Cloud Employee | Helping US & UK ...",
+             ("Seb Hall", "Founder", "Cloud Employee")),
+            ("Mark Lucovsky - Founder",
+             ("Mark Lucovsky", "Founder", None)),
+            ("Jim Whitson - Owner, WitWerx, Inc.",
+             ("Jim Whitson", "Owner", "WitWerx, Inc.")),
+            ("Kevin Steward - Software Engineer at Google",
+             ("Kevin Steward", "Software Engineer", "Google")),
+            ("Vance Wood - Google Engineer | Founder",
+             ("Vance Wood", "Google Engineer", None)),
+        ):
+            self.assertEqual(
+                main.read_headline_record({"title": headline}), expected, headline)
+
+    def test_positioning_copy_after_a_pipe_is_not_a_job_title(self):
+        _, title, _ = main.read_headline_record(
+            {"title": "Seb Hall - Founder @ Cloud Employee | Helping US & UK ..."})
+
+        self.assertEqual(title, "Founder")
+
+    def test_a_company_is_only_taken_when_the_headline_names_one(self):
+        # "@" and "at" are explicit. A bare comma is not: "Engineer, Senior" is
+        # not a person at a company called Senior.
+        _, title, company = main.read_headline_record(
+            {"title": "Dana Scully - Engineer, Senior"})
+
+        self.assertEqual(title, "Engineer")
+        self.assertIsNone(company)
+
+    def test_a_corporate_suffix_does_mark_a_company(self):
+        _, _, company = main.read_headline_record(
+            {"title": "Jim Whitson - Owner, WitWerx, Inc."})
+
+        self.assertEqual(company, "WitWerx, Inc.")
+
+    def test_the_linkedin_slug_is_the_fallback_name(self):
+        self.assertEqual(
+            main.name_from_linkedin_url("https://www.linkedin.com/in/seb-hall"),
+            "Seb Hall")
+        # LinkedIn's disambiguating id is not part of anyone's name.
+        self.assertEqual(
+            main.name_from_linkedin_url("https://www.linkedin.com/in/mark-lucovsky-5280034"),
+            "Mark Lucovsky")
+        self.assertEqual(
+            main.name_from_linkedin_url("https://www.linkedin.com/in/kevin-steward-b91628117"),
+            "Kevin Steward")
+
+    def test_an_unsplittable_slug_is_left_alone_rather_than_mangled(self):
+        self.assertIsNone(main.name_from_linkedin_url("https://linkedin.com/in/juliendanjou"))
+        self.assertIsNone(main.name_from_linkedin_url(""))
+        self.assertIsNone(main.name_from_linkedin_url("https://example.com/nobody"))
+
+    def test_a_headline_with_a_dash_is_not_read_as_a_four_word_name(self):
+        name, _, _ = main.read_headline_record(
+            {"title": "Building the future of sales - Founder"})
+
+        self.assertIsNone(name)
+
+    def test_the_thin_record_becomes_a_lead_the_frontend_will_show(self):
+        lead = main.transform_coldiq_profile({
+            "title": "Seb Hall - Founder @ Cloud Employee | Helping US & UK ...",
+            "linkedin_url": "https://www.linkedin.com/in/seb-hall",
+        })
+
+        self.assertEqual(lead["contact_name"], "Seb Hall")
+        self.assertEqual(lead["job_title"], "Founder")
+        self.assertEqual(lead["company_name"], "Cloud Employee")
+        # The frontend filters on exactly this.
+        self.assertTrue(lead["contact_name"] or lead["company_name"])
+
+    def test_a_full_record_is_untouched_by_any_of_this(self):
+        lead = main.transform_coldiq_profile({
+            "first_name": "Ada", "last_name": "Lovelace",
+            "company_name": "Acme", "title": "CTO", "email": "ada@acme.com",
+        })
+
+        self.assertEqual(lead["contact_name"], "Ada Lovelace")
+        self.assertEqual(lead["job_title"], "CTO")
+        self.assertEqual(lead["company_name"], "Acme")
+        self.assertEqual(lead["business_email"], "ada@acme.com")
+
+
 if __name__ == "__main__":
     unittest.main()
