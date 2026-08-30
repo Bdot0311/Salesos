@@ -255,7 +255,10 @@ class ProviderChainTests(unittest.TestCase):
 class BytemineFilterTests(unittest.TestCase):
     def test_core_filters_map_onto_bytemine_fields(self):
         body = main.build_bytemine_filters({
-            "job_title": "VP of Sales",
+            # Deliberately a title that implies no seniority, so the
+            # seniority mapping below is actually exercised — see
+            # SeniorityImpliedByTitleTests for the title-implies-it case.
+            "job_title": "Account Executive",
             "seniority": "vp",
             "industry": "Information Technology and Services",
             "company_size": "51-200",
@@ -265,7 +268,7 @@ class BytemineFilterTests(unittest.TestCase):
             "location": "California",
         })
 
-        self.assertEqual(body["jobTitles"], ["VP of Sales"])
+        self.assertEqual(body["jobTitles"], ["Account Executive"])
         self.assertEqual(body["seniorityLevels"], ["VP"])
         self.assertEqual(body["industries"], ["Information Technology and Services"])
         self.assertEqual(body["employeeSizes"], ["51-200"])
@@ -273,12 +276,15 @@ class BytemineFilterTests(unittest.TestCase):
         self.assertEqual(body["states"], ["CA"])
 
     def test_founder_maps_to_the_owner_seniority(self):
-        body = main.build_bytemine_filters({"job_title": "Founder", "seniority": "founder"})
+        # No job title, so the mapping is what is under test rather than the
+        # implied-seniority skip.
+        body = main.build_bytemine_filters({"seniority": "founder"})
         self.assertEqual(body["seniorityLevels"], ["Owner"])
 
     def test_c_suite_maps_to_the_canonical_c_team_spelling(self):
         for value in ("cxo", "c-level", "c-suite", "executive"):
-            body = main.build_bytemine_filters({"job_title": "CEO", "seniority": value})
+            body = main.build_bytemine_filters(
+                {"job_title": "Account Executive", "seniority": value})
             self.assertEqual(body["seniorityLevels"], ["C-Team"], value)
 
     def test_a_city_goes_to_cities_rather_than_states(self):
@@ -993,13 +999,13 @@ class ColdiqFilterTests(unittest.TestCase):
 
     def test_core_filters_map_onto_coldiq_fields(self):
         body = main.build_coldiq_filters({
-            "job_title": "VP of Sales",
+            "job_title": "Account Executive",
             "seniority": "vp",
             "company_domain": "https://www.stripe.com/pricing",
             "location": "United States",
         })
 
-        self.assertEqual(body["job_titles"], ["VP of Sales"])
+        self.assertEqual(body["job_titles"], ["Account Executive"])
         self.assertEqual(body["seniorities"], ["vp"])
         self.assertEqual(body["company_domains"], ["stripe.com"])
         self.assertEqual(body["locations"], ["US"])
@@ -1489,6 +1495,172 @@ class PhoneTests(unittest.TestCase):
         self.assertEqual((wiza["phone"], wiza["phone_type"]), ("+3247", "mobile"))
         self.assertEqual((reveal["phone"], reveal["phone_type"]), ("+3229", "office"))
         self.assertEqual((coldiq["phone"], coldiq["phone_type"]), ("+3247", "mobile"))
+
+
+class RegionLocationTests(unittest.TestCase):
+    """"Europe" is not a city, and sending it as one matches nothing.
+
+    From production: `Bytemine /b2b-search body: {… "city": "Europe" …}`
+    returning `total_companies: 0`, on every European search, while reporting
+    success. A region has to be recognised as a region so it can be refused.
+    """
+
+    def test_continents_and_blocs_are_regions(self):
+        for token in ("Europe", "EMEA", "APAC", "Asia", "North America",
+                      "LATAM", "Nordics", "Middle East", "DACH"):
+            kind, value = main.classify_location(token)
+            self.assertEqual(kind, "region", token)
+            self.assertEqual(value, token)
+
+    def test_real_places_are_still_read_as_before(self):
+        self.assertEqual(main.classify_location("California"), ("state", "CA"))
+        self.assertEqual(main.classify_location("Germany"), ("country", "DE"))
+        self.assertEqual(main.classify_location("San Francisco"),
+                         ("city", "San Francisco"))
+        self.assertEqual(main.classify_location("TX"), ("state", "TX"))
+
+    def test_no_provider_pretends_a_region_is_a_place(self):
+        # Each refuses rather than filtering on something that cannot match, so
+        # the fan-out reaches Crustdata — which does match a region by name.
+        for build in (main.build_bytemine_filters, main.build_coldiq_filters,
+                      main.build_wiza_filters):
+            with self.assertRaises(main.ProviderUnsupported, msg=build.__name__):
+                build({"job_title": "Founder", "location": "Europe"})
+
+    def test_the_company_keyword_search_refuses_a_region_too(self):
+        # This is the one that was sending city:"Europe" — it has a country
+        # field, so it had somewhere to put a country and nowhere to put a
+        # continent, and the city branch swallowed it.
+        with self.assertRaises(main.ProviderUnsupported):
+            main.build_bytemine_company_body({"keywords": "AI", "location": "Europe"})
+
+    def test_the_company_search_still_places_what_it_can(self):
+        by_country = main.build_bytemine_company_body(
+            {"keywords": "AI", "location": "Germany"})
+        by_city = main.build_bytemine_company_body(
+            {"keywords": "AI", "location": "Berlin"})
+
+        self.assertEqual(by_country["country"], "DE")
+        self.assertNotIn("city", by_country)
+        self.assertEqual(by_city["city"], "Berlin")
+
+    def test_crustdata_still_takes_a_region_because_it_can(self):
+        body = main.build_crustdata_filters(
+            {"job_title": "Founder", "location": "Europe"})
+
+        rendered = json.dumps(body)
+        self.assertIn("Europe", rendered)
+        self.assertIn("full_location", rendered)
+
+
+class SeniorityImpliedByTitleTests(unittest.TestCase):
+    """One stated criterion must not become two ANDed filters.
+
+    "AI SaaS founders" parses to job_title="Founder" AND seniority="founder" —
+    one word, two filters. Sending both asserts our seniority taxonomy on top of
+    the title, and when the provider disagrees the second filter removes
+    everyone the first one found. In production Bytemine and Crustdata both
+    returned zero for `title ~ Founder AND seniority = Owner`, while Wiza
+    returned real people for the identical search.
+    """
+
+    def test_a_title_that_states_the_seniority_implies_it(self):
+        for title, seniority in (("Founder", "founder"), ("Founder", "owner"),
+                                 ("Co-Founder", "founder"), ("CEO", "cxo"),
+                                 ("CEO", "c_suite"), ("VP of Sales", "vp"),
+                                 ("Head of Growth", "manager"),
+                                 ("Director of Ops", "director")):
+            self.assertTrue(main.seniority_implied_by_title(title, seniority),
+                            f"{title} / {seniority}")
+
+    def test_a_seniority_the_title_does_not_state_is_a_real_criterion(self):
+        for title, seniority in (("Account Executive", "vp"),
+                                 ("Engineer", "founder"),
+                                 ("Sales Manager", "vp"),
+                                 ("Founder", "vp")):
+            self.assertFalse(main.seniority_implied_by_title(title, seniority),
+                             f"{title} / {seniority}")
+
+    def test_spelling_differences_are_not_two_criteria(self):
+        # "CEO" + "cxo" is one thing said twice; comparing raw strings missed it.
+        self.assertTrue(main.seniority_implied_by_title("CEO", "c-level"))
+        self.assertTrue(main.seniority_implied_by_title("VP Sales", "vice president"))
+
+    def test_nothing_is_implied_by_a_missing_side(self):
+        self.assertFalse(main.seniority_implied_by_title("", "founder"))
+        self.assertFalse(main.seniority_implied_by_title("Founder", ""))
+        self.assertFalse(main.seniority_implied_by_title(None, None))
+
+    def test_the_redundant_filter_is_dropped_for_every_provider(self):
+        params = {"job_title": "Founder", "seniority": "founder"}
+
+        self.assertNotIn("seniorityLevels", main.build_bytemine_filters(params))
+        self.assertNotIn("seniorities", main.build_coldiq_filters(params))
+        self.assertNotIn("job_title_level", main.build_wiza_filters(params))
+        self.assertNotIn("seniority_level",
+                         json.dumps(main.build_crustdata_filters(params)))
+
+    def test_the_title_the_user_said_still_constrains_the_search(self):
+        # Dropping the implied seniority must not widen the search past what
+        # was asked for: the word is still in the request.
+        body = main.build_bytemine_filters(
+            {"job_title": "Founder", "seniority": "founder"})
+
+        self.assertEqual(body["jobTitles"], ["Founder"])
+
+    def test_a_genuinely_separate_seniority_is_still_sent(self):
+        params = {"job_title": "Account Executive", "seniority": "vp"}
+
+        self.assertEqual(main.build_bytemine_filters(params)["seniorityLevels"], ["VP"])
+        self.assertEqual(main.build_wiza_filters(params)["job_title_level"], ["VP"])
+
+
+class EnrichPlaceholderTests(unittest.TestCase):
+    """A placeholder must never become a search filter.
+
+    Production sent Wiza {"full_name": "Ott Salmar", "company": "Unknown"} — a
+    real person scoped to a company literally named Unknown, so the reveal could
+    only miss. The string is written upstream because leads.company_name is NOT
+    NULL and the agent needs something when a provider returns no company; it is
+    a reasonable column value and never an identifier.
+    """
+
+    def test_the_reported_case(self):
+        request = main.EnrichRequest(full_name="Ott Salmar", company="Unknown")
+
+        self.assertIsNone(request.company)
+        self.assertEqual(request.full_name, "Ott Salmar")
+
+    def test_every_spelling_of_we_do_not_know(self):
+        for value in ("Unknown", "unknown", "N/A", "n/a", "na", "none", "NULL",
+                      "-", "--", "?", "TBD", "not available", "undefined", "  "):
+            request = main.EnrichRequest(full_name="Ada", company=value)
+            self.assertIsNone(request.company, value)
+
+    def test_a_real_name_that_merely_contains_one_is_kept(self):
+        # Anchored matching. These are real companies, not placeholders.
+        for value in ("NA Consulting", "Nan Systems", "Company House Ltd",
+                      "None The Wiser Ltd", "TBD Partners"):
+            request = main.EnrichRequest(full_name="Ada", company=value)
+            self.assertEqual(request.company, value, value)
+
+    def test_it_applies_to_every_identifier_not_just_company(self):
+        request = main.EnrichRequest(
+            full_name="unknown", company="Acme", company_domain="N/A",
+            email="none", linkedin_url="  ")
+
+        self.assertIsNone(request.full_name)
+        self.assertIsNone(request.company_domain)
+        self.assertIsNone(request.email)
+        self.assertIsNone(request.linkedin_url)
+        self.assertEqual(request.company, "Acme")
+
+    def test_surrounding_whitespace_is_trimmed_from_real_values(self):
+        request = main.EnrichRequest(full_name=" Ada Lovelace ",
+                                     email=" ada@acme.com ")
+
+        self.assertEqual(request.full_name, "Ada Lovelace")
+        self.assertEqual(request.email, "ada@acme.com")
 
 
 if __name__ == "__main__":

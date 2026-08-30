@@ -924,8 +924,14 @@ def build_wiza_filters(p: dict) -> dict:
     # three-provider chain quietly became a one-provider chain. Wiza cannot rank
     # by the sentence; it searches the filters, which is a real contribution.
 
-    # Seniority — only add if we have a known Wiza level
-    if p.get("seniority"):
+    # Seniority — only add if we have a known Wiza level, and only when the job
+    # title does not already imply it (see seniority_implied_by_title). Wiza's
+    # taxonomy happens to agree with ours on Founder/Owner where Bytemine's and
+    # Crustdata's do not, so this leg was not the one losing people — but the
+    # filter is redundant here too, and a redundant AND against someone else's
+    # taxonomy is exactly the shape of that bug.
+    if p.get("seniority") and not seniority_implied_by_title(
+            p.get("job_title"), p["seniority"]):
         level = SENIORITY_MAP.get(p["seniority"].lower())
         if level:
             fil["job_title_level"] = [level]
@@ -937,6 +943,14 @@ def build_wiza_filters(p: dict) -> dict:
                  if d.strip().lower() in JOB_ROLE_MAP]
         if roles:
             fil["job_role"] = list(dict.fromkeys(roles))  # dedupe, keep order
+
+    # Wiza buckets a location as country, state or city. A region is none of
+    # those, and location_filter would fall through to the city bucket — the
+    # same silent no-match that sent cities:["Europe"] to Bytemine. Refused so
+    # the fan-out reaches Crustdata, which does match a region by name.
+    for key in ("location", "company_location"):
+        if p.get(key) and classify_location(str(p[key]))[0] == "region":
+            raise ProviderUnsupported(key, p[key])
 
     if p.get("location"):
         fil["location"] = [location_filter(p["location"])]
@@ -1927,12 +1941,38 @@ _BM_COUNTRY_CODE = {
 _STATE_CODE_IS_ALSO_A_COUNTRY = _US_STATE_CODES & set(_BM_COUNTRY_CODE.values())
 
 
-def classify_location(token: str) -> tuple[str, str]:
-    """Read one location string as a US state, a country or a city.
+# Continents and multi-country regions. An ICP routinely names one — "founders
+# in Europe", "APAC", "the Nordics" — and none of these providers has a field
+# for it: they filter by country, state or city.
+#
+# Without this set they fell through to "city", so "Europe" was sent as
+# cities:["Europe"] to Bytemine and city:"Europe" to /b2b-search. No company is
+# in a city called Europe, so those searches returned total_companies 0 while
+# reporting success. A region has to be recognised as a region precisely so it
+# can be refused: the fan-out then reaches Crustdata, whose location field is a
+# text match over the full location string and does match "Europe".
+_REGIONS = frozenset({
+    "africa", "americas", "antarctica", "asia", "asia pacific", "asia-pacific",
+    "apac", "anz", "australasia", "benelux", "british isles", "caribbean",
+    "central america", "central asia", "cis", "dach", "eastern europe", "emea",
+    "europe", "eu", "european union", "iberia", "latam", "latin america",
+    "mena", "middle east", "middle east and africa", "nordics", "nordic",
+    "north america", "northern europe", "oceania", "scandinavia",
+    "south america", "south asia", "southeast asia", "south east asia",
+    "sub-saharan africa", "western europe", "worldwide", "global",
+})
 
-    Returns (kind, value) where kind is "state" (2-letter code), "country"
+
+def classify_location(token: str) -> tuple[str, str]:
+    """Read one location string as a region, US state, country or city.
+
+    Returns (kind, value) where kind is "region" (a continent or multi-country
+    bloc, no provider has a field for it), "state" (2-letter code), "country"
     (ISO alpha-2), "city" (the token as given), or "unknown" for a two-letter
     token that is neither a state nor a country we recognise.
+
+    Regions are checked first: "Europe" is not a city, and treating it as one
+    is a filter that matches nothing while looking like it worked.
 
     State names are checked before country codes so "Georgia" the state and "GA"
     the code do not collide, and two-letter codes resolve to countries — see
@@ -1942,6 +1982,8 @@ def classify_location(token: str) -> tuple[str, str]:
     lowered = token.lower()
     upper = token.upper()
 
+    if lowered in _REGIONS:
+        return "region", token
     state_code = _US_STATE_NAME_TO_CODE.get(lowered)
     if state_code:
         return "state", state_code
@@ -1952,6 +1994,60 @@ def classify_location(token: str) -> tuple[str, str]:
     if len(token) > 2:
         return "city", token
     return "unknown", token
+
+
+# One seniority idea, several spellings. _SENIORITY_RULES emits canonical keys
+# while callers hand us whatever the parser or the caller wrote, so both sides
+# are folded onto the same word before being compared. Without this, "CEO" +
+# seniority "cxo" reads as two different criteria when it is one.
+#
+# founder and owner are deliberately the same bucket: every provider here maps
+# them to a single level (Bytemine "Owner", Crustdata "Owner", ColdIQ "owner"),
+# so a title of "Founder" does imply a stated seniority of "owner".
+_CANONICAL_SENIORITY = {
+    "founder": "owner", "co-founder": "owner", "cofounder": "owner",
+    "owner": "owner", "partner": "partner",
+    "cxo": "c_suite", "c-level": "c_suite", "c-suite": "c_suite",
+    "c_suite": "c_suite", "executive": "c_suite", "chief": "c_suite",
+    "vp": "vp", "vice president": "vp", "svp": "vp", "evp": "vp",
+    "director": "director", "head": "manager", "manager": "manager",
+    "senior": "senior", "sr": "senior",
+    "entry": "junior", "junior": "junior", "intern": "junior",
+    "training": "junior",
+}
+
+
+def _canonical_seniority(value: str) -> str:
+    key = (value or "").strip().lower()
+    return _CANONICAL_SENIORITY.get(key, key)
+
+
+def seniority_implied_by_title(job_title: str, seniority: str) -> bool:
+    """True when the job title already says what the seniority filter says.
+
+    One word in the request produces both. "AI SaaS founders" runs through
+    _SENIORITY_RULES to seniority="founder" and through _TITLE_PHRASES to
+    job_title="Founder" — the user stated one criterion and we send two, ANDed.
+
+    That costs nothing only if the provider agrees with us about which
+    seniority band a "Founder" sits in. Bytemine and Crustdata do not: both
+    returned zero for every `title ~ "Founder" AND seniority = Owner` search in
+    production, while Wiza — whose taxonomy happens to agree — returned real
+    people for the identical query. The provider was not out of data; the second
+    filter removed everyone the first one found.
+
+    Dropping the implied one cannot widen the search past what was asked for:
+    the title filter still carries the same word. It only stops us asserting a
+    taxonomy the provider does not share.
+    """
+    if not job_title or not seniority:
+        return False
+    title = str(job_title).strip().lower()
+    stated = _canonical_seniority(str(seniority))
+    for pattern, key in _SENIORITY_RULES:
+        if re.search(pattern, title):
+            return _canonical_seniority(key) == stated
+    return False
 
 
 def bytemine_employee_band(size: str):
@@ -2027,7 +2123,8 @@ def build_coldiq_filters(p: dict) -> dict:
     if p.get("keywords"):
         body["keywords"] = [p["keywords"]]
 
-    if p.get("seniority"):
+    if p.get("seniority") and not seniority_implied_by_title(
+            p.get("job_title"), p["seniority"]):
         mapped = _CIQ_SENIORITY.get(str(p["seniority"]).strip().lower())
         if mapped:
             body["seniorities"] = [mapped]
@@ -2493,7 +2590,10 @@ def build_bytemine_filters(p: dict) -> dict:
 
     if p.get("job_title"):
         body["jobTitles"] = [p["job_title"]]
-    if p.get("seniority"):
+    # Skipped when the job title already implies it — see
+    # seniority_implied_by_title for why the redundant AND zeroed the search.
+    if p.get("seniority") and not seniority_implied_by_title(
+            p.get("job_title"), p["seniority"]):
         mapped = _BM_SENIORITY.get(str(p["seniority"]).strip().lower())
         if mapped:
             body["seniorityLevels"] = [mapped]
@@ -2608,26 +2708,14 @@ async def bytemine_call(path: str, body: dict, timeout: float = 60.0) -> dict:
 BYTEMINE_KEYWORD_COMPANIES = 50
 
 
-async def bytemine_resolve_keywords(params: dict) -> dict:
-    """Turn a free-text term into the company domains it describes.
+def build_bytemine_company_body(params: dict) -> dict:
+    """Build the /b2b-search body for a keyword-to-companies lookup.
 
-    /contacts/search has no free-text field, which is why keywords used to be
-    refused outright. /b2b-search does: `keywords` matches company descriptions,
-    which is where a segment like "AI SaaS" is actually written down. Resolving
-    the term to companies first and then filtering contacts to those domains
-    keeps it a hard constraint instead of dropping it.
-
-    Returns params unchanged when there is nothing to resolve. On a resolved
-    keyword the key is replaced by `company_domains`; an empty list there means
-    the term genuinely matched no company, which is a real no-results answer
-    rather than a reason to search without it.
+    Separate from the call so the filters can be checked without spending a
+    company-search credit to find out what was sent.
     """
-    keywords = (params.get("keywords") or "").strip()
-    if not keywords:
-        return params
-
     body: dict = {
-        "keywords": keywords,
+        "keywords": (params.get("keywords") or "").strip(),
         "page": 1,
         "page_size": BYTEMINE_KEYWORD_COMPANIES,
         # A contact search filters by domain, so a company without one cannot
@@ -2647,6 +2735,11 @@ async def bytemine_resolve_keywords(params: dict) -> dict:
     # narrow the company list by one — but a code that names both a state and a
     # country is no more resolvable here, and picking wrong would seed the
     # contact search with companies on the wrong continent.
+    #
+    # A region reaches the else and is refused. It used to reach the city
+    # branch, which is how city:"Europe" was sent on every European search —
+    # total_companies 0 every time, reported as a successful search with no
+    # matches rather than as a filter this endpoint cannot express.
     location = params.get("company_location") or params.get("location")
     if location:
         kind, value = classify_location(str(location))
@@ -2658,7 +2751,28 @@ async def bytemine_resolve_keywords(params: dict) -> dict:
             body["city"] = value
         else:
             raise ProviderUnsupported("location", location)
+    return body
 
+
+async def bytemine_resolve_keywords(params: dict) -> dict:
+    """Turn a free-text term into the company domains it describes.
+
+    /contacts/search has no free-text field, which is why keywords used to be
+    refused outright. /b2b-search does: `keywords` matches company descriptions,
+    which is where a segment like "AI SaaS" is actually written down. Resolving
+    the term to companies first and then filtering contacts to those domains
+    keeps it a hard constraint instead of dropping it.
+
+    Returns params unchanged when there is nothing to resolve. On a resolved
+    keyword the key is replaced by `company_domains`; an empty list there means
+    the term genuinely matched no company, which is a real no-results answer
+    rather than a reason to search without it.
+    """
+    keywords = (params.get("keywords") or "").strip()
+    if not keywords:
+        return params
+
+    body = build_bytemine_company_body(params)
     data = await bytemine_call("/b2b-search", body)
     companies = data.get("data") or data.get("results") or []
     domains = []
@@ -2900,7 +3014,11 @@ def build_crustdata_filters(p: dict):
     if p.get("job_title"):
         conds.append({"field": _CD_TITLE, "type": "(.)", "value": p["job_title"]})
 
-    if p.get("seniority"):
+    # See seniority_implied_by_title: Crustdata's `=` on seniority_level is an
+    # exact match against its own taxonomy, so a title-implied seniority ANDs
+    # away every person the title matched.
+    if p.get("seniority") and not seniority_implied_by_title(
+            p.get("job_title"), p["seniority"]):
         raw_seniority = p["seniority"].strip()
         seniority = _CD_SENIORITY_MAP.get(raw_seniority.lower(), raw_seniority)
         conds.append({"field": _CD_SENIORITY, "type": "=", "value": seniority})
@@ -3407,6 +3525,16 @@ async def health_check():
 # Enrich Endpoint  (Wiza Individual Reveal)
 # =============================================================================
 
+# Values a provider or an upstream fallback writes to mean "we don't know",
+# which must never be read back as a fact. Anchored and case-insensitive: a real
+# company called "NA Consulting" or a person named "Nan" has to survive.
+_PLACEHOLDER_RE = re.compile(
+    r"(?:unknown|n/?a|not\s*available|not\s*provided|none|null|nil|undefined|"
+    r"-{1,3}|\?+|tbd|test|no\s*company|company|placeholder)",
+    re.IGNORECASE,
+)
+
+
 class EnrichRequest(BaseModel):
     # Accept the common shorthands callers send alongside the canonical names so
     # a `{"profile_url": ...}` / `{"linkedin": ...}` / `{"domain": ...}` body
@@ -3428,6 +3556,26 @@ class EnrichRequest(BaseModel):
         default=None, validation_alias=AliasChoices("bytemine_pid", "pid"))
 
     model_config = {"populate_by_name": True}
+
+    # A placeholder is not an identifier, and here it is worse than nothing: it
+    # becomes a search filter. Production sent Wiza
+    # {"full_name": "Ott Salmar", "company": "Unknown"} — a real person, scoped
+    # to a company literally named Unknown, so the reveal could only miss.
+    #
+    # The string is written upstream because leads.company_name is NOT NULL and
+    # the agent needs *something* when a provider returns no company. That is
+    # reasonable for a column; it is not an identifier, and this is the one door
+    # every reveal goes through, so it is the right place to drop it.
+    @field_validator("company", "company_domain", "full_name", "email",
+                     "linkedin_url", mode="after")
+    @classmethod
+    def _drop_placeholders(cls, value):
+        if not isinstance(value, str):
+            return value
+        cleaned = value.strip()
+        if not cleaned or _PLACEHOLDER_RE.fullmatch(cleaned):
+            return None
+        return cleaned
 
 
 @app.post("/enrich")
