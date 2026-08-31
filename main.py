@@ -42,6 +42,7 @@ class Settings(BaseSettings):
     # and spends an email credit per search, so it sits last.
     bytemine_api_key: Optional[str] = None
     coldiq_api_key: Optional[str] = None
+    getleads_api_key: Optional[str] = None
     crustdata_api_key: Optional[str] = None
     search_provider: str = "bytemine"
     # ICP parsing is rule-based by default (no API credits needed). Set
@@ -94,7 +95,9 @@ BYTEMINE_GATEWAY = "https://bvjmtgaxijpyasjtaqiv.supabase.co/functions/v1/api-ga
 
 # Default order, best-fit first. Filtered down to configured providers by
 # provider_chain().
-PROVIDER_ORDER = ("bytemine", "crustdata", "coldiq", "wiza")
+# getleads sits ahead of coldiq: it filters on industry, headcount and region
+# for real, where coldiq can only rank on them. See build_getleads_filters.
+PROVIDER_ORDER = ("bytemine", "crustdata", "getleads", "coldiq", "wiza")
 
 
 def provider_configured(name: str) -> bool:
@@ -105,6 +108,8 @@ def provider_configured(name: str) -> bool:
         return bool(settings.crustdata_api_key)
     if name == "coldiq":
         return bool(settings.coldiq_api_key)
+    if name == "getleads":
+        return bool(settings.getleads_api_key)
     if name == "wiza":
         return bool(settings.wiza_api_key)
     return False
@@ -1955,6 +1960,20 @@ _BM_COUNTRY_CODE = {
 # describes, and a code in one but not the other is a silent misread.
 _STATE_CODE_IS_ALSO_A_COUNTRY = _US_STATE_CODES & set(_BM_COUNTRY_CODE.values())
 
+# Reverse lookups, for providers whose filters take names where classify_location
+# hands back a code. Derived from the maps above rather than written out again,
+# so a country added in one place cannot go missing here.
+#
+# The longest spelling of each code wins, because the aliases are abbreviations
+# of the real name: "us", "usa" and "united states" all map to US, and only the
+# last of those is what a country-name filter will match.
+_GL_COUNTRY_NAME: dict = {}
+for _name, _code in sorted(_BM_COUNTRY_CODE.items(), key=lambda kv: -len(kv[0])):
+    _GL_COUNTRY_NAME.setdefault(_code, _name.title())
+_US_STATE_CODE_TO_NAME = {
+    _code: _name.title() for _name, _code in _US_STATE_NAME_TO_CODE.items()
+}
+
 
 # Continents and multi-country regions. An ICP routinely names one — "founders
 # in Europe", "APAC", "the Nordics" — and none of these providers has a field
@@ -2082,6 +2101,255 @@ def bytemine_employee_band(size: str):
         if floor <= high:
             return band
     return _BM_TOP_BAND
+
+
+# =============================================================================
+# GetLeads  (https://app.getleads.io)
+# =============================================================================
+#
+# The first provider in the chain that can express a whole ICP as hard filters.
+# Bytemine has no country field, Crustdata matches location as loose text, and
+# ColdIQ has no industry or headcount field at all — which is why a search for
+# "founders at 1-10 employee AI SaaS" came back with a Software Engineer at
+# Google. /api/v1/contacts/search filters on industry, headcount band, seniority
+# and geography together, so the stated segment is actually applied.
+#
+# It also has what nothing else in the chain has: a real `offset`. Repeat leads
+# on ColdIQ have to be filtered out after the fact because its API cannot skip;
+# here page two is page two.
+#
+# Cost: 1 credit per record *returned* by search, so this leg is billed like
+# Wiza rather than like the reveal-on-unlock providers — it is capped to the
+# page size and never over-fetches speculatively. `/search/count` is free, which
+# is why the count is what gets logged rather than a second billed call.
+
+GETLEADS_BASE = "https://app.getleads.io"
+
+# Their documented job-level enum: C-Team, VP, Director, Manager, Staff, Other.
+# Only mappings the docs evidence are listed. "founder" and "owner" have no
+# level of their own — the docs put founders under the CEO/Founder *persona*,
+# and their own decision-maker lookup treats C-Team as the top level — so they
+# map there. Anything unmapped is omitted rather than guessed: the job title
+# filter still narrows the search.
+_GL_SENIORITY = {
+    "cxo": "C-Team", "c-level": "C-Team", "c-suite": "C-Team",
+    "c_suite": "C-Team", "executive": "C-Team", "chief": "C-Team",
+    "founder": "C-Team", "owner": "C-Team",
+    "vp": "VP", "vice president": "VP", "svp": "VP", "evp": "VP",
+    "director": "Director",
+    "manager": "Manager", "head": "Manager",
+}
+
+# Their `regions` enum, and the continents they accept separately. This is the
+# only provider in the chain with a field for either, which is what makes a
+# search for "Europe" answerable here instead of merely refused.
+_GL_REGION = {
+    "emea": "EMEA", "apac": "APAC", "asia pacific": "APAC",
+    "asia-pacific": "APAC", "anz": "APAC", "australasia": "APAC",
+    "latam": "LATAM", "latin america": "LATAM",
+    "noram": "NORAM", "north america": "NORAM", "americas": "NORAM",
+}
+_GL_CONTINENT = {
+    "europe": "Europe", "asia": "Asia", "africa": "Africa",
+    "south america": "South America", "oceania": "Oceania",
+    "antarctica": "Antarctica",
+}
+
+
+def build_getleads_filters(p: dict) -> dict:
+    """Translate internal search params into a GetLeads `filters` object.
+
+    Almost nothing is refused here, because almost everything is expressible —
+    which is the point of adding it. Industry reuses the LinkedIn spellings
+    Bytemine needs (`_BM_INDUSTRY`): GetLeads documents its `industries` filter
+    as LinkedIn's 441 categories, the same vocabulary.
+    """
+    f: dict = {}
+
+    if p.get("job_title"):
+        f["job_titles"] = [p["job_title"]]
+    if p.get("seniority") and not seniority_implied_by_title(
+            p.get("job_title"), p["seniority"]):
+        mapped = _GL_SENIORITY.get(str(p["seniority"]).strip().lower())
+        if mapped:
+            f["seniority"] = [mapped]
+    if p.get("departments"):
+        depts = p["departments"]
+        f["job_functions"] = depts if isinstance(depts, list) else [depts]
+
+    if p.get("industry"):
+        mapped = bytemine_industry(p["industry"])
+        if not mapped:
+            raise ProviderUnsupported("industry", p["industry"])
+        f["industries"] = [mapped]
+
+    # Numeric bounds rather than the band labels: the server maps a range onto
+    # its headcount bands, so we do not have to guess how it spells "1 to 10".
+    if p.get("company_size"):
+        lo, hi = _size_bounds(p["company_size"])
+        if lo is None and hi is None:
+            raise ProviderUnsupported("company_size", p["company_size"])
+        if lo is not None:
+            f["employees_min"] = lo
+        if hi is not None:
+            f["employees_max"] = hi
+
+    domain = p.get("company_domain")
+    company = p.get("company")
+    if company and not domain and looks_like_domain(company):
+        domain, company = company, None
+    if domain:
+        f["domains"] = [domain_host(domain)]
+    elif company:
+        f["company_name"] = company
+
+    # A segment phrase belongs against the company's own description of itself,
+    # which is where "AI SaaS" is actually written down.
+    if p.get("keywords"):
+        f["company_description"] = str(p["keywords"])
+
+    location = p.get("location") or p.get("company_location")
+    if location:
+        token = str(location)
+        lowered = token.strip().lower()
+        kind, value = classify_location(token)
+        if kind == "region":
+            if lowered in _GL_REGION:
+                f["regions"] = [_GL_REGION[lowered]]
+            elif lowered in _GL_CONTINENT:
+                f["continents"] = [_GL_CONTINENT[lowered]]
+            else:
+                raise ProviderUnsupported("location", location)
+        elif kind == "country":
+            # Their filter takes country *names*; classify_location hands back
+            # an ISO-2 code, so it is turned back into the name it came from.
+            f["countries"] = [_GL_COUNTRY_NAME.get(value, token)]
+        elif kind == "state":
+            f["states"] = [_US_STATE_CODE_TO_NAME.get(value, value)]
+        elif kind == "city":
+            f["cities"] = [token]
+        else:
+            raise ProviderUnsupported("location", location)
+
+    if not f:
+        raise HTTPException(status_code=400, detail="At least one search parameter required")
+    return f
+
+
+def transform_getleads_contact(record: dict) -> dict:
+    """Map one GetLeads contact row onto our lead shape.
+
+    Their contact rows come from the same index the enrichment endpoints read,
+    so the documented field names (first_name, last_name, email_address,
+    cellphone, domain_org, org_company_name, person_country_name) are the ones
+    read first; the camelCase convenience keys their responses also carry are
+    accepted as fallbacks.
+    """
+    r = record or {}
+
+    def pick(*names):
+        for name in names:
+            value = r.get(name)
+            if value not in (None, ""):
+                return value
+        return None
+
+    first = pick("first_name", "firstName") or ""
+    last = pick("last_name", "lastName") or ""
+    name = pick("full_name", "fullName", "name") or f"{first} {last}".strip()
+    email = pick("email_address", "emailAddress", "email")
+    phone, phone_type = pick_phone(r)
+    if not phone:
+        phone = clean_phone(pick("cellphone", "cellPhone", "phone_number"))
+        phone_type = "mobile" if phone else None
+
+    return {
+        "contact_name": name or None,
+        "first_name": first or None,
+        "last_name": last or None,
+        "job_title": pick("title", "job_title", "jobTitle", "position"),
+        "company_name": pick("org_company_name", "company_name", "companyName",
+                             "organization"),
+        "company_domain": domain_host(
+            pick("domain_org", "company_domain", "domain", "website") or "") or None,
+        "business_email": email,
+        # Their own verification verdict, carried through so the reveal-time
+        # check can tell "already known bad" from "not yet checked".
+        "email_status": pick("email_status", "emailStatus"),
+        "phone": phone,
+        "phone_type": phone_type,
+        "phone_available": bool(phone),
+        "linkedin_url": pick("person_linkedin_url", "linkedin_url", "linkedinUrl",
+                             "profileUrl"),
+        "industry": pick("industry", "org_industry", "company_industry"),
+        "country": pick("person_country_name", "country", "countryName"),
+        "provider": "getleads",
+    }
+
+
+async def getleads_call(path: str, body: dict) -> dict:
+    """POST to GetLeads and return the parsed body, mapping their errors onto ours."""
+    headers = {
+        "Authorization": f"Bearer {settings.getleads_api_key or ''}",
+        "Content-Type": "application/json",
+    }
+    async with httpx.AsyncClient(timeout=90.0) as client:
+        resp = await client.post(f"{GETLEADS_BASE}{path}", headers=headers, json=body)
+
+    print(f"GetLeads {path} status: {resp.status_code} {resp.text[:300]}")
+    if resp.status_code == 401:
+        raise HTTPException(status_code=502, detail="GetLeads rejected the API key")
+    if resp.status_code == 402:
+        raise HTTPException(
+            status_code=402,
+            detail="GetLeads credits exhausted — top up to keep searching")
+    if resp.status_code == 429:
+        raise HTTPException(status_code=429,
+                            detail="GetLeads rate limit — try again in a moment")
+    if resp.status_code not in (200, 201, 202):
+        raise HTTPException(
+            status_code=resp.status_code if resp.status_code < 500 else 502,
+            detail=f"GetLeads error: {resp.text[:300]}")
+    try:
+        return resp.json()
+    except ValueError:
+        raise HTTPException(status_code=502, detail="GetLeads returned a non-JSON body")
+
+
+async def getleads_person_search(params: dict, limit: int, offset: int = 0) -> dict:
+    """Search the GetLeads contact index.
+
+    Billed per record returned, so `limit` is the page size and nothing more:
+    this leg never over-fetches to compensate for filtering, because unlike
+    ColdIQ it does not have to — `offset` moves to genuinely new rows.
+    """
+    body = {
+        "filters": build_getleads_filters(params),
+        "limit": max(min(limit, 50000), 1),
+        "offset": max(offset, 0),
+        # Without this one prolific company can fill a whole page.
+        "max_per_company": 3,
+    }
+    print(f"GetLeads search body: {json.dumps(body)[:400]}")
+    data = await getleads_call("/api/v1/contacts/search", body)
+
+    contacts = data.get("contacts") or data.get("results") or data.get("data") or []
+    contacts = [c for c in contacts if isinstance(c, dict)]
+    if contacts:
+        print(f"GetLeads record keys: {sorted(contacts[0].keys())[:25]}")
+
+    return {
+        "profiles": contacts,
+        "total": data.get("total_available") or len(contacts),
+        "next_offset": data.get("next_offset") if data.get("has_more") else None,
+    }
+
+
+async def fetch_from_getleads(params: dict) -> list:
+    """People-search fetcher for /search — returns raw GetLeads contact rows."""
+    limit = max(min(params.get("limit", 10), 100), 1)
+    data = await getleads_person_search(params, limit)
+    return data["profiles"]
 
 
 # =============================================================================
@@ -3457,7 +3725,8 @@ def _profile_url(profile: dict) -> Optional[str]:
     """
     nested = (((profile.get("social_handles") or {})
                .get("professional_network_identifier") or {}).get("profile_url"))
-    return nested or profile.get("linkedin_url") or profile.get("linkedinUrl")
+    return (nested or profile.get("linkedin_url") or profile.get("linkedinUrl")
+            or profile.get("person_linkedin_url"))
 
 
 def _profile_lead_key(profile: dict) -> Optional[str]:
@@ -4154,6 +4423,8 @@ async def search_leads(request: SearchRequest):
             return lambda profile: transform_bytemine_profile(profile, params)
         if name == "coldiq":
             return lambda profile: transform_coldiq_profile(profile, params)
+        if name == "getleads":
+            return lambda record: transform_getleads_contact(record)
         if name == "crustdata":
             return lambda profile: transform_crustdata_profile(profile, params)
         if degraded:
@@ -4260,6 +4531,28 @@ async def search_leads(request: SearchRequest):
             if request.campaign_id:
                 found = await record_new_campaign_profiles(request.campaign_id, found)
             return found, result["total"], result.get("next_cursor")
+
+        if name == "getleads":
+            # The one leg with a real offset: page two is fetched as page two
+            # rather than over-fetched and sliced, which matters because this
+            # provider bills per record returned. Exclusions are still applied
+            # after — the search has no exclude-by-profile field — but they trim
+            # a page that was already the right page.
+            data = await getleads_person_search(
+                params, params.get("limit", 10), offset=request.start_offset)
+            found = data["profiles"]
+
+            if exclusions:
+                seen = {i for i in (linkedin_identity(u) for u in exclusions) if i}
+                found = [c for c in found
+                         if linkedin_identity(_profile_url(c)) not in seen]
+            if campaign_keys:
+                found = [c for c in found
+                         if _profile_lead_key(c) not in campaign_keys]
+            if request.campaign_id:
+                found = await record_new_campaign_profiles(request.campaign_id, found)
+
+            return found, data["total"], None
 
         if name == "coldiq":
             # ColdIQ's people search has no cursor, no offset and no exclusion
