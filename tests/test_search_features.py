@@ -1213,6 +1213,26 @@ class RoutedClient:
 
 
 class CredentialStrippingTests(unittest.TestCase):
+    def test_it_covers_a_field_nobody_remembered_to_list(self):
+        # The original validator named its fields, with a comment saying the
+        # next provider could not forget it. The next provider forgot it:
+        # getleads_api_key was added with the same trailing space and failed on
+        # every call. "*" is the only version that cannot be forgotten.
+        for field in ("getleads_api_key", "coldiq_api_key", "wiza_api_key",
+                      "crustdata_api_key", "bytemine_api_key",
+                      "anthropic_api_key", "database_url", "search_provider"):
+            self.assertIn(field, main.Settings.model_fields, field)
+
+        cleaned = main.Settings._strip_credential(
+            "  glb_live_01M1CMVMEXGWBEDGG8VJN9TCZQ \n")
+        self.assertEqual(cleaned, "glb_live_01M1CMVMEXGWBEDGG8VJN9TCZQ")
+
+    def test_a_non_string_setting_is_returned_untouched(self):
+        # "*" sees every field, including the ints and bools.
+        self.assertEqual(main.Settings._strip_credential(3600), 3600)
+        self.assertIs(main.Settings._strip_credential(True), True)
+
+
     """A pasted key keeps whatever whitespace came with it.
 
     httpx refuses to build a header whose value has trailing whitespace, so the
