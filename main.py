@@ -127,6 +127,21 @@ def provider_chain() -> list[str]:
     return chain or ["wiza"]
 
 
+def linkedin_identity(url) -> Optional[str]:
+    """The part of a LinkedIn URL that identifies the person.
+
+    One definition, because "have we shown this person already?" is asked in
+    several places and every spelling of the same profile has to answer the
+    same: http vs https, with or without www, with or without a trailing slash.
+    ColdIQ's search returns https and its enrich returns http for the very same
+    person, so a raw string comparison misses.
+    """
+    text = str(url or "").strip().lower()
+    if not text or "linkedin.com/" not in text:
+        return None
+    return text.rstrip("/").split("linkedin.com/")[-1] or None
+
+
 def _dedupe_key(lead: dict) -> str:
     """The strongest identity a transformed lead offers.
 
@@ -135,9 +150,9 @@ def _dedupe_key(lead: dict) -> str:
     deduped on what actually identifies a person, in order of how much it
     proves: a LinkedIn URL, then a work email, then name plus company.
     """
-    linkedin = str(lead.get("linkedin_url") or "").strip().lower()
+    linkedin = linkedin_identity(lead.get("linkedin_url"))
     if linkedin:
-        return "li:" + linkedin.rstrip("/").split("linkedin.com/")[-1]
+        return "li:" + linkedin
     email = str(lead.get("contact_email") or lead.get("business_email") or "").strip().lower()
     if email:
         return "em:" + email
@@ -3434,8 +3449,15 @@ def aggregate_companies_crustdata(profiles: list) -> list:
 # =============================================================================
 
 def _profile_url(profile: dict) -> Optional[str]:
-    return (((profile.get("social_handles") or {})
-             .get("professional_network_identifier") or {}).get("profile_url"))
+    """The LinkedIn URL on a raw provider record, whichever shape it arrives in.
+
+    Crustdata nests it; ColdIQ puts it flat on the record. Reading only the
+    nested path meant every ColdIQ result was untrackable, so campaign history
+    never recorded one and the same people came back on every search.
+    """
+    nested = (((profile.get("social_handles") or {})
+               .get("professional_network_identifier") or {}).get("profile_url"))
+    return nested or profile.get("linkedin_url") or profile.get("linkedinUrl")
 
 
 def _profile_lead_key(profile: dict) -> Optional[str]:
@@ -4240,13 +4262,33 @@ async def search_leads(request: SearchRequest):
             return found, result["total"], result.get("next_cursor")
 
         if name == "coldiq":
-            # No cursor and no offset on ColdIQ's people search, so a numbered
-            # page is served by over-fetching and slicing. Its own `limit` caps
-            # at 100, which is the ceiling for this leg.
+            # ColdIQ's people search has no cursor, no offset and no exclusion
+            # field, so every "show me someone new" has to happen on this side.
+            # Without it the leg returned the same top results on every search
+            # — the same person appeared in five consecutive searches — and
+            # once the other three providers came back empty, that was the
+            # entire page the user saw, every time.
+            #
+            # Over-fetch by however many we expect to drop, then filter. Its
+            # own `limit` caps at 100, which is the ceiling for this leg: past
+            # that the pool is genuinely exhausted rather than merely filtered.
             skip = request.start_offset
+            wanted = params.get("limit", 10) + skip
+            headroom = len(exclusions) + len(campaign_keys or ())
             data = await coldiq_person_search(
-                params, max(min(params.get("limit", 10) + skip, 100), 1))
+                params, max(min(wanted + headroom, 100), 1))
             found = data["profiles"]
+
+            if exclusions:
+                seen = {i for i in (linkedin_identity(u) for u in exclusions) if i}
+                found = [p for p in found
+                         if linkedin_identity(_profile_url(p)) not in seen]
+            if campaign_keys:
+                found = [p for p in found
+                         if _profile_lead_key(p) not in campaign_keys]
+            if request.campaign_id:
+                found = await record_new_campaign_profiles(request.campaign_id, found)
+
             return (found[skip:] if skip else found), data["total"], None
 
         if degraded:

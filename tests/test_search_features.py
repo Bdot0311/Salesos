@@ -1764,5 +1764,61 @@ class ColdiqHeadlineRecordTests(unittest.TestCase):
         self.assertEqual(lead["business_email"], "ada@acme.com")
 
 
+class LinkedInIdentityTests(unittest.TestCase):
+    """One definition of "the same person", because several places ask.
+
+    ColdIQ's search returns https://www.linkedin.com/in/seb-hall and its enrich
+    returns http://www.linkedin.com/in/seb-hall for that same person, so a raw
+    string comparison treats them as two people and shows him twice.
+    """
+
+    def test_every_spelling_of_one_profile_is_one_identity(self):
+        spellings = [
+            "https://www.linkedin.com/in/seb-hall",
+            "http://www.linkedin.com/in/seb-hall",
+            "https://linkedin.com/in/seb-hall",
+            "https://www.linkedin.com/in/seb-hall/",
+            "HTTPS://WWW.LINKEDIN.COM/in/seb-hall",
+        ]
+
+        self.assertEqual(len({main.linkedin_identity(u) for u in spellings}), 1)
+
+    def test_different_people_stay_different(self):
+        self.assertNotEqual(
+            main.linkedin_identity("https://www.linkedin.com/in/seb-hall"),
+            main.linkedin_identity("https://www.linkedin.com/in/jim-whitson"))
+
+    def test_anything_that_is_not_a_profile_is_no_identity(self):
+        for value in ("", None, "https://example.com/in/seb-hall", "not a url"):
+            self.assertIsNone(main.linkedin_identity(value), repr(value))
+
+    def test_a_coldiq_record_is_trackable(self):
+        # _profile_url read only Crustdata's nested shape, so every ColdIQ
+        # record was untrackable: campaign history recorded none of them and
+        # the same people came back on every search.
+        record = {"linkedin_url": "https://www.linkedin.com/in/seb-hall",
+                  "title": "Seb Hall - Founder @ Cloud Employee"}
+
+        self.assertEqual(main._profile_url(record),
+                         "https://www.linkedin.com/in/seb-hall")
+        self.assertIsNotNone(main._profile_lead_key(record))
+
+    def test_the_crustdata_shape_still_wins_where_it_exists(self):
+        record = {
+            "social_handles": {"professional_network_identifier": {
+                "profile_url": "https://www.linkedin.com/in/nested"}},
+            "linkedin_url": "https://www.linkedin.com/in/flat",
+        }
+
+        self.assertEqual(main._profile_url(record),
+                         "https://www.linkedin.com/in/nested")
+
+    def test_a_lead_dedupes_on_the_normalised_identity(self):
+        a = main._dedupe_key({"linkedin_url": "https://www.linkedin.com/in/seb-hall"})
+        b = main._dedupe_key({"linkedin_url": "http://linkedin.com/in/seb-hall/"})
+
+        self.assertEqual(a, b)
+
+
 if __name__ == "__main__":
     unittest.main()
