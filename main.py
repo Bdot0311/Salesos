@@ -3725,7 +3725,8 @@ def _profile_url(profile: dict) -> Optional[str]:
     """
     nested = (((profile.get("social_handles") or {})
                .get("professional_network_identifier") or {}).get("profile_url"))
-    return nested or profile.get("linkedin_url") or profile.get("linkedinUrl")
+    return (nested or profile.get("linkedin_url") or profile.get("linkedinUrl")
+            or profile.get("person_linkedin_url"))
 
 
 def _profile_lead_key(profile: dict) -> Optional[str]:

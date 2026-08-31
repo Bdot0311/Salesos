@@ -1820,5 +1820,150 @@ class LinkedInIdentityTests(unittest.TestCase):
         self.assertEqual(a, b)
 
 
+class GetleadsFilterTests(unittest.TestCase):
+    """The first provider in the chain that can express a whole ICP.
+
+    A search for "founders at 1-10 employee AI SaaS" returned a Software
+    Engineer at Google, because the only provider still answering was one with
+    no industry field and no headcount field. These are hard filters.
+    """
+
+    def test_a_whole_icp_becomes_hard_filters(self):
+        f = main.build_getleads_filters({
+            "job_title": "Founder",
+            "industry": "computer software",
+            "company_size": "1-10",
+            "location": "United States",
+        })
+
+        self.assertEqual(f["job_titles"], ["Founder"])
+        self.assertEqual(f["industries"], ["Computer Software"])
+        self.assertEqual(f["employees_min"], 1)
+        self.assertEqual(f["employees_max"], 10)
+        self.assertEqual(f["countries"], ["United States"])
+
+    def test_a_region_is_answerable_here_rather_than_refused(self):
+        # Every other provider steps aside on a continent. This one has fields
+        # for both a macro-region and a continent, so "Europe" is a real filter.
+        self.assertEqual(
+            main.build_getleads_filters({"job_title": "Owner", "location": "Europe"})["continents"],
+            ["Europe"])
+        self.assertEqual(
+            main.build_getleads_filters({"job_title": "Owner", "location": "EMEA"})["regions"],
+            ["EMEA"])
+        self.assertEqual(
+            main.build_getleads_filters({"job_title": "Owner", "location": "APAC"})["regions"],
+            ["APAC"])
+
+    def test_a_country_code_is_turned_back_into_the_name_the_filter_wants(self):
+        # classify_location yields ISO-2; this filter matches on country names.
+        for token, expected in (("US", "United States"), ("Germany", "Germany"),
+                                ("UK", "United Kingdom")):
+            f = main.build_getleads_filters({"job_title": "CTO", "location": token})
+            self.assertEqual(f["countries"], [expected], token)
+
+    def test_a_state_arrives_as_its_name(self):
+        f = main.build_getleads_filters({"job_title": "CTO", "location": "California"})
+
+        self.assertEqual(f["states"], ["California"])
+
+    def test_an_unmappable_industry_is_refused_rather_than_guessed(self):
+        with self.assertRaises(main.ProviderUnsupported):
+            main.build_getleads_filters(
+                {"job_title": "Founder", "industry": "underwater basket weaving"})
+
+    def test_the_implied_seniority_is_dropped_here_too(self):
+        implied = main.build_getleads_filters(
+            {"job_title": "Founder", "seniority": "founder"})
+        separate = main.build_getleads_filters(
+            {"job_title": "Account Executive", "seniority": "vp"})
+
+        self.assertNotIn("seniority", implied)
+        self.assertEqual(separate["seniority"], ["VP"])
+
+    def test_a_segment_phrase_searches_the_company_description(self):
+        f = main.build_getleads_filters(
+            {"job_title": "Founder", "keywords": "AI SaaS"})
+
+        self.assertEqual(f["company_description"], "AI SaaS")
+
+    def test_a_domain_beats_a_company_name(self):
+        by_domain = main.build_getleads_filters({"company_domain": "acme.com"})
+        by_name = main.build_getleads_filters({"company": "Acme Inc"})
+        # The parser emitting a bare domain as a company name is read as one.
+        as_domain = main.build_getleads_filters({"company": "workflows.io"})
+
+        self.assertEqual(by_domain["domains"], ["acme.com"])
+        self.assertEqual(by_name["company_name"], "Acme Inc")
+        self.assertEqual(as_domain["domains"], ["workflows.io"])
+
+
+class GetleadsTransformTests(unittest.TestCase):
+    def test_the_documented_row_shape(self):
+        lead = main.transform_getleads_contact({
+            "first_name": "Jane", "last_name": "Doe",
+            "email_address": "jane@acme.com", "email_status": "VALID",
+            "cellphone": "+1 415-555-0142",
+            "domain_org": "acme.com", "org_company_name": "Acme Inc",
+            "person_country_name": "United States",
+            "person_linkedin_url": "https://www.linkedin.com/in/janedoe",
+            "title": "VP Sales",
+        })
+
+        self.assertEqual(lead["contact_name"], "Jane Doe")
+        self.assertEqual(lead["business_email"], "jane@acme.com")
+        self.assertEqual(lead["email_status"], "VALID")
+        self.assertEqual(lead["company_name"], "Acme Inc")
+        self.assertEqual(lead["company_domain"], "acme.com")
+        self.assertEqual(lead["job_title"], "VP Sales")
+        self.assertEqual(lead["country"], "United States")
+        self.assertEqual(lead["provider"], "getleads")
+        # cellphone is a mobile by name, which is the WhatsApp-capable one.
+        self.assertEqual((lead["phone"], lead["phone_type"]),
+                         ("+1 415-555-0142", "mobile"))
+
+    def test_the_camelcase_convenience_keys_are_accepted_too(self):
+        lead = main.transform_getleads_contact({
+            "firstName": "Ada", "lastName": "Lovelace",
+            "emailAddress": "ada@acme.com", "linkedinUrl": "https://x.com/a",
+        })
+
+        self.assertEqual(lead["contact_name"], "Ada Lovelace")
+        self.assertEqual(lead["business_email"], "ada@acme.com")
+
+    def test_an_empty_row_yields_nulls_rather_than_junk(self):
+        lead = main.transform_getleads_contact({})
+
+        self.assertIsNone(lead["contact_name"])
+        self.assertIsNone(lead["business_email"])
+        self.assertFalse(lead["phone_available"])
+
+    def test_a_getleads_row_is_trackable_so_it_is_not_shown_twice(self):
+        row = {"person_linkedin_url": "https://www.linkedin.com/in/janedoe"}
+
+        self.assertIsNotNone(main._profile_lead_key(row))
+        self.assertEqual(main.linkedin_identity(main._profile_url(row)), "in/janedoe")
+
+
+class GetleadsChainTests(unittest.TestCase):
+    def test_it_joins_the_chain_ahead_of_coldiq(self):
+        order = list(main.PROVIDER_ORDER)
+
+        self.assertIn("getleads", order)
+        self.assertLess(order.index("getleads"), order.index("coldiq"))
+
+    def test_no_key_removes_it_rather_than_breaking_the_chain(self):
+        with patch.object(main.settings, "bytemine_api_key", "b"), \
+             patch.object(main.settings, "getleads_api_key", None), \
+             patch.object(main.settings, "search_provider", "bytemine"):
+            self.assertNotIn("getleads", main.provider_chain())
+
+    def test_a_key_is_all_it_takes(self):
+        with patch.object(main.settings, "bytemine_api_key", "b"), \
+             patch.object(main.settings, "getleads_api_key", "glb_live_x"), \
+             patch.object(main.settings, "search_provider", "bytemine"):
+            self.assertIn("getleads", main.provider_chain())
+
+
 if __name__ == "__main__":
     unittest.main()
