@@ -1,6 +1,6 @@
 # Cache-First Lead Generation Proxy
 
-FastAPI application that caches Wiza API results to reduce costs.
+FastAPI application that caches and merges lead data from a provider waterfall.
 
 ## Setup
 
@@ -46,16 +46,63 @@ Response includes `source: "cache"` or `source: "api"` to indicate data origin.
 
 ### Provider chain
 
-Searches are served by the first provider that can answer them, tried in order:
-**Bytemine → Crustdata → Wiza**. A provider only joins the chain if its key is
-configured (`BYTEMINE_API_KEY`, `CRUSTDATA_API_KEY`, `WIZA_API_KEY`), so adding a
-key is all it takes to put one in front. `SEARCH_PROVIDER` pins which one leads;
+Searches are served by all configured providers and merged in order:
+**Bytemine → Crustdata → GetLeads → Treg → ColdIQ → Wiza**. A provider only joins the chain if its key is
+configured (for example `TREG_TOKEN`, `BYTEMINE_API_KEY`, or `WIZA_API_KEY`), so
+adding a key is all it takes to put one in front. `SEARCH_PROVIDER` pins which one leads;
 the others still follow it as fallbacks.
 
 The order follows capability. Bytemine and Crustdata both return masked or
 flagged contacts from search and charge on reveal, matching how the app bills.
 Wiza's list workflow returns already-enriched contacts and spends an email
 credit per search, so it sits last.
+
+### Treg setup and customer billing
+
+Treg is used only for lead generation through its routed
+`treg.people.search` and `treg.people.enrich` capabilities. Set an org-scoped
+`TREG_TOKEN`, `TREG_ORG_ID` (`4258` for the `bdotindustries` organization), and
+optionally `SEARCH_PROVIDER=treg`. The token is
+backend-only and must never be sent to a browser or model.
+
+Every request that can reach Treg must carry a stable, non-email customer ID:
+
+```http
+X-Customer-ID: cust_8123
+X-Workspace-ID: ws_9
+Idempotency-Key: one-key-per-logical-request
+```
+
+The service writes those IDs to `X-Treg-Meta` itself, stores the returned
+`X-Treg-Call-Id` and `X-Treg-Cost-Micro` in `treg_usage`, and refuses an
+untagged Treg call before money can be spent. Cached responses incur no new
+Treg usage.
+
+For invoice generation, configure `BILLING_ADMIN_KEY` and call:
+
+```http
+GET /billing/treg/customers/cust_8123/usage?days=30
+X-Billing-Admin-Key: <internal-admin-key>
+```
+
+That endpoint reads Treg's authoritative `usage/by-tag` ledger and verifies
+that attributed plus unattributed spend equals the ledger total. Any nonzero
+`unattributed_micro` is returned as a warning and should block invoice close.
+Do not calculate invoices from the local audit table.
+
+Customer spend controls are managed through:
+
+```http
+PUT /billing/treg/customers/cust_8123/budget
+X-Billing-Admin-Key: <internal-admin-key>
+Content-Type: application/json
+
+{"daily_cap_micro": 5000000}
+```
+
+Use `{"status":"blocked"}` to stop Treg spend for a customer. Treg caps are
+advisory under concurrent requests; the prepaid organization balance is the
+hard limit.
 
 A search moves to the next provider when the current one:
 

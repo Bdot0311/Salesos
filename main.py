@@ -5,19 +5,22 @@ A FastAPI application that caches Wiza API results to reduce costs.
 
 import asyncio
 import base64
+import contextvars
 import hashlib
+import hmac
 import json
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+from urllib.parse import quote
 
 import anthropic
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator, Field, AliasChoices
 from pydantic_settings import BaseSettings
-from sqlalchemy import Column, String, Text, DateTime, select
+from sqlalchemy import BigInteger, Column, String, Text, DateTime, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
@@ -29,7 +32,7 @@ from sqlalchemy.orm import DeclarativeBase
 
 class Settings(BaseSettings):
     database_url: str
-    wiza_api_key: str
+    wiza_api_key: Optional[str] = None
     anthropic_api_key: Optional[str] = None
     # Prospecting data providers, tried in order: Bytemine, then Crustdata, then
     # Wiza. A provider is only in the chain if its key is configured, so adding a
@@ -44,6 +47,16 @@ class Settings(BaseSettings):
     coldiq_api_key: Optional[str] = None
     getleads_api_key: Optional[str] = None
     crustdata_api_key: Optional[str] = None
+    # treg is an all-in-one tool catalog. We use only its routed lead-gen
+    # endpoints, while treg itself chooses among the eligible upstream tools.
+    # Keep this org-scoped token on the backend: it pays for every customer.
+    treg_token: Optional[str] = None
+    treg_org_id: Optional[str] = None
+    treg_base_url: str = "https://treg.to"
+    # Protects the invoice and budget management endpoints below. It is
+    # intentionally separate from TREG_TOKEN so callers never receive treg's
+    # credential or team-level balance details.
+    billing_admin_key: Optional[str] = None
     search_provider: str = "bytemine"
     # ICP parsing is rule-based by default (no API credits needed). Set
     # USE_LLM_PARSER=true (with ANTHROPIC_API_KEY) to also run the LLM and let it
@@ -95,12 +108,13 @@ CRUSTDATA_VERSION = "2025-11-01"
 # Bytemine routes every endpoint through one gateway: the real path and method
 # travel in the JSON body rather than the URL.
 BYTEMINE_GATEWAY = "https://bvjmtgaxijpyasjtaqiv.supabase.co/functions/v1/api-gateway"
+TREG_META_VALUE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 # Default order, best-fit first. Filtered down to configured providers by
 # provider_chain().
 # getleads sits ahead of coldiq: it filters on industry, headcount and region
 # for real, where coldiq can only rank on them. See build_getleads_filters.
-PROVIDER_ORDER = ("bytemine", "crustdata", "getleads", "coldiq", "wiza")
+PROVIDER_ORDER = ("bytemine", "crustdata", "getleads", "treg", "coldiq", "wiza")
 
 
 def provider_configured(name: str) -> bool:
@@ -113,6 +127,8 @@ def provider_configured(name: str) -> bool:
         return bool(settings.coldiq_api_key)
     if name == "getleads":
         return bool(settings.getleads_api_key)
+    if name == "treg":
+        return bool(settings.treg_token)
     if name == "wiza":
         return bool(settings.wiza_api_key)
     return False
@@ -129,10 +145,7 @@ def provider_chain() -> list[str]:
     preferred = (settings.search_provider or PROVIDER_ORDER[0]).strip().lower()
     ordered = [preferred] + [p for p in PROVIDER_ORDER if p != preferred]
     chain = [p for p in ordered if p in PROVIDER_ORDER and provider_configured(p)]
-    # Wiza's key is required by Settings, so the chain is never empty in
-    # practice; the guard keeps a misconfigured environment from failing here
-    # with an IndexError instead of a readable provider error.
-    return chain or ["wiza"]
+    return chain
 
 
 def linkedin_identity(url) -> Optional[str]:
@@ -264,7 +277,7 @@ def provider_state() -> tuple[str, bool]:
     """
     chain = provider_chain()
     preferred = (settings.search_provider or PROVIDER_ORDER[0]).strip().lower()
-    head = chain[0]
+    head = chain[0] if chain else "none"
     # Degraded means the provider that was asked for is not the one that will
     # run, which for Wiza changes what a search costs — see the note above.
     return head, head != preferred
@@ -1079,6 +1092,26 @@ class CampaignSeenLead(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+class TregUsage(Base):
+    """Local audit copy of Treg's authoritative append-only billing ledger.
+
+    `treg_call_id` makes retries idempotent on our side too. Invoices still use
+    treg's usage/by-tag ledger; these rows join a product request to that ledger
+    and make support/debugging possible without relying on Treg's call log.
+    """
+
+    __tablename__ = "treg_usage"
+
+    treg_call_id = Column(String(128), primary_key=True)
+    customer_id = Column(String(128), nullable=False, index=True)
+    workspace_id = Column(String(128), nullable=True, index=True)
+    feature = Column(String(64), nullable=False)
+    endpoint_id = Column(String(128), nullable=False)
+    cost_micro = Column(BigInteger, nullable=False, default=0)
+    served_by = Column(String(128), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
 # =============================================================================
 # Database Setup
 # =============================================================================
@@ -1090,6 +1123,142 @@ async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+
+# =============================================================================
+# Treg customer attribution and billing
+# =============================================================================
+
+_treg_request_context = contextvars.ContextVar("treg_request_context", default=None)
+
+
+def _valid_treg_meta_value(name: str, value: Optional[str], required: bool = False) -> Optional[str]:
+    value = value.strip() if isinstance(value, str) else value
+    if not value:
+        if required:
+            raise HTTPException(status_code=400, detail=f"Missing X-{name.replace('_', '-').title()}")
+        return None
+    if not TREG_META_VALUE_RE.fullmatch(value) or "@" in value:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{name} must be 1-128 URL-safe characters and cannot be an email",
+        )
+    return value
+
+
+def treg_request_context() -> dict:
+    """Return validated server-owned billing context for the current request."""
+    ctx = _treg_request_context.get() or {}
+    return {
+        "customer_id": _valid_treg_meta_value(
+            "customer_id", ctx.get("customer_id"), required=True),
+        "workspace_id": _valid_treg_meta_value(
+            "workspace_id", ctx.get("workspace_id")),
+        "idempotency_key": ctx.get("idempotency_key"),
+    }
+
+
+def _treg_meta_header(ctx: dict, feature: str) -> str:
+    tags = [f"customer={ctx['customer_id']}", f"feature={feature}"]
+    if ctx.get("workspace_id"):
+        tags.insert(1, f"workspace={ctx['workspace_id']}")
+    return ", ".join(tags)
+
+
+async def record_treg_usage(
+    *, call_id: Optional[str], ctx: dict, feature: str, endpoint_id: str,
+    cost_micro: int, served_by: Optional[str],
+) -> None:
+    if not call_id:
+        return
+    try:
+        async with async_session() as session:
+            values = dict(
+                treg_call_id=call_id,
+                customer_id=ctx["customer_id"],
+                workspace_id=ctx.get("workspace_id"),
+                feature=feature,
+                endpoint_id=endpoint_id,
+                cost_micro=cost_micro,
+                served_by=served_by,
+            )
+            statement = pg_insert(TregUsage).values(**values).on_conflict_do_nothing(
+                index_elements=[TregUsage.treg_call_id])
+            await session.execute(statement)
+            await session.commit()
+    except Exception as exc:
+        # Treg's ledger remains the billing source of truth. A local audit write
+        # must not turn a paid, successful provider response into a user error.
+        print(f"WARNING: could not store treg usage row {call_id}: {exc}")
+
+
+def _safe_treg_error(response: httpx.Response) -> HTTPException:
+    """Redact team balance/top-up details while preserving customer cap errors."""
+    try:
+        body = response.json()
+    except Exception:
+        body = {}
+    error = body.get("error") if isinstance(body, dict) else None
+    is_treg_refusal = response.headers.get("X-Treg-Error") == "1"
+    if error in ("tag_blocked", "tag_spend_cap_reached"):
+        return HTTPException(status_code=response.status_code, detail=body)
+    if response.status_code == 422:
+        return HTTPException(status_code=422, detail=body.get("detail", "Invalid lead request"))
+    if response.status_code == 429:
+        return HTTPException(status_code=503, detail="Lead data provider is temporarily rate limited")
+    if response.status_code == 402:
+        return HTTPException(status_code=503, detail="Lead data provider billing is temporarily unavailable")
+    if not is_treg_refusal:
+        return HTTPException(
+            status_code=response.status_code if response.status_code < 500 else 502,
+            detail=body.get("detail", "Upstream lead provider request failed"),
+        )
+    return HTTPException(
+        status_code=response.status_code if response.status_code < 500 else 502,
+        detail=body.get("detail", "Lead data provider request failed"),
+    )
+
+
+async def treg_call(endpoint_id: str, payload: dict, feature: str) -> dict:
+    """The only product call path to Treg: tagged, metered and auditable."""
+    if not settings.treg_token:
+        raise HTTPException(status_code=503, detail="Treg is not configured")
+    ctx = treg_request_context()
+    headers = {
+        "X-Treg-Token": settings.treg_token,
+        "X-Treg-Meta": _treg_meta_header(ctx, feature),
+        "Content-Type": "application/json",
+    }
+    if ctx.get("idempotency_key"):
+        headers["Idempotency-Key"] = ctx["idempotency_key"]
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        response = await client.post(
+            f"{settings.treg_base_url.rstrip('/')}/call/{endpoint_id}",
+            headers=headers,
+            json=payload,
+        )
+
+    call_id = response.headers.get("X-Treg-Call-Id")
+    try:
+        cost_micro = int(response.headers.get("X-Treg-Cost-Micro") or 0)
+    except ValueError:
+        cost_micro = 0
+    await record_treg_usage(
+        call_id=call_id,
+        ctx=ctx,
+        feature=feature,
+        endpoint_id=endpoint_id,
+        cost_micro=cost_micro,
+        served_by=response.headers.get("X-Treg-Served-By"),
+    )
+
+    if response.is_error:
+        raise _safe_treg_error(response)
+    try:
+        return response.json()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="Treg returned an invalid response") from exc
 
 
 # =============================================================================
@@ -2287,6 +2456,107 @@ def transform_getleads_contact(record: dict) -> dict:
         "industry": pick("industry", "org_industry", "company_industry"),
         "country": pick("person_country_name", "country", "countryName"),
         "provider": "getleads",
+    }
+
+
+def transform_treg_person(record: dict, search_params: dict = None) -> dict:
+    """Normalize Treg's routed people output without depending on its child.
+
+    Routed endpoints return a stable top-level person shape, but `raw` remains
+    provider-native. The fallbacks below tolerate both so adding a new child to
+    Treg does not require another provider implementation here.
+    """
+    r = record or {}
+    search_params = search_params or {}
+
+    def pick(*names):
+        for name in names:
+            value = r.get(name)
+            if value not in (None, "", [], {}):
+                return value
+        return None
+
+    first = pick("first_name", "firstName")
+    last = pick("last_name", "lastName")
+    name = pick("full_name", "fullName", "name") or " ".join(
+        part for part in (first, last) if part)
+    company = pick("company", "company_name", "companyName", "organization")
+    if isinstance(company, dict):
+        company_name = company.get("name")
+        company_domain = company.get("domain") or company.get("website")
+    else:
+        company_name = company
+        company_domain = pick("company_domain", "companyDomain", "domain", "website")
+    phone, phone_type = pick_phone(r)
+
+    return {
+        "contact_name": name or None,
+        "first_name": first,
+        "last_name": last,
+        "job_title": pick("title", "job_title", "jobTitle", "position"),
+        "linkedin_url": pick("linkedin_url", "linkedinUrl", "linkedin", "profile_url"),
+        "business_email": pick("email", "business_email", "work_email"),
+        "email_status": pick("email_status", "emailStatus"),
+        "phone": phone,
+        "phone_type": phone_type,
+        "location": pick("location", "country"),
+        "company_name": company_name,
+        "company_domain": domain_host(company_domain or "") or None,
+        "industry": pick("industry", "company_industry") or search_params.get("industry"),
+        "company_size": pick("company_size", "headcount") or search_params.get("company_size"),
+        "company_revenue": pick("revenue", "company_revenue"),
+        "company_funding": pick("funding", "company_funding"),
+        "technologies": pick("technologies") or search_params.get("technologies"),
+        "provider": "treg",
+        "raw_data": r,
+    }
+
+
+def build_treg_people_search(params: dict, limit: int) -> dict:
+    """Map the filters supported by Treg's routed lead-search capability."""
+    unsupported = [
+        field for field in (
+            "departments", "company_size", "technologies", "intent_topics",
+            "revenue_min", "revenue_max", "job_change_days", "signals",
+        ) if params.get(field)
+    ]
+    if unsupported:
+        raise ProviderUnsupported(", ".join(unsupported), "requested")
+
+    location = params.get("location") or params.get("company_location")
+    location_kind, normalized_location = classify_location(location) if location else (None, None)
+    payload = {
+        "q": params.get("query") or params.get("company"),
+        "company_domain": params.get("company_domain"),
+        "title": params.get("job_title"),
+        "country": normalized_location if location_kind == "country" else None,
+        "location": normalized_location if location_kind != "country" else None,
+        "limit": max(min(int(limit or 10), 100), 1),
+    }
+    keywords = []
+    if params.get("keywords"):
+        keywords.extend(x.strip() for x in str(params["keywords"]).split(",") if x.strip())
+    if params.get("industry"):
+        keywords.append(str(params["industry"]))
+    if params.get("seniority"):
+        keywords.append(str(params["seniority"]))
+    if keywords:
+        payload["keywords"] = list(dict.fromkeys(keywords))
+    return {k: v for k, v in payload.items() if v not in (None, "", [])}
+
+
+async def treg_person_search(params: dict, limit: int) -> dict:
+    data = await treg_call(
+        "treg.people.search", build_treg_people_search(params, limit), "lead-search")
+    output = data.get("output") if isinstance(data, dict) else None
+    output = output if isinstance(output, dict) else {}
+    people = output.get("people") or []
+    if not isinstance(people, list):
+        people = []
+    return {
+        "profiles": people,
+        "total": output.get("total") or len(people),
+        "next_cursor": output.get("next_cursor"),
     }
 
 
@@ -3903,6 +4173,20 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def attach_treg_billing_context(request: Request, call_next):
+    """Bind trusted tenant headers once; provider code never accepts model tags."""
+    token = _treg_request_context.set({
+        "customer_id": request.headers.get("X-Customer-ID"),
+        "workspace_id": request.headers.get("X-Workspace-ID"),
+        "idempotency_key": request.headers.get("Idempotency-Key"),
+    })
+    try:
+        return await call_next(request)
+    finally:
+        _treg_request_context.reset(token)
+
+
 @app.on_event("startup")
 async def startup():
     prov, degraded = provider_state()
@@ -3936,12 +4220,107 @@ async def health_check():
         "status": "healthy",
         "search_provider": prov,
         "provider_chain": chain,
+        "treg_configured": provider_configured("treg"),
         "degraded": degraded,
         "degraded_reason": (
             f"SEARCH_PROVIDER={preferred} but no API key is configured for it; "
             f"searches are served by {prov}"
         ) if degraded else None,
     }
+
+
+class TregBudgetRequest(BaseModel):
+    daily_cap_micro: Optional[int] = Field(default=None, ge=0)
+    status: Optional[str] = None
+
+    @field_validator("status")
+    @classmethod
+    def validate_status(cls, value):
+        if value not in (None, "active", "blocked"):
+            raise ValueError("status must be active or blocked")
+        return value
+
+
+def require_billing_admin(provided: Optional[str]) -> None:
+    if not settings.billing_admin_key:
+        raise HTTPException(status_code=503, detail="Billing administration is not configured")
+    if not provided or not hmac.compare_digest(provided, settings.billing_admin_key):
+        raise HTTPException(status_code=401, detail="Invalid billing admin key")
+
+
+def require_treg_billing_config() -> None:
+    if not settings.treg_token or not settings.treg_org_id:
+        raise HTTPException(status_code=503, detail="Treg billing is not configured")
+
+
+@app.get("/billing/treg/customers/{customer_id}/usage")
+async def treg_customer_usage(
+    customer_id: str,
+    days: int = 30,
+    x_billing_admin_key: Optional[str] = Header(default=None),
+):
+    """Read invoiceable customer usage from Treg's ledger, never its call log."""
+    require_billing_admin(x_billing_admin_key)
+    require_treg_billing_config()
+    customer_id = _valid_treg_meta_value("customer_id", customer_id, required=True)
+    days = max(min(days, 366), 1)
+    url = (
+        f"{settings.treg_base_url.rstrip('/')}/orgs/{quote(settings.treg_org_id, safe='')}"
+        f"/usage/by-tag"
+    )
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.get(
+            url,
+            headers={"X-Treg-Token": settings.treg_token},
+            params={"key": "customer", "days": days},
+        )
+    if response.is_error:
+        raise _safe_treg_error(response)
+    data = response.json()
+    attributed = int(data.get("attributed_micro") or 0)
+    unattributed = int(data.get("unattributed_micro") or 0)
+    total = int(data.get("total_micro") or 0)
+    if attributed + unattributed != total:
+        raise HTTPException(status_code=502, detail="Treg usage ledger did not reconcile")
+    row = next(
+        (item for item in data.get("rows", []) if item.get("value") == customer_id),
+        {"value": customer_id, "charged_micro": 0, "charged_usd": 0.0, "calls": 0},
+    )
+    return {
+        "customer": row,
+        "days": days,
+        "ledger_reconciled": True,
+        "unattributed_micro": unattributed,
+        "unattributed_warning": unattributed != 0,
+    }
+
+
+@app.put("/billing/treg/customers/{customer_id}/budget")
+async def set_treg_customer_budget(
+    customer_id: str,
+    budget: TregBudgetRequest,
+    x_billing_admin_key: Optional[str] = Header(default=None),
+):
+    """Set Treg's advisory daily customer cap or block a customer."""
+    require_billing_admin(x_billing_admin_key)
+    require_treg_billing_config()
+    customer_id = _valid_treg_meta_value("customer_id", customer_id, required=True)
+    payload = budget.model_dump(exclude_none=True)
+    if not payload:
+        raise HTTPException(status_code=422, detail="Provide daily_cap_micro or status")
+    url = (
+        f"{settings.treg_base_url.rstrip('/')}/orgs/{quote(settings.treg_org_id, safe='')}"
+        f"/budgets/customer/{quote(customer_id, safe='')}"
+    )
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.put(
+            url,
+            headers={"X-Treg-Token": settings.treg_token},
+            json=payload,
+        )
+    if response.is_error:
+        raise _safe_treg_error(response)
+    return response.json()
 
 
 # =============================================================================
@@ -4073,6 +4452,44 @@ async def enrich_lead(request: EnrichRequest):
             }
         # No Crustdata match — fall through with whatever identifiers we have.
 
+    # Treg's routed enrichment fans out across its lead-gen catalog and returns
+    # the provider it selected. It remains one leg in our outer waterfall.
+    if "treg" in chain and (
+        request.linkedin_url
+        or request.email
+        or (request.full_name and request.company_domain)
+    ):
+        payload = {
+            "linkedin_url": request.linkedin_url,
+            "email": request.email,
+            "full_name": request.full_name,
+            "domain": request.company_domain,
+        }
+        try:
+            result = await treg_call(
+                "treg.people.enrich",
+                {k: v for k, v in payload.items() if v},
+                "lead-enrich",
+            )
+            output = result.get("output") if isinstance(result, dict) else None
+            person = output if isinstance(output, dict) else {}
+        except HTTPException as exc:
+            print(f"Treg reveal failed ({exc.status_code}); trying next provider")
+            if not any(provider in chain for provider in ("coldiq", "wiza")):
+                raise
+            person = {}
+        if person and any(person.values()):
+            lead = transform_treg_person(person)
+            lead = await verify_revealed_lead(lead, "treg")
+            return {
+                "success": True,
+                "provider": "treg",
+                "treg_served_by": (result.get("_treg") or {}).get("served_by"),
+                "enrichment_status": "complete" if lead.get("business_email") else "no_email",
+                "email_verification": lead["email_verification"],
+                "lead": lead,
+            }
+
     # ColdIQ reveal: its own managed waterfall behind one call, keyed on the
     # LinkedIn URL or the name + company its search hands back. Reached whether
     # or not the lead came from ColdIQ — a reveal is about the person, not about
@@ -4099,6 +4516,9 @@ async def enrich_lead(request: EnrichRequest):
                 "email_verification": lead["email_verification"],
                 "lead": lead,
             }
+
+    if "wiza" not in chain:
+        raise HTTPException(status_code=404, detail="No configured provider could enrich this lead")
 
     headers = {
         "Authorization": f"Bearer {settings.wiza_api_key}",
@@ -4399,6 +4819,8 @@ async def search_leads(request: SearchRequest):
     """
     params = await resolve_search_params(request)
     chain = provider_chain()
+    if not chain:
+        raise HTTPException(status_code=503, detail="No lead data provider is configured")
     prov, degraded = provider_state()
     if request.cursor and prov not in ("crustdata", "bytemine"):
         raise HTTPException(
@@ -4435,6 +4857,8 @@ async def search_leads(request: SearchRequest):
             return lambda profile: transform_coldiq_profile(profile, params)
         if name == "getleads":
             return lambda record: transform_getleads_contact(record)
+        if name == "treg":
+            return lambda record: transform_treg_person(record, params)
         if name == "crustdata":
             return lambda profile: transform_crustdata_profile(profile, params)
         if degraded:
@@ -4563,6 +4987,20 @@ async def search_leads(request: SearchRequest):
                 found = await record_new_campaign_profiles(request.campaign_id, found)
 
             return found, data["total"], None
+
+        if name == "treg":
+            # Treg's routed endpoint chooses among its lead-gen providers. It
+            # has no stable cross-provider cursor, so numbered pages over-fetch
+            # and slice just like other non-cursor legs.
+            skip = request.start_offset
+            data = await treg_person_search(
+                params, max(min(params.get("limit", 10) + skip, 100), 1))
+            found = data["profiles"]
+            if exclusions:
+                seen = {i for i in (linkedin_identity(u) for u in exclusions) if i}
+                found = [p for p in found
+                         if linkedin_identity(_profile_url(p)) not in seen]
+            return (found[skip:] if skip else found), data["total"], data.get("next_cursor")
 
         if name == "coldiq":
             # ColdIQ's people search has no cursor, no offset and no exclusion
