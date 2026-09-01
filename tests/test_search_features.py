@@ -275,9 +275,44 @@ class TregProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["keywords"], ["software"])
         self.assertEqual(payload["limit"], 5)
 
-    def test_unsupported_filters_are_not_silently_dropped(self):
-        with self.assertRaises(main.ProviderUnsupported):
-            main.build_treg_people_search({"company_size": "51-200"}, 10)
+    def test_company_size_uses_an_exact_firmographic_treg_route(self):
+        endpoint, payload = main.treg_search_plan({
+            "company_size": "51-200",
+            "job_title": "VP Sales",
+        }, 10)
+        self.assertEqual(endpoint, "leadsforge.people.search")
+        self.assertEqual(
+            payload["companyEmployeeNumberRange"], {"min": 51, "max": 200})
+        self.assertEqual(payload["leadJobTitles"], {"include": ["VP Sales"]})
+
+    def test_leadsforge_rows_keep_nested_firmographics(self):
+        lead = main.transform_treg_person({
+            "firstName": "Ada",
+            "lastName": "Lovelace",
+            "jobTitle": "VP Engineering",
+            "location": {"city": "London", "country": "United Kingdom"},
+            "company": {
+                "name": "Analytical Engines",
+                "domain": "analytical.example",
+                "employeeCount": 120,
+                "industry": "software development",
+            },
+        })
+        self.assertEqual(lead["contact_name"], "Ada Lovelace")
+        self.assertEqual(lead["company_size"], "51-200")
+        self.assertEqual(lead["company_headcount"], 120)
+        self.assertEqual(lead["location"], "London, United Kingdom")
+
+    async def test_firmographic_response_and_cursor_are_read(self):
+        with patch.object(main, "treg_call", new=AsyncMock(return_value={
+            "leads": [{"firstName": "Ada"}], "cursor": "next-page",
+        })) as call:
+            result = await main.treg_person_search(
+                {"company_size": "51-200"}, 10, cursor="current-page")
+        self.assertEqual(result["profiles"], [{"firstName": "Ada"}])
+        self.assertEqual(result["next_cursor"], "next-page")
+        self.assertEqual(call.await_args.args[0], "leadsforge.people.search")
+        self.assertEqual(call.await_args.kwargs["query"], {"cursor": "current-page"})
 
     async def test_every_call_is_tagged_metered_and_recorded(self):
         class Response:
@@ -304,7 +339,7 @@ class TregProviderTests(unittest.IsolatedAsyncioTestCase):
             async def __aexit__(self, *args):
                 return False
 
-            async def post(self, url, headers, json):
+            async def post(self, url, headers, json, params=None):
                 self.__class__.last_headers = headers
                 self.__class__.last_json = json
                 return Response()
