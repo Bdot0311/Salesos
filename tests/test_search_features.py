@@ -1,7 +1,7 @@
 import json
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost/test")
 os.environ.setdefault("WIZA_API_KEY", "test-wiza")
@@ -251,6 +251,153 @@ class ProviderChainTests(unittest.TestCase):
         self.assertEqual(self.chain(search_provider="nonesuch"),
                          ["bytemine", "crustdata", "wiza"])
 
+
+class TregProviderTests(unittest.IsolatedAsyncioTestCase):
+    def test_treg_joins_the_waterfall_when_configured(self):
+        with patch.object(main.settings, "treg_token", "treg-token"), \
+             patch.object(main.settings, "bytemine_api_key", None), \
+             patch.object(main.settings, "crustdata_api_key", None), \
+             patch.object(main.settings, "getleads_api_key", None), \
+             patch.object(main.settings, "coldiq_api_key", "coldiq"), \
+             patch.object(main.settings, "wiza_api_key", "wiza"):
+            self.assertEqual(main.provider_chain(), ["treg", "coldiq", "wiza"])
+
+    def test_search_payload_uses_only_the_lead_gen_route(self):
+        payload = main.build_treg_people_search({
+            "job_title": "VP Sales",
+            "company_domain": "acme.com",
+            "location": "New York",
+            "industry": "software",
+            "limit": 5,
+        }, 5)
+        self.assertEqual(payload["title"], "VP Sales")
+        self.assertEqual(payload["company_domain"], "acme.com")
+        self.assertEqual(payload["keywords"], ["software"])
+        self.assertEqual(payload["limit"], 5)
+
+    def test_unsupported_filters_are_not_silently_dropped(self):
+        with self.assertRaises(main.ProviderUnsupported):
+            main.build_treg_people_search({"company_size": "51-200"}, 10)
+
+    async def test_every_call_is_tagged_metered_and_recorded(self):
+        class Response:
+            is_error = False
+            headers = {
+                "X-Treg-Call-Id": "call_123",
+                "X-Treg-Cost-Micro": "4200",
+                "X-Treg-Served-By": "icypeas",
+            }
+
+            def json(self):
+                return {"output": {"people": []}}
+
+        class Client:
+            last_headers = None
+            last_json = None
+
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def post(self, url, headers, json):
+                self.__class__.last_headers = headers
+                self.__class__.last_json = json
+                return Response()
+
+        context_token = main._treg_request_context.set({
+            "customer_id": "cust_8123",
+            "workspace_id": "ws_9",
+            "idempotency_key": "retry-1",
+        })
+        try:
+            with patch.object(main.settings, "treg_token", "secret"), \
+                 patch.object(main.httpx, "AsyncClient", Client), \
+                 patch.object(main, "record_treg_usage", new=AsyncMock()) as record:
+                await main.treg_call("treg.people.search", {"limit": 1}, "lead-search")
+        finally:
+            main._treg_request_context.reset(context_token)
+
+        self.assertEqual(
+            Client.last_headers["X-Treg-Meta"],
+            "customer=cust_8123, workspace=ws_9, feature=lead-search",
+        )
+        self.assertEqual(Client.last_headers["Idempotency-Key"], "retry-1")
+        record.assert_awaited_once()
+        self.assertEqual(record.await_args.kwargs["call_id"], "call_123")
+        self.assertEqual(record.await_args.kwargs["cost_micro"], 4200)
+
+    async def test_missing_customer_never_creates_unattributed_spend(self):
+        context_token = main._treg_request_context.set({})
+        try:
+            with patch.object(main.settings, "treg_token", "secret"):
+                with self.assertRaises(HTTPException) as raised:
+                    await main.treg_call("treg.people.search", {"limit": 1}, "lead-search")
+        finally:
+            main._treg_request_context.reset(context_token)
+        self.assertEqual(raised.exception.status_code, 400)
+
+    async def test_invoice_usage_comes_from_the_reconciled_treg_ledger(self):
+        class Response:
+            is_error = False
+            headers = {}
+
+            def json(self):
+                return {
+                    "rows": [{
+                        "value": "cust_8123", "charged_micro": 41234,
+                        "charged_usd": 0.041234, "calls": 22,
+                    }],
+                    "attributed_micro": 41234,
+                    "unattributed_micro": 1880,
+                    "total_micro": 43114,
+                }
+
+        class Client:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def get(self, url, headers, params):
+                self.params = params
+                return Response()
+
+        with patch.object(main.settings, "treg_token", "secret"), \
+             patch.object(main.settings, "treg_org_id", "org_1"), \
+             patch.object(main.settings, "billing_admin_key", "admin"), \
+             patch.object(main.httpx, "AsyncClient", Client):
+            result = await main.treg_customer_usage(
+                "cust_8123", days=30, x_billing_admin_key="admin")
+
+        self.assertTrue(result["ledger_reconciled"])
+        self.assertEqual(result["customer"]["charged_micro"], 41234)
+        self.assertTrue(result["unattributed_warning"])
+
+    def test_team_balance_details_are_never_exposed(self):
+        class Response:
+            status_code = 402
+            headers = {"X-Treg-Error": "1"}
+
+            def json(self):
+                return {
+                    "error": "insufficient_balance",
+                    "balance_micro": 12,
+                    "topup_url": "https://private.example/top-up",
+                }
+
+        error = main._safe_treg_error(Response())
+        self.assertEqual(error.status_code, 503)
+        self.assertNotIn("balance", str(error.detail))
+        self.assertNotIn("top-up", str(error.detail))
 
 class BytemineFilterTests(unittest.TestCase):
     def test_core_filters_map_onto_bytemine_fields(self):
