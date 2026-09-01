@@ -65,11 +65,14 @@ class Settings(BaseSettings):
     # That is exactly what happened to ColdIQ: one trailing space meant it never
     # returned a single lead, and the email verification that runs through it
     # answered "unknown" for every address, for as long as it had been deployed.
-    # Stripping here fixes every call site at once and cannot be forgotten by the
-    # next one.
-    @field_validator("wiza_api_key", "anthropic_api_key", "bytemine_api_key",
-                     "coldiq_api_key", "crustdata_api_key", "database_url",
-                     mode="after")
+    #
+    # This applies to every field rather than a named list. The named list said
+    # it "cannot be forgotten by the next one" and was then forgotten by the very
+    # next one: GetLeads was added with the same trailing space, failed on every
+    # call for the same reason, and the validator did not cover it because nobody
+    # went back to add it. A list of fields to protect is a list someone has to
+    # remember to extend; "*" is not.
+    @field_validator("*", mode="after")
     @classmethod
     def _strip_credential(cls, value):
         return value.strip() if isinstance(value, str) else value
@@ -2374,6 +2377,13 @@ async def fetch_from_getleads(params: dict) -> list:
 
 COLDIQ_BASE = "https://api.coldiq.com"
 
+# How far past the requested page to fetch, to leave room for already-seen rows
+# to be filtered out. ColdIQ has no exclusion field, so the filtering happens
+# here; it also bills per record returned, so this cannot be generous. Three
+# pages' worth is the compromise — enough to clear a page of repeats, far short
+# of the "one row per person ever seen" that made a 6-lead search ask for 56.
+COLDIQ_OVERFETCH = 3
+
 # ColdIQ's documented seniority vocabulary, from the FindPeopleInput examples
 # ("c_suite", "vp"). Ours is mapped onto it; anything unmapped is left out
 # rather than guessed, and the title filter still narrows the search.
@@ -4562,14 +4572,21 @@ async def search_leads(request: SearchRequest):
             # once the other three providers came back empty, that was the
             # entire page the user saw, every time.
             #
-            # Over-fetch by however many we expect to drop, then filter. Its
-            # own `limit` caps at 100, which is the ceiling for this leg: past
-            # that the pool is genuinely exhausted rather than merely filtered.
+            # Over-fetch to survive that filtering, but only to a multiple of
+            # the page — not by the length of the seen list. Asking for one row
+            # per previously-seen person meant a page of 6 requesting 56, and
+            # this provider bills per record returned: the log showed a single
+            # search costing 10 credits against a balance of 0.32.
+            #
+            # The trade is honest either way. A page that comes back fully
+            # filtered is "nothing new here", which is true, and GetLeads —
+            # which has a real offset and does not need this at all — is the
+            # leg that should be finding new people now.
             skip = request.start_offset
             wanted = params.get("limit", 10) + skip
-            headroom = len(exclusions) + len(campaign_keys or ())
             data = await coldiq_person_search(
-                params, max(min(wanted + headroom, 100), 1))
+                params, max(min(wanted * COLDIQ_OVERFETCH, 100), 1))
+            before = len(data["profiles"])
             found = data["profiles"]
 
             if exclusions:
@@ -4581,6 +4598,10 @@ async def search_leads(request: SearchRequest):
                          if _profile_lead_key(p) not in campaign_keys]
             if request.campaign_id:
                 found = await record_new_campaign_profiles(request.campaign_id, found)
+
+            if before and not found:
+                print(f"ColdIQ: all {before} record(s) already seen — "
+                      "no new people at this page depth")
 
             return (found[skip:] if skip else found), data["total"], None
 
