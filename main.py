@@ -1219,7 +1219,9 @@ def _safe_treg_error(response: httpx.Response) -> HTTPException:
     )
 
 
-async def treg_call(endpoint_id: str, payload: dict, feature: str) -> dict:
+async def treg_call(
+    endpoint_id: str, payload: dict, feature: str, query: Optional[dict] = None,
+) -> dict:
     """The only product call path to Treg: tagged, metered and auditable."""
     if not settings.treg_token:
         raise HTTPException(status_code=503, detail="Treg is not configured")
@@ -1236,6 +1238,7 @@ async def treg_call(endpoint_id: str, payload: dict, feature: str) -> dict:
         response = await client.post(
             f"{settings.treg_base_url.rstrip('/')}/call/{endpoint_id}",
             headers=headers,
+            params=query,
             json=payload,
         )
 
@@ -2484,10 +2487,19 @@ def transform_treg_person(record: dict, search_params: dict = None) -> dict:
     if isinstance(company, dict):
         company_name = company.get("name")
         company_domain = company.get("domain") or company.get("website")
+        company_industry = company.get("industry")
+        company_headcount = company.get("employeeCount") or company.get("employee_count")
     else:
         company_name = company
         company_domain = pick("company_domain", "companyDomain", "domain", "website")
+        company_industry = None
+        company_headcount = None
     phone, phone_type = pick_phone(r)
+    location = pick("location", "country")
+    if isinstance(location, dict):
+        location = ", ".join(
+            str(location.get(key)) for key in ("city", "state", "country")
+            if location.get(key)) or None
 
     return {
         "contact_name": name or None,
@@ -2499,11 +2511,15 @@ def transform_treg_person(record: dict, search_params: dict = None) -> dict:
         "email_status": pick("email_status", "emailStatus"),
         "phone": phone,
         "phone_type": phone_type,
-        "location": pick("location", "country"),
+        "location": location,
         "company_name": company_name,
         "company_domain": domain_host(company_domain or "") or None,
-        "industry": pick("industry", "company_industry") or search_params.get("industry"),
-        "company_size": pick("company_size", "headcount") or search_params.get("company_size"),
+        "industry": (pick("industry", "company_industry") or company_industry
+                     or search_params.get("industry")),
+        "company_size": (pick("company_size", "headcount")
+                         or (_size_bucket(company_headcount) if company_headcount else None)
+                         or search_params.get("company_size")),
+        "company_headcount": company_headcount,
         "company_revenue": pick("revenue", "company_revenue"),
         "company_funding": pick("funding", "company_funding"),
         "technologies": pick("technologies") or search_params.get("technologies"),
@@ -2545,18 +2561,78 @@ def build_treg_people_search(params: dict, limit: int) -> dict:
     return {k: v for k, v in payload.items() if v not in (None, "", [])}
 
 
-async def treg_person_search(params: dict, limit: int) -> dict:
+def build_treg_leadsforge_search(params: dict, limit: int) -> dict:
+    """Build an exact firmographic search for Treg's LeadsForge endpoint."""
+    unsupported = [
+        field for field in (
+            "intent_topics", "revenue_min", "revenue_max", "job_change_days", "signals",
+        ) if params.get(field)
+    ]
+    if unsupported:
+        raise ProviderUnsupported(", ".join(unsupported), "requested")
+
+    payload: dict = {"limit": max(min(int(limit or 10), 100), 1)}
+    if params.get("company_domain"):
+        payload["companyDomains"] = {"include": [domain_host(params["company_domain"])]}
+    elif params.get("company"):
+        payload["companyNames"] = {"include": [params["company"]]}
+    if params.get("company_size"):
+        low, high = _size_bounds(params["company_size"])
+        if low is None and high is None:
+            raise ProviderUnsupported("company_size", params["company_size"])
+        payload["companyEmployeeNumberRange"] = {
+            key: value for key, value in (("min", low), ("max", high))
+            if value is not None
+        }
+    if params.get("industry"):
+        payload["companyIndustries"] = {"include": [str(params["industry"]).lower()]}
+    if params.get("technologies"):
+        payload["companyTechnologies"] = {"any": params["technologies"]}
+    if params.get("keywords"):
+        payload["companyKeywords"] = {"include": [params["keywords"]]}
+    if params.get("job_title"):
+        payload["leadJobTitles"] = {"include": [params["job_title"]]}
+    if params.get("seniority"):
+        payload["leadSeniorities"] = {"include": [_canonical_seniority(params["seniority"])]}
+    if params.get("departments"):
+        payload["leadDepartments"] = {"include": params["departments"]}
+    if params.get("location"):
+        payload["leadLocations"] = {"include": [params["location"]]}
+    if params.get("company_location"):
+        payload["companyLocations"] = {"include": [params["company_location"]]}
+    payload["companyRequired"] = True
+    return payload
+
+
+def treg_search_plan(params: dict, limit: int) -> tuple[str, dict]:
+    """Choose the Treg lead endpoint that can express the requested ICP."""
+    needs_firmographics = any(
+        params.get(field) for field in ("company_size", "technologies", "departments"))
+    if needs_firmographics:
+        return "leadsforge.people.search", build_treg_leadsforge_search(params, limit)
+    return "treg.people.search", build_treg_people_search(params, limit)
+
+
+async def treg_person_search(params: dict, limit: int, cursor: str = None) -> dict:
+    endpoint_id, payload = treg_search_plan(params, limit)
     data = await treg_call(
-        "treg.people.search", build_treg_people_search(params, limit), "lead-search")
-    output = data.get("output") if isinstance(data, dict) else None
-    output = output if isinstance(output, dict) else {}
-    people = output.get("people") or []
+        endpoint_id, payload, "lead-search", query={"cursor": cursor} if cursor else None)
+    if endpoint_id == "leadsforge.people.search":
+        people = data.get("leads") or [] if isinstance(data, dict) else []
+        total = len(people)
+        next_cursor = data.get("cursor") if isinstance(data, dict) else None
+    else:
+        output = data.get("output") if isinstance(data, dict) else None
+        output = output if isinstance(output, dict) else {}
+        people = output.get("people") or []
+        total = output.get("total") or len(people)
+        next_cursor = output.get("next_cursor")
     if not isinstance(people, list):
         people = []
     return {
         "profiles": people,
-        "total": output.get("total") or len(people),
-        "next_cursor": output.get("next_cursor"),
+        "total": total,
+        "next_cursor": next_cursor,
     }
 
 
@@ -4994,7 +5070,8 @@ async def search_leads(request: SearchRequest):
             # and slice just like other non-cursor legs.
             skip = request.start_offset
             data = await treg_person_search(
-                params, max(min(params.get("limit", 10) + skip, 100), 1))
+                params, max(min(params.get("limit", 10) + skip, 100), 1),
+                cursor=provider_cursor)
             found = data["profiles"]
             if exclusions:
                 seen = {i for i in (linkedin_identity(u) for u in exclusions) if i}
