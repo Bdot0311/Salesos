@@ -53,6 +53,11 @@ class Settings(BaseSettings):
     treg_token: Optional[str] = None
     treg_org_id: Optional[str] = None
     treg_base_url: str = "https://treg.to"
+    # Used only when the caller has neither X-Customer-ID nor an authenticated
+    # identity. Prefer setting this to the product/account slug in server-to-
+    # server deployments. Browser traffic otherwise receives a pseudonymous,
+    # stable client identifier so Treg calls are never left unattributed.
+    treg_default_customer_id: Optional[str] = None
     # Protects the invoice and budget management endpoints below. It is
     # intentionally separate from TREG_TOKEN so callers never receive treg's
     # credential or team-level balance details.
@@ -1158,6 +1163,57 @@ def treg_request_context() -> dict:
     }
 
 
+def _jwt_subject(authorization: Optional[str]) -> Optional[str]:
+    """Read a stable subject from an already-authenticated bearer JWT.
+
+    This does not authenticate the request; that remains the API gateway's job.
+    It only avoids making a rotating access token itself the billing identity.
+    """
+    if not authorization or not authorization.lower().startswith("bearer "):
+        return None
+    token = authorization.split(None, 1)[1].strip()
+    parts = token.split(".")
+    if len(parts) != 3:
+        return None
+    try:
+        padded = parts[1] + "=" * (-len(parts[1]) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(padded).decode())
+    except Exception:
+        return None
+    for key in ("tenant_id", "organization_id", "org_id", "sub", "user_id"):
+        value = claims.get(key) if isinstance(claims, dict) else None
+        if value:
+            return str(value)
+    return None
+
+
+def treg_customer_id_from_request(request: Request) -> str:
+    """Resolve the most specific stable billing identity available.
+
+    Explicit tenant headers win. Authenticated JWT subjects are next. The final
+    fallback is a one-way client fingerprint (never the raw IP or user agent),
+    which keeps production searches working and attributable even for the
+    current caller that sends no tenant header.
+    """
+    explicit = request.headers.get("X-Customer-ID")
+    if explicit:
+        return explicit
+
+    subject = _jwt_subject(request.headers.get("Authorization"))
+    if subject:
+        digest = hashlib.sha256(subject.encode()).hexdigest()[:24]
+        return f"auth_{digest}"
+
+    if settings.treg_default_customer_id:
+        return settings.treg_default_customer_id
+
+    forwarded = (request.headers.get("X-Forwarded-For") or "").split(",", 1)[0].strip()
+    peer = forwarded or (request.client.host if request.client else "unknown")
+    agent = request.headers.get("User-Agent") or "unknown"
+    digest = hashlib.sha256(f"{peer}|{agent}".encode()).hexdigest()[:24]
+    return f"anon_{digest}"
+
+
 def _treg_meta_header(ctx: dict, feature: str) -> str:
     tags = [f"customer={ctx['customer_id']}", f"feature={feature}"]
     if ctx.get("workspace_id"):
@@ -1612,6 +1668,11 @@ def extract_json_object(text: str) -> dict:
 # Wiza Workflow: Create List → Poll → Fetch Contacts
 # =============================================================================
 
+def wiza_no_contacts(response: httpx.Response) -> bool:
+    """Wiza's empty-export sentinel is a successful zero-result outcome."""
+    return (response.status_code == 400
+            and "no contacts to export" in response.text.lower())
+
 async def fetch_from_wiza(params: dict) -> list:
     """
     Wiza three-step workflow:
@@ -1763,6 +1824,13 @@ async def fetch_from_wiza(params: dict) -> list:
         )
         print(f"Wiza contacts status: {contacts_resp.status_code}")
         print(f"Wiza contacts response: {contacts_resp.text[:400]}")
+
+        # Wiza reports an empty completed list as HTTP 400. That is a valid
+        # zero-result search, not a broken provider and not a reason to retry a
+        # second export segment that will return the same response.
+        if wiza_no_contacts(contacts_resp):
+            print("Wiza returned 0 contacts")
+            return []
 
         if contacts_resp.status_code not in (200, 201):
             # Try fetching all contacts if "valid" segment returns nothing
@@ -4253,7 +4321,7 @@ app.add_middleware(
 async def attach_treg_billing_context(request: Request, call_next):
     """Bind trusted tenant headers once; provider code never accepts model tags."""
     token = _treg_request_context.set({
-        "customer_id": request.headers.get("X-Customer-ID"),
+        "customer_id": treg_customer_id_from_request(request),
         "workspace_id": request.headers.get("X-Workspace-ID"),
         "idempotency_key": request.headers.get("Idempotency-Key"),
     })
@@ -5135,29 +5203,20 @@ async def search_leads(request: SearchRequest):
         total = len(found)
         return (found[skip:] if skip else found), total, None
 
-    # Every configured provider runs, and everything they surface is shown.
-    #
-    # This used to stop at the first provider that returned anything, so the
-    # rest never contributed: a search Bytemine could answer thinly never saw
-    # the deeper matches Crustdata had for the same ICP. They hold different
-    # data, which is the reason for having more than one — so they are called
-    # together and their results merged, and a provider that returns nothing
-    # simply adds nothing rather than deciding the search for everyone else.
-    #
-    # Concurrent because they are independent network calls; sequentially this
-    # would cost the sum of three timeouts on a bad day.
-    outcomes = await asyncio.gather(
-        *(run_provider(name) for name in chain), return_exceptions=True,
-    )
-
     attempts: list = []
     buckets: list = []
     refused: dict[str, str] = {}
     failures: dict[str, object] = {}
     ran = False
 
-    for name, outcome in zip(chain, outcomes):
-        if isinstance(outcome, ProviderUnsupported):
+    # True waterfall: call one provider at a time, in configured order. Move to
+    # the next leg only when the current one cannot express the ICP, errors, or
+    # returns no matches. The first leg with results wins and stops the chain,
+    # avoiding duplicate spend and unnecessary calls to lower-priority tools.
+    for name in chain:
+        try:
+            outcome = await run_provider(name)
+        except ProviderUnsupported as outcome:
             # This provider cannot express one of the requested filters. It sits
             # this search out; the others still answer it.
             print(f"{name} cannot express {outcome} — it contributes nothing here")
@@ -5165,13 +5224,13 @@ async def search_leads(request: SearchRequest):
             attempts.append({"provider": name, "outcome": "unsupported_filter",
                              "detail": outcome.field})
             continue
-        if isinstance(outcome, HTTPException):
+        except HTTPException as outcome:
             print(f"{name} failed ({outcome.status_code})")
             failures[name] = outcome
             attempts.append({"provider": name, "outcome": "error",
                              "detail": outcome.status_code})
             continue
-        if isinstance(outcome, BaseException):
+        except Exception as outcome:
             print(f"{name} raised {type(outcome).__name__}: {outcome}")
             failures[name] = outcome
             attempts.append({"provider": name, "outcome": "error", "detail": "exception"})
@@ -5185,6 +5244,8 @@ async def search_leads(request: SearchRequest):
         if found or provider_cursor:
             buckets.append({"provider": name, "profiles": found,
                             "total": provider_total, "next_cursor": provider_cursor})
+        if found:
+            break
 
     # Nothing ran at all. Distinguish the two ways that happens: every provider
     # refused the filter, or every provider errored. An empty success would
