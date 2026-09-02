@@ -1,6 +1,7 @@
 import json
 import os
 import unittest
+import base64
 from unittest.mock import AsyncMock, patch
 
 os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost/test")
@@ -376,6 +377,38 @@ class TregProviderTests(unittest.IsolatedAsyncioTestCase):
             main._treg_request_context.reset(context_token)
         self.assertEqual(raised.exception.status_code, 400)
 
+    def test_explicit_customer_header_wins(self):
+        request = main.Request({
+            "type": "http", "method": "GET", "path": "/",
+            "headers": [(b"x-customer-id", b"cust_8123")],
+            "client": ("127.0.0.1", 1234),
+        })
+        self.assertEqual(main.treg_customer_id_from_request(request), "cust_8123")
+
+    def test_authenticated_customer_is_stable_without_custom_header(self):
+        claims = base64.urlsafe_b64encode(
+            json.dumps({"sub": "user-42"}).encode()).decode().rstrip("=")
+        token = f"ignored.{claims}.ignored"
+        request = main.Request({
+            "type": "http", "method": "GET", "path": "/",
+            "headers": [(b"authorization", f"Bearer {token}".encode())],
+            "client": ("127.0.0.1", 1234),
+        })
+        customer = main.treg_customer_id_from_request(request)
+        self.assertRegex(customer, r"^auth_[0-9a-f]{24}$")
+        self.assertEqual(customer, main.treg_customer_id_from_request(request))
+
+    def test_anonymous_request_gets_pseudonymous_attribution(self):
+        request = main.Request({
+            "type": "http", "method": "GET", "path": "/",
+            "headers": [(b"user-agent", b"salesos-test")],
+            "client": ("203.0.113.7", 1234),
+        })
+        with patch.object(main.settings, "treg_default_customer_id", None):
+            customer = main.treg_customer_id_from_request(request)
+        self.assertRegex(customer, r"^anon_[0-9a-f]{24}$")
+        self.assertNotIn("203.0.113.7", customer)
+
     async def test_invoice_usage_comes_from_the_reconciled_treg_ledger(self):
         class Response:
             is_error = False
@@ -655,7 +688,7 @@ class ProviderFallbackTests(unittest.IsolatedAsyncioTestCase):
                 p.stop()
         return response, calls
 
-    async def test_a_typed_query_does_not_sideline_providers(self):
+    async def test_a_typed_query_uses_the_first_successful_provider(self):
         """The regression the logs caught.
 
         Every search from the UI carries the user's sentence, and both Bytemine
@@ -673,16 +706,12 @@ class ProviderFallbackTests(unittest.IsolatedAsyncioTestCase):
              "wiza": [{"full_name": "Alan T", "company": "Bletchley"}]},
         )
 
-        self.assertEqual(sorted(calls), ["bytemine", "crustdata", "wiza"])
+        self.assertEqual(calls, ["bytemine"])
         outcomes = {a["provider"]: a["outcome"] for a in response.provider_attempts}
         self.assertNotIn("unsupported_filter", outcomes.values())
-        self.assertEqual(response.count, 3)
+        self.assertEqual(response.count, 1)
 
-    async def test_every_provider_contributes_to_one_merged_result(self):
-        # The providers hold different data, which is the reason for having more
-        # than one. Stopping at the first that returned anything meant a search
-        # Bytemine could answer thinly never saw what Crustdata had for the same
-        # ICP.
+    async def test_first_success_stops_the_waterfall(self):
         response, calls = await self.run_search(
             main.SearchRequest(job_title="VP of Sales", location="CA"),
             {"bytemine": {"profiles": [{"pid": "1", "first_name": "Ada"}],
@@ -691,9 +720,9 @@ class ProviderFallbackTests(unittest.IsolatedAsyncioTestCase):
                            "total": 1, "next_cursor": None}},
         )
 
-        self.assertEqual(sorted(calls), ["bytemine", "crustdata"])
-        self.assertEqual(response.provider, "bytemine+crustdata")
-        self.assertEqual(response.count, 2)
+        self.assertEqual(calls, ["bytemine"])
+        self.assertEqual(response.provider, "bytemine")
+        self.assertEqual(response.count, 1)
         self.assertIn("Ada", [l["contact_name"] for l in response.leads])
 
     async def test_a_provider_with_nothing_does_not_decide_the_search(self):
@@ -781,16 +810,15 @@ class ProviderFallbackTests(unittest.IsolatedAsyncioTestCase):
         outcomes = {a["provider"]: a["outcome"] for a in response.provider_attempts}
         self.assertEqual(outcomes["bytemine"], "no_results")
 
-    async def test_a_bad_request_surfaces(self):
-        # A 400 is about the query, not the provider. With nothing to merge, it
-        # reaches the caller instead of becoming an empty page.
-        with self.assertRaises(HTTPException) as ctx:
-            await self.run_search(
-                main.SearchRequest(job_title="VP of Sales", location="CA"),
-                {"bytemine": HTTPException(status_code=400, detail="bad filter"),
-                 "crustdata": AssertionError("must not be reached")},
-            )
-        self.assertEqual(ctx.exception.status_code, 400)
+    async def test_a_provider_bad_request_falls_through(self):
+        response, calls = await self.run_search(
+            main.SearchRequest(job_title="VP of Sales", location="CA"),
+            {"bytemine": HTTPException(status_code=400, detail="bad filter"),
+             "crustdata": {"profiles": [{"crustdata_person_id": 9}],
+                            "total": 1, "next_cursor": None}},
+        )
+        self.assertEqual(calls, ["bytemine", "crustdata"])
+        self.assertEqual(response.provider, "crustdata")
 
     async def test_every_provider_failing_is_reported(self):
         # Nobody answered, so the error must reach the caller rather than being
@@ -803,6 +831,22 @@ class ProviderFallbackTests(unittest.IsolatedAsyncioTestCase):
                  "wiza": HTTPException(status_code=503, detail="wiza down")},
             )
         self.assertIn(ctx.exception.status_code, (402, 500, 503))
+
+
+class WizaEmptyExportTests(unittest.TestCase):
+    def test_no_contacts_export_is_a_zero_result_not_an_error(self):
+        response = type("Response", (), {
+            "status_code": 400,
+            "text": '{"message":"No contacts to export."}',
+        })()
+        self.assertTrue(main.wiza_no_contacts(response))
+
+    def test_other_400s_are_not_hidden(self):
+        response = type("Response", (), {
+            "status_code": 400,
+            "text": '{"message":"Invalid list"}',
+        })()
+        self.assertFalse(main.wiza_no_contacts(response))
 
 
 class PaginationTests(unittest.TestCase):
