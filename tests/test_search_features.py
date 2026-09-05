@@ -2214,6 +2214,169 @@ class GetleadsChainTests(unittest.TestCase):
             self.assertIn("getleads", main.provider_chain())
 
 
+class GetleadsRepeatLeadTests(unittest.IsolatedAsyncioTestCase):
+    """Every search must surface people the user has not been shown before.
+
+    start_offset is zero on every fresh search — the frontend sends page 1 each
+    time — so this leg fetched the same first rows for the same ICP and then
+    removed the ones already seen. Re-run the same ICP and that page is entirely
+    seen: the provider still answers and still bills, and the user gets nothing
+    new. It is the one leg with a real offset, so it can go and look further in.
+    """
+
+    def _pages(self, pages):
+        """Stub getleads_person_search: a dict of offset -> rows."""
+        seen_offsets: list = []
+
+        async def search(params, limit, offset=0):
+            seen_offsets.append(offset)
+            rows = pages.get(offset, [])
+            nxt = offset + limit
+            return {"profiles": rows, "total": sum(len(p) for p in pages.values()),
+                    "next_offset": nxt if nxt in pages else None}
+
+        return search, seen_offsets
+
+    async def run_search(self, request, pages):
+        search, offsets = self._pages(pages)
+
+        async def no_cache(_hash):
+            return None
+
+        async def no_store(*args, **kwargs):
+            return None
+
+        patches = [
+            patch.object(main.settings, "getleads_api_key", "glb_live_x"),
+            patch.object(main, "provider_chain", lambda: ("getleads",)),
+            patch.object(main, "getleads_person_search", search),
+            patch.object(main, "cache_lookup", no_cache),
+            patch.object(main, "cache_store", no_store),
+        ]
+        for p in patches:
+            p.start()
+        try:
+            return await main.search_leads(request), offsets
+        finally:
+            for p in patches:
+                p.stop()
+
+    def _row(self, slug):
+        return {"first_name": slug, "last_name": "X", "job_title": "Founder",
+                "org_company_name": "Acme", "org_domain": "acme.com",
+                "person_linkedin_url": f"https://www.linkedin.com/in/{slug}"}
+
+    async def test_a_fully_seen_page_pages_forward_instead_of_returning_nothing(self):
+        response, offsets = await self.run_search(
+            main.SearchRequest(
+                job_title="Founder", industry="computer software", limit=2,
+                exclude_profiles=["https://www.linkedin.com/in/ada",
+                                  "https://www.linkedin.com/in/bob"]),
+            {0: [self._row("ada"), self._row("bob")],
+             2: [self._row("cleo"), self._row("dev")]},
+        )
+
+        self.assertEqual(offsets, [0, 2])
+        names = [lead["first_name"] for lead in response.leads]
+        self.assertEqual(names, ["cleo", "dev"])
+
+    async def test_a_page_of_new_people_costs_exactly_one_call(self):
+        # Paging is for when there is nothing new, not something to do always:
+        # this provider bills per record returned.
+        response, offsets = await self.run_search(
+            main.SearchRequest(job_title="Founder", industry="computer software",
+                               limit=2),
+            {0: [self._row("ada"), self._row("bob")],
+             2: [self._row("cleo")]},
+        )
+
+        self.assertEqual(offsets, [0])
+        self.assertEqual([lead["first_name"] for lead in response.leads],
+                         ["ada", "bob"])
+
+    async def test_paging_is_bounded_rather_than_walking_the_index(self):
+        seen = [f"https://www.linkedin.com/in/p{i}" for i in range(20)]
+        pages = {i: [self._row(f"p{i}")] for i in range(0, 20)}
+
+        _, offsets = await self.run_search(
+            main.SearchRequest(job_title="Founder", industry="computer software",
+                               limit=1, exclude_profiles=seen),
+            pages,
+        )
+
+        self.assertEqual(len(offsets), main.GETLEADS_MAX_PAGES)
+
+    async def test_running_out_of_rows_stops_the_walk(self):
+        response, offsets = await self.run_search(
+            main.SearchRequest(job_title="Founder", industry="computer software",
+                               limit=2,
+                               exclude_profiles=["https://www.linkedin.com/in/ada"]),
+            {0: [self._row("ada")]},
+        )
+
+        self.assertEqual(offsets, [0])
+        self.assertEqual(response.leads, [])
+
+
+class RecoveredSegmentTermTests(unittest.IsolatedAsyncioTestCase):
+    """The AI in "B2B AI SaaS founders" has to reach the provider answering.
+
+    Only Crustdata reads semantic_query. When it returns nothing — which is most
+    searches — the leg that actually answers saw job_title + industry and
+    nothing else, so the user got any founder at any small software company
+    anywhere and reasonably said the leads were not what they searched for.
+    """
+
+    async def resolve(self, **kwargs):
+        return await main.resolve_search_params(main.SearchRequest(**kwargs))
+
+    async def test_the_segment_is_recovered_from_the_sentence(self):
+        params = await self.resolve(
+            query="Founders at B2B AI SaaS companies with a team size of 1-10",
+            job_title="Founder", industry="computer software", company_size="1-10")
+
+        self.assertEqual(params["semantic_keywords"], "ai saas")
+
+    async def test_it_is_not_promoted_to_a_stated_keyword(self):
+        # keywords means "a criterion the user stated", and a provider with no
+        # free-text field refuses the whole search rather than drop one. A term
+        # lifted out of the sentence must not sideline Wiza.
+        params = await self.resolve(
+            query="Founders at AI SaaS companies", job_title="Founder",
+            industry="computer software")
+
+        self.assertNotIn("keywords", params)
+        main.build_wiza_filters(params)  # does not raise
+
+    async def test_a_stated_keyword_is_left_alone(self):
+        params = await self.resolve(
+            query="Founders at AI SaaS companies", job_title="Founder",
+            keywords="devtools")
+
+        self.assertEqual(params["keywords"], "devtools")
+        self.assertNotIn("semantic_keywords", params)
+
+    async def test_a_sentence_with_no_segment_term_adds_nothing(self):
+        params = await self.resolve(
+            query="heads of RevOps at fintechs", job_title="VP Sales",
+            industry="financial services")
+
+        self.assertNotIn("semantic_keywords", params)
+
+    def test_getleads_matches_it_against_company_descriptions(self):
+        f = main.build_getleads_filters(
+            {"job_title": "Founder", "semantic_keywords": "ai saas"})
+
+        self.assertEqual(f["company_description"], "ai saas")
+
+    def test_a_stated_keyword_still_wins(self):
+        f = main.build_getleads_filters(
+            {"job_title": "Founder", "keywords": "devtools",
+             "semantic_keywords": "ai saas"})
+
+        self.assertEqual(f["company_description"], "devtools")
+
+
 class FindymailClient:
     """Fake httpx client for Findymail: answers per (method, path)."""
     routes = {}
