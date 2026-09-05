@@ -33,9 +33,12 @@ class CrustdataFilterTests(unittest.TestCase):
         by_field = {condition["field"]: condition for condition in conditions}
 
         self.assertEqual(by_field["basic_profile.location.country"]["value"], "United States")
+        # company_industries is LinkedIn's vocabulary — "Computer Software".
+        # This used to assert the raw lowercase term went through untranslated,
+        # which is a contains match on a string the field never holds.
         self.assertEqual(
             by_field["experience.employment_details.current.company_industries"]["value"],
-            "computer software",
+            "Computer Software",
         )
         self.assertEqual(
             by_field["experience.employment_details.current.seniority_level"]["value"],
@@ -2395,6 +2398,54 @@ class FindymailFindEmailTests(unittest.IsolatedAsyncioTestCase):
                 linkedin_url="https://www.linkedin.com/in/seb-hall")
 
         self.assertEqual(contact, {})
+
+
+class FindymailDomainTests(unittest.TestCase):
+    """/api/search/name needs a mail domain, not a company name."""
+
+    def test_a_company_name_is_not_a_domain(self):
+        # Production sent domain="Uncapped" for every lead known only by name.
+        self.assertIsNone(main.findymail_domain_for(None, "Uncapped"))
+        self.assertIsNone(main.findymail_domain_for(None, "Cloud Employee"))
+
+    def test_a_real_domain_is_used(self):
+        self.assertEqual(main.findymail_domain_for("acme.com", "Acme"), "acme.com")
+
+    def test_a_company_field_holding_a_domain_still_counts(self):
+        # The UI puts a domain in either field depending on the provider.
+        self.assertEqual(main.findymail_domain_for(None, "acme.com"), "acme.com")
+
+    def test_a_url_is_reduced_to_its_host(self):
+        self.assertEqual(
+            main.findymail_domain_for("https://www.acme.com/about", None), "acme.com")
+
+    def test_nothing_at_all_is_none(self):
+        self.assertIsNone(main.findymail_domain_for(None, None))
+
+
+class LinkedInIndustryTests(unittest.TestCase):
+    """Bytemine and Crustdata both name industries the way LinkedIn does."""
+
+    def test_our_lowercase_term_becomes_their_spelling(self):
+        self.assertEqual(main.linkedin_industry("computer software"), "Computer Software")
+        self.assertEqual(main.linkedin_industry("financial services"), "Financial Services")
+
+    def test_their_spelling_survives_unchanged(self):
+        self.assertEqual(main.linkedin_industry("Computer Software"), "Computer Software")
+
+    def test_an_unknown_industry_is_none_rather_than_a_guess(self):
+        self.assertIsNone(main.linkedin_industry("vertical ai agents"))
+
+    def test_bytemine_still_refuses_what_it_cannot_map(self):
+        # Crustdata passes an unmapped term through; Bytemine's is an enum, so
+        # it steps aside instead of zeroing the search silently.
+        with self.assertRaises(main.ProviderUnsupported):
+            main.build_bytemine_filters({"job_title": "Founder",
+                                         "industry": "vertical ai agents"})
+
+    def test_crustdata_passes_an_unmapped_industry_through(self):
+        filters = main.build_crustdata_filters({"industry": "vertical ai agents"})
+        self.assertEqual(filters["value"], "vertical ai agents")
 
 
 class FindymailVerifyTests(unittest.IsolatedAsyncioTestCase):

@@ -2844,6 +2844,21 @@ async def findymail_call(method: str, path: str, *, json_body: dict = None,
             return resp.status_code, None
 
 
+def findymail_domain_for(domain: str = None, company: str = None) -> Optional[str]:
+    """A real mail domain for /api/search/name, or None when we only have a name.
+
+    /api/search/name matches a person against a company's mail domain, so it
+    needs an actual domain. Falling back to the company name sent it strings
+    like "Uncapped", which cannot resolve: the leg was a guaranteed miss on
+    every lead we knew only by name, which is most of them. Worse than wasted —
+    a garbage domain that did match would hand back somebody else's address.
+    """
+    for candidate in (domain, company):
+        if candidate and looks_like_domain(candidate):
+            return domain_host(candidate) or candidate
+    return None
+
+
 async def findymail_find_email(*, linkedin_url: str = None, name: str = None,
                                domain: str = None) -> dict:
     """Find one verified email. Returns {} when nothing was found.
@@ -3716,8 +3731,15 @@ _BM_INDUSTRY = {
 }
 
 
-def bytemine_industry(value: str) -> Optional[str]:
-    """Bytemine's spelling of an industry, or None when we cannot map it."""
+def linkedin_industry(value: str) -> Optional[str]:
+    """The LinkedIn spelling of an industry, or None when we cannot map it.
+
+    The table above is LinkedIn's industry vocabulary, not something private to
+    one provider: Bytemine names industries this way, and so does Crustdata's
+    company_industries — the field transform_crustdata_profile reads straight
+    back out as a display value. We hold industries lowercase PDL-style, so
+    anything crossing into either provider has to be translated first.
+    """
     key = str(value or "").strip().lower()
     if not key:
         return None
@@ -3727,6 +3749,11 @@ def bytemine_industry(value: str) -> Optional[str]:
     if value in _BM_INDUSTRY.values():
         return value
     return None
+
+
+def bytemine_industry(value: str) -> Optional[str]:
+    """Bytemine's spelling of an industry, or None when we cannot map it."""
+    return linkedin_industry(value)
 
 
 def build_bytemine_filters(p: dict) -> dict:
@@ -4189,7 +4216,20 @@ def build_crustdata_filters(p: dict):
         })
 
     if p.get("industry"):
-        conds.append({"field": _CD_INDUSTRY, "type": "(.)", "value": p["industry"]})
+        # company_industries holds LinkedIn's industry names — "Computer
+        # Software", not our lowercase PDL-style "computer software". Sent
+        # through unmapped, a contains match looks for a string that is not
+        # written anywhere in the field, and the whole AND collapses to zero
+        # rows while still reporting a successful search. Every other provider
+        # in the chain translates industry into its own taxonomy; this one was
+        # the exception.
+        #
+        # Unlike Bytemine an unmappable industry is not refused here: this is a
+        # contains match rather than an enum, and Crustdata is the only
+        # provider that can express a country, so refusing would cost more than
+        # a broad match. The raw term is passed through as before.
+        conds.append({"field": _CD_INDUSTRY, "type": "(.)",
+                      "value": linkedin_industry(p["industry"]) or p["industry"]})
 
     if p.get("company_size"):
         lo, hi = _size_bounds(p["company_size"])
@@ -4984,14 +5024,14 @@ async def enrich_lead(request: EnrichRequest):
     # It is also the natural partner to a ColdIQ lead, which can arrive as
     # nothing but a LinkedIn URL — that URL is exactly what
     # /api/search/business-profile takes.
+    findymail_domain = findymail_domain_for(request.company_domain, request.company)
     if "findymail" in chain and (
-        request.linkedin_url
-        or (request.full_name and (request.company_domain or request.company))
+        request.linkedin_url or (request.full_name and findymail_domain)
     ):
         contact = await findymail_find_email(
             linkedin_url=request.linkedin_url,
             name=request.full_name,
-            domain=request.company_domain or request.company)
+            domain=findymail_domain)
         if contact.get("email"):
             lead = await verify_revealed_lead({
                 "contact_name": contact.get("name") or request.full_name,
