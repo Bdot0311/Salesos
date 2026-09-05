@@ -2211,5 +2211,349 @@ class GetleadsChainTests(unittest.TestCase):
             self.assertIn("getleads", main.provider_chain())
 
 
+class FindymailClient:
+    """Fake httpx client for Findymail: answers per (method, path)."""
+    routes = {}
+    calls = []
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def request(self, method, url, headers=None, json=None, params=None):
+        path = url.replace(main.FINDYMAIL_BASE, "")
+        self.__class__.calls.append((method, path, json, params))
+        key = (method, path)
+        status, payload = self.__class__.routes.get(key, (404, {}))
+        if callable(payload):
+            payload = payload(len([c for c in self.__class__.calls if c[1] == path]))
+        return RoutedResponse(status, payload)
+
+    @classmethod
+    def reset(cls, routes=None):
+        cls.routes = routes or {}
+        cls.calls = []
+
+
+def _fm(**env):
+    """Patch settings for a Findymail test."""
+    return patch.multiple(main.settings, findymail_api_key="fm_key", **env)
+
+
+class FindymailSearchBodyTests(unittest.TestCase):
+    """Intellimatch takes a sentence about companies, not a filter object."""
+
+    def test_the_users_own_sentence_is_used_verbatim(self):
+        # This is the one provider in the chain that wants the raw request.
+        query = main.findymail_intellimatch_query(
+            {"semantic_query": "Founders at B2B AI SaaS companies", "industry": "computer software"})
+
+        self.assertEqual(query, "Founders at B2B AI SaaS companies")
+
+    def test_structured_filters_are_written_back_out_as_a_sentence(self):
+        query = main.findymail_intellimatch_query(
+            {"industry": "computer software", "company_size": "1-10",
+             "location": "United States"})
+
+        self.assertEqual(
+            query, "computer software companies with 1-10 employees in United States")
+
+    def test_a_search_with_nothing_to_describe_companies_by_is_refused(self):
+        # An empty query is rejected by Findymail, and a bare job title
+        # describes a person rather than a company.
+        with self.assertRaises(main.ProviderUnsupported):
+            main.build_findymail_search({"job_title": "Founder"}, 10)
+
+    def test_require_email_is_on_so_a_miss_costs_nothing(self):
+        body = main.build_findymail_search({"semantic_query": "AI SaaS"}, 6)
+
+        self.assertTrue(body["config"]["require_email"])
+        self.assertTrue(body["config"]["find_contact"])
+        self.assertTrue(body["config"]["find_email"])
+
+    def test_the_job_title_becomes_the_first_tier_not_an_alternative(self):
+        body = main.build_findymail_search(
+            {"semantic_query": "AI SaaS", "job_title": "Founder"}, 6)
+
+        # Tiers are fallbacks: tier two is only tried when tier one finds
+        # nobody, so a flat list would change the meaning.
+        self.assertEqual(body["config"]["target_job_titles"], [["Founder"]])
+        self.assertEqual(body["config"]["mode"], "targeted")
+
+    def test_the_limit_is_clamped_to_their_documented_ceiling(self):
+        self.assertEqual(main.build_findymail_search({"semantic_query": "x"}, 99999)["limit"], 5000)
+        self.assertEqual(main.build_findymail_search({"semantic_query": "x"}, 0)["limit"], 1)
+
+
+class FindymailTransformTests(unittest.TestCase):
+    def test_the_documented_row_shape(self):
+        lead = main.transform_findymail_row({
+            "name": "Acme Corp", "domain": "acme.com",
+            "employee_count_range": "51-200", "industries": ["Technology", "Software"],
+            "country": "FR", "match_score": 95,
+            "contact_name": "John Doe", "contact_email": "john.doe@acme.com",
+            "contact_job_title": "CEO", "contact_phone": "+33 6 12 34 56 78",
+            "contact_linkedin_url": "https://www.linkedin.com/in/johndoe",
+        })
+
+        self.assertEqual(lead["contact_name"], "John Doe")
+        self.assertEqual(lead["first_name"], "John")
+        self.assertEqual(lead["last_name"], "Doe")
+        self.assertEqual(lead["business_email"], "john.doe@acme.com")
+        self.assertEqual(lead["company_name"], "Acme Corp")
+        self.assertEqual(lead["company_domain"], "acme.com")
+        self.assertEqual(lead["job_title"], "CEO")
+        self.assertEqual(lead["company_size"], "51-200")
+        self.assertEqual(lead["industry"], "Technology")
+        self.assertEqual(lead["provider"], "findymail")
+        self.assertEqual(lead["phone"], "+33 6 12 34 56 78")
+
+    def test_their_match_score_is_carried_not_adopted_as_ours(self):
+        # It measures how well the company fits the query, which is not what
+        # our fit score measures. One provider's number must not become ours.
+        lead = main.transform_findymail_row({"name": "Acme", "match_score": 95})
+
+        self.assertEqual(lead["match_score"], 95)
+        self.assertNotIn("icp_score", lead)
+
+    def test_an_empty_row_yields_nulls_rather_than_junk(self):
+        lead = main.transform_findymail_row({})
+
+        self.assertIsNone(lead["contact_name"])
+        self.assertIsNone(lead["business_email"])
+        self.assertFalse(lead["phone_available"])
+
+    def test_a_findymail_row_is_trackable_so_it_is_not_shown_twice(self):
+        row = {"contact_linkedin_url": "https://www.linkedin.com/in/johndoe"}
+
+        self.assertEqual(main._profile_url(row),
+                         "https://www.linkedin.com/in/johndoe")
+        self.assertEqual(main.linkedin_identity(main._profile_url(row)), "in/johndoe")
+
+
+class FindymailFindEmailTests(unittest.IsolatedAsyncioTestCase):
+    """The reveal leg. Charged only on a found email, so a miss costs nothing."""
+
+    async def test_a_linkedin_url_is_tried_first(self):
+        # It identifies a person exactly; name plus domain can land on the
+        # wrong person at a big company.
+        FindymailClient.reset({
+            ("POST", "/api/search/business-profile"):
+                (200, {"contact": {"name": "Seb Hall", "domain": "cloudemployee.co.uk",
+                                   "email": "seb.hall@cloudemployee.co.uk"}}),
+        })
+        with patch.object(main.httpx, "AsyncClient", FindymailClient), _fm():
+            contact = await main.findymail_find_email(
+                linkedin_url="https://www.linkedin.com/in/seb-hall",
+                name="Seb Hall", domain="cloudemployee.co.uk")
+
+        self.assertEqual(contact["email"], "seb.hall@cloudemployee.co.uk")
+        # Name search never ran — the first identifier answered.
+        self.assertEqual([c[1] for c in FindymailClient.calls],
+                         ["/api/search/business-profile"])
+
+    async def test_it_falls_back_to_name_and_domain(self):
+        FindymailClient.reset({
+            ("POST", "/api/search/business-profile"): (200, {"contact": None}),
+            ("POST", "/api/search/name"):
+                (200, {"contact": {"name": "Ada Lovelace", "domain": "acme.com",
+                                   "email": "ada@acme.com"}}),
+        })
+        with patch.object(main.httpx, "AsyncClient", FindymailClient), _fm():
+            contact = await main.findymail_find_email(
+                linkedin_url="https://www.linkedin.com/in/ada",
+                name="Ada Lovelace", domain="acme.com")
+
+        self.assertEqual(contact["email"], "ada@acme.com")
+        self.assertEqual([c[1] for c in FindymailClient.calls],
+                         ["/api/search/business-profile", "/api/search/name"])
+
+    async def test_a_miss_is_nothing_rather_than_an_error(self):
+        FindymailClient.reset({
+            ("POST", "/api/search/business-profile"): (200, {"contact": None}),
+            ("POST", "/api/search/name"): (200, {"contact": None}),
+        })
+        with patch.object(main.httpx, "AsyncClient", FindymailClient), _fm():
+            contact = await main.findymail_find_email(
+                linkedin_url="https://x/in/a", name="A B", domain="acme.com")
+
+        self.assertEqual(contact, {})
+
+    async def test_out_of_credits_does_not_raise(self):
+        # 402 is a state of their account, not a failure of this request; a leg
+        # that raises takes the whole reveal down with it.
+        FindymailClient.reset({
+            ("POST", "/api/search/business-profile"): (402, {"error": "Not enough credits"}),
+        })
+        with patch.object(main.httpx, "AsyncClient", FindymailClient), _fm():
+            contact = await main.findymail_find_email(
+                linkedin_url="https://www.linkedin.com/in/seb-hall")
+
+        self.assertEqual(contact, {})
+
+
+class FindymailVerifyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_a_verified_address_is_deliverable_and_sendable(self):
+        FindymailClient.reset({
+            ("POST", "/api/verify"):
+                (200, {"email": "john@example.com", "verified": True, "provider": "Google"}),
+        })
+        with patch.object(main.httpx, "AsyncClient", FindymailClient), _fm():
+            verdict = await main.findymail_verify_email("john@example.com")
+
+        self.assertEqual(verdict["status"], "deliverable")
+        self.assertTrue(verdict["sendable"])
+        self.assertEqual(verdict["checked_by"], "findymail")
+        self.assertEqual(verdict["vendor"], "Google")
+
+    async def test_an_unverified_address_is_undeliverable(self):
+        FindymailClient.reset({
+            ("POST", "/api/verify"): (200, {"email": "x@y.com", "verified": False}),
+        })
+        with patch.object(main.httpx, "AsyncClient", FindymailClient), _fm():
+            verdict = await main.findymail_verify_email("x@y.com")
+
+        self.assertEqual(verdict["status"], "undeliverable")
+        self.assertFalse(verdict["sendable"])
+
+    async def test_nothing_is_invented_between_the_two(self):
+        # Findymail returns a bare boolean, with none of ColdIQ's catch-all or
+        # role detail. An error is unknown, never a guess either way.
+        FindymailClient.reset({("POST", "/api/verify"): (402, {"error": "Not enough credits"})})
+        with patch.object(main.httpx, "AsyncClient", FindymailClient), _fm():
+            verdict = await main.findymail_verify_email("x@y.com")
+
+        self.assertEqual(verdict["status"], "unknown")
+        self.assertIsNone(verdict["sendable"])
+        self.assertIn("credits", verdict["reason"])
+
+
+class FindymailVerifierFallbackTests(unittest.IsolatedAsyncioTestCase):
+    """ColdIQ is the primary checker and the one that runs out of credits.
+
+    Production spent weeks answering "unknown" for every address because of it.
+    """
+
+    async def test_findymail_answers_when_coldiq_cannot(self):
+        FindymailClient.reset({
+            ("POST", "/api/verify"): (200, {"email": "a@b.com", "verified": True}),
+        })
+        with patch.object(main.httpx, "AsyncClient", FindymailClient), \
+             patch.object(main, "coldiq_verify_email", AsyncMock(return_value={
+                 "status": "unknown", "sendable": None, "checked_by": "coldiq",
+                 "reason": "coldiq returned no verdict"})), _fm():
+            lead = await main.verify_revealed_lead(
+                {"business_email": "a@b.com"}, "coldiq")
+
+        self.assertEqual(lead["email_verification"]["checked_by"], "findymail")
+        self.assertTrue(lead["email_verified"])
+        # The reason ColdIQ could not answer is kept, not thrown away.
+        self.assertIn("fell_back_from", lead["email_verification"])
+
+    async def test_a_coldiq_verdict_is_not_second_guessed(self):
+        FindymailClient.reset({})
+        with patch.object(main.httpx, "AsyncClient", FindymailClient), \
+             patch.object(main, "coldiq_verify_email", AsyncMock(return_value={
+                 "status": "undeliverable", "sendable": False, "checked_by": "coldiq"})), _fm():
+            lead = await main.verify_revealed_lead(
+                {"business_email": "a@b.com"}, "coldiq")
+
+        self.assertEqual(lead["email_verification"]["checked_by"], "coldiq")
+        self.assertFalse(lead["email_verified"])
+        self.assertEqual(FindymailClient.calls, [])
+
+    async def test_no_email_costs_no_call_to_either(self):
+        FindymailClient.reset({})
+        with patch.object(main.httpx, "AsyncClient", FindymailClient), _fm():
+            lead = await main.verify_revealed_lead({"contact_name": "Ada"}, "wiza")
+
+        self.assertEqual(lead["email_verification"]["status"], "unverified")
+        self.assertEqual(FindymailClient.calls, [])
+
+
+class FindymailSearchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_submit_poll_then_page(self):
+        FindymailClient.reset({
+            ("POST", "/api/intellimatch/search"): (200, {"hash": "abc123"}),
+            ("GET", "/api/intellimatch/status"): (200, {"status": "success"}),
+            ("GET", "/api/intellimatch/data"): (200, {
+                "data": [{"name": "Acme", "contact_email": "a@acme.com",
+                          "contact_name": "Ada Lovelace"}],
+                "meta": {"total": 1}}),
+        })
+        with patch.object(main.httpx, "AsyncClient", FindymailClient), \
+             patch.object(main, "FINDYMAIL_POLL_INTERVAL", 0), _fm():
+            data = await main.findymail_person_search({"semantic_query": "AI SaaS"}, 6)
+
+        self.assertEqual(len(data["profiles"]), 1)
+        self.assertEqual([c[1] for c in FindymailClient.calls],
+                         ["/api/intellimatch/search", "/api/intellimatch/status",
+                          "/api/intellimatch/data"])
+
+    async def test_a_task_that_never_finishes_returns_what_it_has(self):
+        # The credits are spent when the task runs, so partial results beat
+        # nothing — and the hash stays collectable afterwards.
+        FindymailClient.reset({
+            ("POST", "/api/intellimatch/search"): (200, {"hash": "abc123"}),
+            ("GET", "/api/intellimatch/status"): (200, {"status": "processing", "progress": 40}),
+            ("GET", "/api/intellimatch/data"): (200, {"data": [{"name": "Acme"}], "meta": {"total": 9}}),
+        })
+        with patch.object(main.httpx, "AsyncClient", FindymailClient), \
+             patch.object(main, "FINDYMAIL_POLL_INTERVAL", 0), \
+             patch.object(main, "FINDYMAIL_POLL_SECONDS", 0.01), _fm():
+            data = await main.findymail_person_search({"semantic_query": "AI SaaS"}, 6)
+
+        self.assertEqual(len(data["profiles"]), 1)
+
+    async def test_a_failed_task_is_empty_rather_than_an_error(self):
+        FindymailClient.reset({
+            ("POST", "/api/intellimatch/search"): (200, {"hash": "abc123"}),
+            ("GET", "/api/intellimatch/status"): (200, {"status": "failed"}),
+        })
+        with patch.object(main.httpx, "AsyncClient", FindymailClient), \
+             patch.object(main, "FINDYMAIL_POLL_INTERVAL", 0), _fm():
+            data = await main.findymail_person_search({"semantic_query": "AI SaaS"}, 6)
+
+        self.assertEqual(data["profiles"], [])
+        # No point paging a task that failed.
+        self.assertNotIn("/api/intellimatch/data", [c[1] for c in FindymailClient.calls])
+
+    async def test_out_of_credits_is_a_402_the_caller_can_act_on(self):
+        FindymailClient.reset({
+            ("POST", "/api/intellimatch/search"): (402, {"error": "Not enough credits"}),
+        })
+        with patch.object(main.httpx, "AsyncClient", FindymailClient), _fm():
+            with self.assertRaises(main.HTTPException) as caught:
+                await main.findymail_person_search({"semantic_query": "AI SaaS"}, 6)
+
+        self.assertEqual(caught.exception.status_code, 402)
+
+
+class FindymailChainTests(unittest.TestCase):
+    def test_it_sits_late_because_it_is_slow_and_billed_per_result(self):
+        order = list(main.PROVIDER_ORDER)
+
+        self.assertIn("findymail", order)
+        self.assertGreater(order.index("findymail"), order.index("getleads"))
+        self.assertGreater(order.index("findymail"), order.index("coldiq"))
+
+    def test_no_key_removes_it_rather_than_breaking_the_chain(self):
+        with patch.object(main.settings, "bytemine_api_key", "b"), \
+             patch.object(main.settings, "findymail_api_key", None), \
+             patch.object(main.settings, "search_provider", "bytemine"):
+            self.assertNotIn("findymail", main.provider_chain())
+
+    def test_a_key_is_all_it_takes(self):
+        with patch.object(main.settings, "bytemine_api_key", "b"), \
+             patch.object(main.settings, "findymail_api_key", "fm"), \
+             patch.object(main.settings, "search_provider", "bytemine"):
+            self.assertIn("findymail", main.provider_chain())
+
+
 if __name__ == "__main__":
     unittest.main()

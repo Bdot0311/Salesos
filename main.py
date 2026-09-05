@@ -10,6 +10,7 @@ import hashlib
 import hmac
 import json
 import re
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from urllib.parse import quote
@@ -50,6 +51,7 @@ class Settings(BaseSettings):
     # treg is an all-in-one tool catalog. We use only its routed lead-gen
     # endpoints, while treg itself chooses among the eligible upstream tools.
     # Keep this org-scoped token on the backend: it pays for every customer.
+    findymail_api_key: Optional[str] = None
     treg_token: Optional[str] = None
     treg_org_id: Optional[str] = None
     treg_base_url: str = "https://treg.to"
@@ -119,7 +121,12 @@ TREG_META_VALUE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 # provider_chain().
 # getleads sits ahead of coldiq: it filters on industry, headcount and region
 # for real, where coldiq can only rank on them. See build_getleads_filters.
-PROVIDER_ORDER = ("bytemine", "crustdata", "getleads", "treg", "coldiq", "wiza")
+# findymail sits late on purpose. Its search is asynchronous — submit, poll,
+# then fetch — so it is the slowest leg by a wide margin, and it bills per
+# result found. In a sequential waterfall that makes it the right answer only
+# once the fast, cheaper providers have come back empty.
+PROVIDER_ORDER = ("bytemine", "crustdata", "getleads", "treg", "coldiq",
+                  "findymail", "wiza")
 
 
 def provider_configured(name: str) -> bool:
@@ -134,6 +141,8 @@ def provider_configured(name: str) -> bool:
         return bool(settings.getleads_api_key)
     if name == "treg":
         return bool(settings.treg_token)
+    if name == "findymail":
+        return bool(settings.findymail_api_key)
     if name == "wiza":
         return bool(settings.wiza_api_key)
     return False
@@ -2770,6 +2779,299 @@ async def fetch_from_getleads(params: dict) -> list:
 
 
 # =============================================================================
+# Findymail  (https://app.findymail.com)
+# =============================================================================
+#
+# Three different jobs, and the useful ones are not the search.
+#
+# Its synchronous endpoints answer two problems this chain has right now.
+# /api/search/business-profile turns a LinkedIn URL into a verified email —
+# which is exactly what a ColdIQ lead is missing, since that provider can
+# return a person as nothing but a profile URL and a headline. And /api/verify
+# is a second deliverability checker, which matters because ColdIQ is both the
+# only verifier and the thing that runs out of credits.
+#
+# Both are charged only on success ("uses one finder credit if a verified email
+# is found"), so a miss costs nothing and they can be tried freely.
+#
+# Its search — Intellimatch — is asynchronous: submit a natural-language query,
+# get a hash, poll for completion, then page the results. That is a poor fit for
+# a request a user is waiting on, so the leg is bounded (see FINDYMAIL_POLL_*)
+# and sits late in the waterfall.
+
+FINDYMAIL_BASE = "https://app.findymail.com"
+
+# How long a live search will wait for an Intellimatch task. Findymail queues
+# these; a large export can take minutes, which no one is going to sit through.
+# On a timeout the hash is logged so the same task can be collected later rather
+# than re-run — the credits are already spent either way.
+FINDYMAIL_POLL_SECONDS = 25.0
+FINDYMAIL_POLL_INTERVAL = 2.5
+
+
+async def findymail_call(method: str, path: str, *, json_body: dict = None,
+                         params: dict = None) -> tuple:
+    """Call Findymail. Returns (status_code, parsed body or None).
+
+    Returns rather than raises for the outcomes that are ordinary here: 402 out
+    of credits and 423 subscription paused are states of their account, not
+    failures of this request, and a leg that raises on them takes the whole
+    search down with it.
+    """
+    headers = {
+        "Authorization": f"Bearer {settings.findymail_api_key or ''}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.request(
+                method, f"{FINDYMAIL_BASE}{path}",
+                headers=headers, json=json_body, params=params)
+    except httpx.HTTPError as exc:
+        print(f"Findymail {path} unreachable: {exc}")
+        return 0, None
+
+    if resp.status_code != 200:
+        print(f"Findymail {path} status: {resp.status_code} {resp.text[:200]}")
+    try:
+        return resp.status_code, resp.json()
+    except ValueError:
+        # /api/verify documents a text/plain body holding JSON.
+        try:
+            return resp.status_code, json.loads(resp.text)
+        except ValueError:
+            return resp.status_code, None
+
+
+async def findymail_find_email(*, linkedin_url: str = None, name: str = None,
+                               domain: str = None) -> dict:
+    """Find one verified email. Returns {} when nothing was found.
+
+    A LinkedIn URL is tried first because it identifies a person exactly; name
+    plus domain can land on the wrong person at a big company. Charged only when
+    an email is actually found, so trying both costs nothing on a miss.
+    """
+    if linkedin_url:
+        status, body = await findymail_call(
+            "POST", "/api/search/business-profile",
+            json_body={"linkedin_url": linkedin_url})
+        contact = (body or {}).get("contact") if status == 200 else None
+        if contact and contact.get("email"):
+            return contact
+
+    if name and domain:
+        status, body = await findymail_call(
+            "POST", "/api/search/name",
+            json_body={"name": name, "domain": domain_host(domain) or domain})
+        contact = (body or {}).get("contact") if status == 200 else None
+        if contact and contact.get("email"):
+            return contact
+
+    return {}
+
+
+async def findymail_verify_email(email: str) -> dict:
+    """Verify one address through Findymail, in our shared verdict shape.
+
+    Its answer is a bare boolean — `verified` — with none of the catch-all or
+    role detail ColdIQ returns, so a true maps to "deliverable" and a false to
+    "undeliverable" and nothing is invented in between.
+    """
+    status, body = await findymail_call("POST", "/api/verify",
+                                        json_body={"email": email})
+    if status != 200 or not isinstance(body, dict) or "verified" not in body:
+        reason = ("findymail out of verifier credits" if status == 402
+                  else "findymail subscription paused" if status == 423
+                  else "findymail returned no verdict")
+        return {"status": "unknown", "sendable": None,
+                "checked_by": "findymail", "reason": reason}
+
+    deliverable = bool(body.get("verified"))
+    return {
+        "status": "deliverable" if deliverable else "undeliverable",
+        "sendable": deliverable,
+        "checked_by": "findymail",
+        "vendor": body.get("provider"),
+        "score": None,
+        "raw_status": str(body.get("verified")),
+    }
+
+
+def findymail_intellimatch_query(p: dict) -> str:
+    """The natural-language query Intellimatch searches companies with.
+
+    It takes a sentence, not filters, so the user's own sentence is used where
+    there is one — this is the one provider in the chain that wants it verbatim.
+    Otherwise the structured filters are written back out as a sentence, because
+    an empty query is rejected and a bare job title describes a person rather
+    than a company.
+    """
+    sentence = (p.get("semantic_query") or p.get("query") or "").strip()
+    if sentence:
+        return sentence
+
+    described = []
+    if p.get("industry"):
+        described.append(str(p["industry"]))
+    size = p.get("company_size")
+    location = p.get("company_location") or p.get("location")
+    keywords = p.get("keywords")
+
+    # "companies" on its own describes every company there is. A search with a
+    # job title and nothing else says who to find, never where — and Intellimatch
+    # searches companies, so that has to be refused rather than sent as a query
+    # that matches the entire index.
+    if not (described or size or location or keywords):
+        return ""
+
+    parts = described + ["companies"]
+    if size:
+        parts.append(f"with {size} employees")
+    if location:
+        parts.append(f"in {location}")
+    if keywords:
+        parts.append(f"({keywords})")
+    return " ".join(parts).strip()
+
+
+def build_findymail_search(p: dict, limit: int) -> dict:
+    """Build the Intellimatch task body.
+
+    require_email is on deliberately. Findymail documents that companies without
+    an email are "excluded and not charged", which turns the cost of a bad
+    search into nothing and means this leg never returns the emailless rows that
+    the rest of the chain already produces too many of.
+    """
+    query = findymail_intellimatch_query(p)
+    if not query:
+        raise ProviderUnsupported("query", "no company description to search")
+
+    config = {
+        "find_contact": True,
+        "find_email": True,
+        "require_email": True,
+        "mode": "targeted" if p.get("job_title") else "broad",
+    }
+    if p.get("job_title"):
+        # Tiers are fallbacks, not alternatives: tier two is only tried when
+        # tier one finds nobody, so the stated title stays the first choice.
+        config["target_job_titles"] = [[p["job_title"]]]
+
+    return {"query": query, "limit": max(min(limit, 5000), 1), "config": config}
+
+
+async def findymail_person_search(params: dict, limit: int) -> dict:
+    """Run one Intellimatch search, within a bounded wait.
+
+    Submit, poll, page. A task that has not finished inside the budget returns
+    what it has rather than nothing, and logs its hash: the credits are spent
+    when the task runs, so the results stay collectable afterwards.
+    """
+    body = build_findymail_search(params, limit)
+    print(f"Findymail intellimatch body: {json.dumps(body)[:400]}")
+
+    status, submitted = await findymail_call(
+        "POST", "/api/intellimatch/search", json_body=body)
+    task = (submitted or {}).get("hash") if status == 200 else None
+    if not task:
+        if status == 402:
+            raise HTTPException(
+                status_code=402,
+                detail="Findymail credits exhausted — top up to keep searching")
+        if status == 423:
+            raise HTTPException(status_code=502,
+                                detail="Findymail subscription is paused")
+        raise HTTPException(status_code=502, detail="Findymail started no search")
+
+    deadline = time.monotonic() + FINDYMAIL_POLL_SECONDS
+    state = "pending"
+    while time.monotonic() < deadline:
+        await asyncio.sleep(FINDYMAIL_POLL_INTERVAL)
+        _, progress = await findymail_call(
+            "GET", "/api/intellimatch/status", params={"hash": task})
+        state = (progress or {}).get("status") or state
+        if state in ("success", "failed", "not_found"):
+            break
+        print(f"Findymail {task[:12]}… {state} {(progress or {}).get('progress', '')}%")
+
+    if state in ("failed", "not_found"):
+        print(f"Findymail search {state}: {task}")
+        return {"profiles": [], "total": 0, "next_cursor": None}
+
+    _, page = await findymail_call(
+        "GET", "/api/intellimatch/data",
+        params={"hash": task, "page": 1, "per_page": max(min(limit, 500), 1)})
+    rows = [r for r in ((page or {}).get("data") or []) if isinstance(r, dict)]
+
+    if state != "success":
+        # Partial, not empty: the task keeps running on their side and this hash
+        # can be collected later without paying for the search twice.
+        print(f"Findymail still {state} after {FINDYMAIL_POLL_SECONDS:.0f}s — "
+              f"returning {len(rows)} row(s) so far, hash {task}")
+    if rows:
+        print(f"Findymail record keys: {sorted(rows[0].keys())[:20]}")
+
+    return {
+        "profiles": rows,
+        "total": ((page or {}).get("meta") or {}).get("total") or len(rows),
+        "next_cursor": None,
+    }
+
+
+def transform_findymail_row(row: dict, search_params: dict = None) -> dict:
+    """Map one Intellimatch result onto our lead shape.
+
+    Each row is a company with one contact folded into it — the contact_* keys
+    are the person, everything else describes where they work.
+    """
+    r = row or {}
+    industries = r.get("industries")
+    if isinstance(industries, list):
+        industry = industries[0] if industries else None
+    else:
+        industry = industries or None
+
+    phone, phone_type = pick_phone(r)
+    if not phone:
+        phone = clean_phone(r.get("contact_phone"))
+        phone_type = None
+
+    name = (r.get("contact_name") or "").strip()
+    first, _, last = name.partition(" ")
+
+    return {
+        "contact_name": name or None,
+        "first_name": first or None,
+        "last_name": last or None,
+        "job_title": r.get("contact_job_title"),
+        "company_name": r.get("name"),
+        "company_domain": domain_host(r.get("domain") or "") or None,
+        "company_description": r.get("description"),
+        "business_email": r.get("contact_email"),
+        "phone": phone,
+        "phone_type": phone_type,
+        "phone_available": bool(phone),
+        "linkedin_url": r.get("contact_linkedin_url"),
+        "industry": industry or (search_params or {}).get("industry"),
+        "company_size": r.get("employee_count_range"),
+        "country": r.get("country"),
+        # Intellimatch's own confidence that the company fits the query. Carried
+        # through rather than folded into our score: it measures a different
+        # thing, and one provider's number should not silently become ours.
+        "match_score": r.get("match_score"),
+        "provider": "findymail",
+    }
+
+
+async def fetch_from_findymail(params: dict) -> list:
+    """People-search fetcher for /search — returns raw Intellimatch rows."""
+    limit = max(min(params.get("limit", 10), 500), 1)
+    data = await findymail_person_search(params, limit)
+    return data["profiles"]
+
+
+# =============================================================================
 # ColdIQ  (https://api.coldiq.com)
 # =============================================================================
 #
@@ -3351,11 +3653,26 @@ async def verify_revealed_lead(lead: dict, provider: str = None) -> dict:
     """
     email = (lead or {}).get("business_email") or (lead or {}).get("email")
     verdict = await coldiq_verify_email(email or "")
+
+    # ColdIQ is the primary checker, but it is also the thing that runs out of
+    # credits — production spent weeks answering "unknown" for every address
+    # because of it. Findymail answers the same question and bills separately,
+    # so a verdict ColdIQ could not reach is worth one more attempt rather than
+    # being reported as unknown.
+    if (email and verdict.get("sendable") is None
+            and verdict.get("status") in ("unknown", "unverified")
+            and provider_configured("findymail")):
+        fallback = await findymail_verify_email(email)
+        if fallback.get("sendable") is not None:
+            fallback["checked_at"] = datetime.now(timezone.utc).isoformat()
+            fallback["fell_back_from"] = verdict.get("reason") or verdict.get("status")
+            verdict = fallback
+
     lead["email_verification"] = verdict
     lead["email_verified"] = verdict.get("sendable")
     if email:
         source = provider or lead.get("provider") or "unknown provider"
-        print(f"ColdIQ verify {source} lead: "
+        print(f"{verdict.get('checked_by') or 'no'} verify {source} lead: "
               f"{verdict.get('status')} (sendable={verdict.get('sendable')})")
     return lead
 
@@ -4150,7 +4467,8 @@ def _profile_url(profile: dict) -> Optional[str]:
     nested = (((profile.get("social_handles") or {})
                .get("professional_network_identifier") or {}).get("profile_url"))
     return (nested or profile.get("linkedin_url") or profile.get("linkedinUrl")
-            or profile.get("person_linkedin_url"))
+            or profile.get("person_linkedin_url")
+            or profile.get("contact_linkedin_url"))
 
 
 def _profile_lead_key(profile: dict) -> Optional[str]:
@@ -4661,6 +4979,36 @@ async def enrich_lead(request: EnrichRequest):
                 "lead": lead,
             }
 
+    # Findymail last before Wiza, and worth reaching even when everything above
+    # failed: it is charged only on a found email, so a miss here costs nothing.
+    # It is also the natural partner to a ColdIQ lead, which can arrive as
+    # nothing but a LinkedIn URL — that URL is exactly what
+    # /api/search/business-profile takes.
+    if "findymail" in chain and (
+        request.linkedin_url
+        or (request.full_name and (request.company_domain or request.company))
+    ):
+        contact = await findymail_find_email(
+            linkedin_url=request.linkedin_url,
+            name=request.full_name,
+            domain=request.company_domain or request.company)
+        if contact.get("email"):
+            lead = await verify_revealed_lead({
+                "contact_name": contact.get("name") or request.full_name,
+                "business_email": contact.get("email"),
+                "company_domain": domain_host(contact.get("domain") or "") or None,
+                "company_name": request.company,
+                "linkedin_url": request.linkedin_url,
+                "provider": "findymail",
+            }, "findymail")
+            return {
+                "success": True,
+                "provider": "findymail",
+                "enrichment_status": "complete",
+                "email_verification": lead["email_verification"],
+                "lead": lead,
+            }
+
     if "wiza" not in chain:
         raise HTTPException(status_code=404, detail="No configured provider could enrich this lead")
 
@@ -4999,6 +5347,8 @@ async def search_leads(request: SearchRequest):
             return lambda profile: transform_bytemine_profile(profile, params)
         if name == "coldiq":
             return lambda profile: transform_coldiq_profile(profile, params)
+        if name == "findymail":
+            return lambda row: transform_findymail_row(row, params)
         if name == "getleads":
             return lambda record: transform_getleads_contact(record)
         if name == "treg":
@@ -5146,6 +5496,26 @@ async def search_leads(request: SearchRequest):
                 found = [p for p in found
                          if linkedin_identity(_profile_url(p)) not in seen]
             return (found[skip:] if skip else found), data["total"], data.get("next_cursor")
+
+        if name == "findymail":
+            # Intellimatch has no cursor and no offset, so a numbered page is
+            # over-fetched and sliced. require_email is already on, so rows that
+            # arrive have an address — the filtering below only removes people
+            # already shown.
+            skip = request.start_offset
+            data = await findymail_person_search(
+                params, max(min(params.get("limit", 10) + skip, 500), 1))
+            found = data["profiles"]
+            if exclusions:
+                seen = {i for i in (linkedin_identity(u) for u in exclusions) if i}
+                found = [r for r in found
+                         if linkedin_identity(_profile_url(r)) not in seen]
+            if campaign_keys:
+                found = [r for r in found
+                         if _profile_lead_key(r) not in campaign_keys]
+            if request.campaign_id:
+                found = await record_new_campaign_profiles(request.campaign_id, found)
+            return (found[skip:] if skip else found), data["total"], None
 
         if name == "coldiq":
             # ColdIQ's people search has no cursor, no offset and no exclusion
