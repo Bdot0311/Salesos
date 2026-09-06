@@ -5491,9 +5491,24 @@ async def search_leads(request: SearchRequest):
     # Each provider resumes from its own position — see decode_cursors.
     cursor_by_provider = decode_cursors(request.cursor, chain)
 
-    async def run_provider(name: str):
-        """One provider's search. Returns (raw_results, total, next_cursor)."""
+    # run_provider rebinds `params` to a per-leg copy carrying that leg's share
+    # of the page, so it needs a stable name for the search's own params.
+    outer_params = params
+
+    async def run_provider(name: str, want: int = None):
+        """One provider's search. Returns (raw_results, total, next_cursor).
+
+        `want` is how many rows this leg is being asked for, which is the page
+        size for the first leg and the shortfall for the ones after it. Later
+        legs top up a partial page rather than re-requesting the whole thing:
+        several of these bill per record returned, so asking for six when two
+        are missing is four rows of waste on every partially-filled search.
+        """
         provider_cursor = cursor_by_provider.get(name)
+        if want is not None:
+            params = {**outer_params, "limit": max(want, 1)}
+        else:
+            params = outer_params
         if name == "bytemine":
             result = await bytemine_person_search(
                 params, max(min(params.get("limit", 10), 100), 1),
@@ -5687,13 +5702,29 @@ async def search_leads(request: SearchRequest):
     failures: dict[str, object] = {}
     ran = False
 
-    # True waterfall: call one provider at a time, in configured order. Move to
-    # the next leg only when the current one cannot express the ICP, errors, or
-    # returns no matches. The first leg with results wins and stops the chain,
-    # avoiding duplicate spend and unnecessary calls to lower-priority tools.
+    # Waterfall: call one provider at a time, in configured order, and stop as
+    # soon as the page is full. Move to the next leg when the current one cannot
+    # express the ICP, errors, returns nothing — or returns less than was asked
+    # for.
+    #
+    # That last case used to end the chain too: `if found: break` stopped on the
+    # first leg with *any* row, so one lead from Bytemine ended a search for six
+    # and the remaining five providers were never asked. The point of a chain is
+    # that nobody depends on a single provider, and a page of one lead is that
+    # dependency at its worst — the user sees a nearly empty result while four
+    # tools that could have filled it sat idle.
+    #
+    # It stays a waterfall: nothing is called speculatively, each leg is asked
+    # only for the shortfall, and the walk ends the moment the page is full.
+    # merge_provider_results already round-robins the buckets and drops
+    # cross-provider duplicates, so a topped-up page is one page, not two
+    # stacked.
+    wanted = max(int(params.get("limit") or 10), 1)
+    collected = 0
+
     for name in chain:
         try:
-            outcome = await run_provider(name)
+            outcome = await run_provider(name, wanted - collected)
         except ProviderUnsupported as outcome:
             # This provider cannot express one of the requested filters. It sits
             # this search out; the others still answer it.
@@ -5722,8 +5753,12 @@ async def search_leads(request: SearchRequest):
         if found or provider_cursor:
             buckets.append({"provider": name, "profiles": found,
                             "total": provider_total, "next_cursor": provider_cursor})
-        if found:
+        collected += len(found)
+        if collected >= wanted:
             break
+        if found:
+            print(f"{name} filled {collected}/{wanted} — continuing the chain "
+                  f"for {wanted - collected} more")
 
     # Nothing ran at all. Distinguish the two ways that happens: every provider
     # refused the filter, or every provider errored. An empty success would

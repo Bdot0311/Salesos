@@ -709,24 +709,71 @@ class ProviderFallbackTests(unittest.IsolatedAsyncioTestCase):
              "wiza": [{"full_name": "Alan T", "company": "Bletchley"}]},
         )
 
-        self.assertEqual(calls, ["bytemine"])
+        # The point of this test is the refusal, not the stopping: neither
+        # Bytemine nor Wiza may sit out a search just because it carries the
+        # user's sentence.
         outcomes = {a["provider"]: a["outcome"] for a in response.provider_attempts}
         self.assertNotIn("unsupported_filter", outcomes.values())
-        self.assertEqual(response.count, 1)
+        self.assertEqual(calls[0], "bytemine")
+        self.assertGreaterEqual(response.count, 1)
 
-    async def test_first_success_stops_the_waterfall(self):
+    async def test_a_full_page_stops_the_waterfall(self):
+        # Nothing below is called speculatively: the page is full, so the walk
+        # ends and the lower-priority tools are never billed.
         response, calls = await self.run_search(
-            main.SearchRequest(job_title="VP of Sales", location="CA"),
-            {"bytemine": {"profiles": [{"pid": "1", "first_name": "Ada"}],
-                          "total": 1, "next_cursor": None},
+            main.SearchRequest(job_title="VP of Sales", location="CA", limit=2),
+            {"bytemine": {"profiles": [{"pid": "1", "first_name": "Ada"},
+                                       {"pid": "2", "first_name": "Grace"}],
+                          "total": 2, "next_cursor": None},
              "crustdata": {"profiles": [{"crustdata_person_id": 9}],
                            "total": 1, "next_cursor": None}},
         )
 
         self.assertEqual(calls, ["bytemine"])
         self.assertEqual(response.provider, "bytemine")
-        self.assertEqual(response.count, 1)
+        self.assertEqual(response.count, 2)
         self.assertIn("Ada", [l["contact_name"] for l in response.leads])
+
+    async def test_a_partial_page_is_topped_up_by_the_next_provider(self):
+        """One lead used to end a search for ten.
+
+        `if found: break` stopped on the first leg with any row at all, so a
+        single Bytemine result ended the chain and the other providers were
+        never asked — the user saw a nearly empty page while the tools that
+        could have filled it sat idle. That is the single-provider dependency a
+        chain exists to prevent.
+        """
+        response, calls = await self.run_search(
+            main.SearchRequest(job_title="VP of Sales", location="CA", limit=3),
+            {"bytemine": {"profiles": [{"pid": "1", "first_name": "Ada"}],
+                          "total": 1, "next_cursor": None},
+             "crustdata": {"profiles": [{"crustdata_person_id": 9}],
+                           "total": 1, "next_cursor": None}},
+        )
+
+        self.assertEqual(calls, ["bytemine", "crustdata"])
+        self.assertEqual(response.count, 2)
+        self.assertEqual(response.provider, "bytemine+crustdata")
+
+    async def test_a_later_leg_is_asked_only_for_the_shortfall(self):
+        # Several of these bill per record returned, so a leg topping up a page
+        # must not re-request the whole page.
+        asked: list = []
+
+        async def crustdata(params, limit, **kwargs):
+            asked.append(limit)
+            return {"profiles": [{"crustdata_person_id": 9}], "total": 1,
+                    "next_cursor": None}
+
+        with patch.object(main, "crustdata_person_search", crustdata):
+            await self.run_search(
+                main.SearchRequest(job_title="VP of Sales", location="CA", limit=5),
+                {"bytemine": {"profiles": [{"pid": "1", "first_name": "Ada"},
+                                           {"pid": "2", "first_name": "Grace"}],
+                              "total": 2, "next_cursor": None}},
+            )
+
+        self.assertEqual(asked, [3])
 
     async def test_a_provider_with_nothing_does_not_decide_the_search(self):
         response, calls = await self.run_search(
