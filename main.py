@@ -603,7 +603,13 @@ def semantic_terms_in(text: str) -> list[str]:
     low = (text or "").lower()
     found: list[str] = []
     for term in sorted(_SEMANTIC_ONLY_TERMS, key=len, reverse=True):
-        if not re.search(rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])", low):
+        # The trailing guard also rejects a term that is the stem of a filename.
+        # Every pitch in production mentions "llm.txt robot.txt" as an SEO
+        # deliverable, and "llm" was matching inside it — so a search for salon
+        # owners went out to GetLeads as company_description "llm" and to Fiber
+        # as a keyword, narrowing every one of those searches to companies that
+        # talk about language models.
+        if not re.search(rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9]|\.[a-z])", low):
             continue
         # A longer match already covers this one ("ai" inside "ai saas").
         if any(term in seen for seen in found):
@@ -2940,16 +2946,48 @@ async def findymail_verify_email(email: str) -> dict:
     }
 
 
+# A pitch says what the user sells. An ICP says who the buyers are. Intellimatch
+# searches company descriptions, so only the second is a query it can answer.
+_PITCH_MARKERS = re.compile(
+    r"\b(i am selling|i'm selling|i sell|we are selling|we're selling|we sell|"
+    r"i offer|we offer|i charge|we charge|i build|we build|i provide|we provide|"
+    r"i help|we help|my product|our product|my service|our service|my website|"
+    r"our website|it cost|it costs|per month)\b", re.I)
+
+# Past this, a "description of target companies" is something else.
+FINDYMAIL_MAX_QUERY_CHARS = 300
+
+
+def findymail_query_from_sentence(sentence: str) -> str:
+    """The user's sentence, when it describes the companies to find.
+
+    Production sent this endpoint entire sales pitches — "I am selling a website
+    to car showrooms, https://... it cost only 50$ ... for maintaince I charge
+    5dolllar per month ..." — several hundred words of offer, pricing and links.
+    Intellimatch answered `failed` to every one of them, on every search, because
+    none of it describes a company to go and find.
+
+    Returned empty when the sentence is a pitch, which sends the caller to the
+    structured filters instead. Those describe the buyer, which is the question
+    this endpoint takes.
+    """
+    text = re.sub(r"https?://\S+", " ", sentence or "").strip()
+    if not text or _PITCH_MARKERS.search(text) or len(text) > FINDYMAIL_MAX_QUERY_CHARS:
+        return ""
+    return " ".join(text.split())
+
+
 def findymail_intellimatch_query(p: dict) -> str:
     """The natural-language query Intellimatch searches companies with.
 
-    It takes a sentence, not filters, so the user's own sentence is used where
-    there is one — this is the one provider in the chain that wants it verbatim.
-    Otherwise the structured filters are written back out as a sentence, because
-    an empty query is rejected and a bare job title describes a person rather
+    It takes a sentence, not filters, so the user's own sentence is used when it
+    reads like a description of the companies to find. A sales pitch is not
+    that, so the structured filters are written back out as a sentence instead —
+    an empty query is rejected, and a bare job title describes a person rather
     than a company.
     """
-    sentence = (p.get("semantic_query") or p.get("query") or "").strip()
+    sentence = findymail_query_from_sentence(
+        p.get("semantic_query") or p.get("query") or "")
     if sentence:
         return sentence
 
@@ -2958,7 +2996,7 @@ def findymail_intellimatch_query(p: dict) -> str:
         described.append(str(p["industry"]))
     size = p.get("company_size")
     location = p.get("company_location") or p.get("location")
-    keywords = p.get("keywords")
+    keywords = p.get("keywords") or p.get("semantic_keywords")
 
     # "companies" on its own describes every company there is. A search with a
     # job title and nothing else says who to find, never where — and Intellimatch
@@ -3035,7 +3073,9 @@ async def findymail_person_search(params: dict, limit: int) -> dict:
         state = (progress or {}).get("status") or state
         if state in ("success", "failed", "not_found"):
             break
-        print(f"Findymail {task[:12]}… {state} {(progress or {}).get('progress', '')}%")
+        pct = (progress or {}).get("progress")
+        print(f"Findymail {task[:12]}… {state}"
+              + (f" {pct}%" if pct not in (None, "") else ""))
 
     if state in ("failed", "not_found"):
         print(f"Findymail search {state}: {task}")
@@ -3775,6 +3815,11 @@ async def coldiq_person_search(params: dict, limit: int) -> dict:
     single vendor would make this leg a second, worse copy of a provider we
     already call directly.
     """
+    if coldiq_out_of_credits():
+        raise HTTPException(
+            status_code=402,
+            detail="ColdIQ credits exhausted — top up the ColdIQ account to keep searching")
+
     search_input = {**build_coldiq_filters(params), "limit": max(min(limit, 100), 1)}
     # Internal marker, not an API field: which ICP dimensions went in as a
     # keyword hint rather than a hard filter. Popped before the request and
@@ -3798,6 +3843,7 @@ async def coldiq_person_search(params: dict, limit: int) -> dict:
             f"{COLDIQ_BASE}/v1/people/search", headers=headers, json=body,
         )
         print(f"ColdIQ search status: {resp.status_code} {resp.text[:300]}")
+        coldiq_note_status(resp.status_code)
         if resp.status_code == 401:
             raise HTTPException(status_code=502, detail="ColdIQ rejected the API key")
         if resp.status_code == 402:
@@ -3913,6 +3959,31 @@ async def coldiq_reveal(request: "EnrichRequest") -> dict:
     return transform_coldiq_profile(record)
 
 
+# ColdIQ answers 402 for every call once the balance runs out, and it answers it
+# slowly: three doomed round trips per enrich and one per search, 1-3 seconds
+# each, on every request the product serves. The balance is a fact the 402
+# itself reports, so there is no reason to keep asking.
+#
+# Latched rather than permanent: a top-up should bring the provider back without
+# a deploy, so the latch simply expires and the next call finds out.
+COLDIQ_EXHAUSTED_SECONDS = 900.0
+_coldiq_exhausted_until = 0.0
+
+
+def coldiq_note_status(status: int) -> None:
+    """Record a 402 so the next few calls can skip the round trip."""
+    global _coldiq_exhausted_until
+    if status == 402:
+        _coldiq_exhausted_until = time.monotonic() + COLDIQ_EXHAUSTED_SECONDS
+        print("ColdIQ is out of credits — skipping it for "
+              f"{int(COLDIQ_EXHAUSTED_SECONDS // 60)} minutes")
+
+
+def coldiq_out_of_credits() -> bool:
+    """True while a recent 402 says there is nothing to spend."""
+    return time.monotonic() < _coldiq_exhausted_until
+
+
 async def coldiq_verb(path: str, identity: dict) -> Optional[dict]:
     """POST one record to a ColdIQ GTM verb and return its normalized `data`.
 
@@ -3921,6 +3992,9 @@ async def coldiq_verb(path: str, identity: dict) -> Optional[dict]:
     anything that is not a usable result, including 404 ("No usable result found
     across providers"), which is a legitimate miss rather than an error.
     """
+    if coldiq_out_of_credits():
+        return None
+
     body = {"input": identity, "provider": "auto"}
     headers = {
         "Authorization": f"Bearer {settings.coldiq_api_key or ''}",
@@ -3934,6 +4008,7 @@ async def coldiq_verb(path: str, identity: dict) -> Optional[dict]:
         return None
 
     print(f"ColdIQ {path} status: {resp.status_code} {resp.text[:300]}")
+    coldiq_note_status(resp.status_code)
     if resp.status_code == 404:
         return None
     if resp.status_code not in (200, 201):
