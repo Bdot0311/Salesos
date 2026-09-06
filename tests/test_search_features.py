@@ -2816,5 +2816,112 @@ class FindymailChainTests(unittest.TestCase):
             self.assertIn("findymail", main.provider_chain())
 
 
+class ProviderFilterDiagnosticTests(unittest.IsolatedAsyncioTestCase):
+    """Turn "the search returns nothing" into "nothing once X is applied".
+
+    Three fixes were aimed at the Bytemine and Crustdata zeros from a reading of
+    the request bodies, and none of them moved it. A body that looks correct and
+    a body that matches their index are not the same thing, and re-reading does
+    not tell them apart.
+    """
+
+    def _probe(self, empties_on=None, seen=None):
+        """A fake provider search that returns nothing once `empties_on` is set."""
+        async def search(params, limit, **kwargs):
+            if seen is not None:
+                seen.append(sorted(params))
+            if empties_on and params.get(empties_on):
+                return {"profiles": [], "total": 0, "next_cursor": None}
+            return {"profiles": [{"pid": "1"}], "total": 12, "next_cursor": None}
+        return search
+
+    async def diagnose(self, request, **searches):
+        patches = [patch.object(main, "provider_configured", lambda n: True)]
+        for name, attr in (("bytemine", "bytemine_person_search"),
+                           ("crustdata", "crustdata_person_search"),
+                           ("getleads", "getleads_person_search")):
+            patches.append(patch.object(main, attr,
+                                        searches.get(name, self._probe())))
+        for p in patches:
+            p.start()
+        try:
+            return await main.diagnose_provider_filters(request)
+        finally:
+            for p in patches:
+                p.stop()
+
+    async def test_it_names_the_filter_that_empties_the_search(self):
+        report = await self.diagnose(
+            main.SearchRequest(job_title="Founder", industry="computer software",
+                               company_size="1-10"),
+            bytemine=self._probe(empties_on="industry"),
+        )
+
+        self.assertIn("industry", report["providers"]["bytemine"]["verdict"])
+        steps = report["providers"]["bytemine"]["steps"]
+        self.assertEqual([s["added"] for s in steps], ["job_title", "industry"])
+        self.assertEqual(steps[0]["total"], 12)
+        self.assertEqual(steps[1]["total"], 0)
+
+    async def test_empty_on_the_first_filter_reads_as_the_whole_integration(self):
+        report = await self.diagnose(
+            main.SearchRequest(job_title="Founder", industry="computer software"),
+            crustdata=self._probe(empties_on="job_title"),
+        )
+
+        self.assertIn("whole integration",
+                      report["providers"]["crustdata"]["verdict"])
+
+    async def test_filters_are_added_one_at_a_time(self):
+        seen: list = []
+        await self.diagnose(
+            main.SearchRequest(job_title="Founder", industry="computer software",
+                               company_size="1-10"),
+            getleads=self._probe(seen=seen),
+        )
+
+        # Each probe carries one more field than the last, and the walk runs to
+        # the end when nothing empties it.
+        added = [[f for f in call if f in main.DIAGNOSTIC_FILTER_ORDER] for call in seen]
+        self.assertEqual(added, [["job_title"],
+                                 ["industry", "job_title"],
+                                 ["company_size", "industry", "job_title"]])
+
+    async def test_a_provider_that_survives_every_filter_says_so(self):
+        report = await self.diagnose(
+            main.SearchRequest(job_title="Founder", industry="computer software"))
+
+        self.assertEqual(report["providers"]["getleads"]["verdict"],
+                         "no filter emptied it")
+
+    async def test_a_refusal_is_reported_rather_than_raised(self):
+        async def refuses(params, limit, **kwargs):
+            raise main.ProviderUnsupported("location", params.get("location"))
+
+        report = await self.diagnose(
+            main.SearchRequest(job_title="Founder", location="US"),
+            bytemine=refuses,
+        )
+
+        self.assertIn("unsupported_filter", report["providers"]["bytemine"]["verdict"])
+
+    async def test_an_upstream_error_is_reported_rather_than_raised(self):
+        async def fails(params, limit, **kwargs):
+            raise main.HTTPException(status_code=402, detail="out of credits")
+
+        report = await self.diagnose(
+            main.SearchRequest(job_title="Founder"), crustdata=fails)
+
+        step = report["providers"]["crustdata"]["steps"][0]
+        self.assertEqual(step["outcome"], "error")
+        self.assertEqual(step["status"], 402)
+
+    async def test_a_search_with_nothing_to_isolate_is_refused(self):
+        with self.assertRaises(main.HTTPException) as raised:
+            await self.diagnose(main.SearchRequest(company_domain="acme.com"))
+
+        self.assertEqual(raised.exception.status_code, 400)
+
+
 if __name__ == "__main__":
     unittest.main()
