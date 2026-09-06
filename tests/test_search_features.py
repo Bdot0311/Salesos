@@ -2816,6 +2816,360 @@ class FindymailChainTests(unittest.TestCase):
             self.assertIn("findymail", main.provider_chain())
 
 
+class FiberClient:
+    """Fake httpx client for Fiber: answers per path, records headers and body."""
+    routes = {}
+    calls = []
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def post(self, url, headers=None, json=None):
+        path = url.replace(main.FIBER_BASE, "")
+        self.__class__.calls.append((path, json, headers))
+        status, payload = self.__class__.routes.get(path, (404, {}))
+        return RoutedResponse(status, payload)
+
+    @classmethod
+    def reset(cls, routes=None):
+        cls.routes = routes or {}
+        cls.calls = []
+
+
+def _fb(**env):
+    return patch.multiple(main.settings, fiber_api_key="fb_key", **env)
+
+
+class FiberSearchBodyTests(unittest.TestCase):
+    def test_an_icp_without_a_size_uses_the_cheaper_people_search(self):
+        path, body = main.build_fiber_search(
+            {"job_title": "Founder", "industry": "computer software"}, 6)
+
+        self.assertEqual(path, "/v1/people-search")
+        self.assertEqual(body["pageSize"], 6)
+        # includeCount costs an extra credit and the row count is what we paid
+        # for anyway.
+        self.assertIs(body["includeCount"], False)
+
+    def test_a_size_moves_it_to_the_combined_endpoint(self):
+        # people-search has no headcount field. Refusing would be honest and
+        # would also make Fiber sit out nearly every search this product sends.
+        path, body = main.build_fiber_search(
+            {"job_title": "Founder", "company_size": "1-10"}, 6)
+
+        self.assertEqual(path, "/v1/combined-search/paginated")
+        self.assertEqual(
+            body["companyConfig"]["searchParams"]["employeeCountV2"],
+            {"lowerBoundExclusive": 0, "upperBoundInclusive": 10})
+
+    def test_the_lower_bound_is_exclusive(self):
+        # A 1-10 band starts above 0, not above 1 — off by one here silently
+        # drops every one-person company.
+        _, body = main.build_fiber_search({"job_title": "F", "company_size": "11-50"}, 6)
+        bounds = body["companyConfig"]["searchParams"]["employeeCountV2"]
+
+        self.assertEqual(bounds["lowerBoundExclusive"], 10)
+        self.assertEqual(bounds["upperBoundInclusive"], 50)
+
+    def test_a_country_is_sent_as_iso3(self):
+        params = main.build_fiber_people_params({"job_title": "F", "location": "US"})
+        self.assertEqual(params["country3LetterCode"], {"anyOf": ["USA"]})
+
+    def test_a_state_carries_its_full_name(self):
+        # "CA" alone is Canada to the classifier, not California.
+        params = main.build_fiber_people_params(
+            {"job_title": "F", "location": "California"})
+
+        self.assertEqual(params["state"]["anyOf"][0]["stateName"], "California")
+        self.assertEqual(params["state"]["anyOf"][0]["countryCode"], "USA")
+
+    def test_a_city_gets_a_radius_because_the_field_requires_one(self):
+        params = main.build_fiber_people_params(
+            {"job_title": "F", "location": "San Francisco"})
+        clause = params["location"]["unionAll"][0]
+
+        self.assertEqual(clause["strategy"], "free-form-city")
+        self.assertEqual(clause["radius"]["unit"], "miles")
+
+    def test_a_continent_is_refused_rather_than_guessed(self):
+        # Their presets are metro areas; none of them is Europe.
+        with self.assertRaises(main.ProviderUnsupported):
+            main.build_fiber_people_params({"job_title": "F", "location": "Europe"})
+
+    def test_every_country_the_parser_emits_has_an_iso3(self):
+        """The guard in the country branch must stay unreachable.
+
+        classify_location returns an ISO-2 code drawn from _BM_COUNTRY_CODE. If
+        a country is added there without an ISO-3 here, Fiber silently stops
+        answering searches for it — a provider quietly sitting out a whole
+        market is exactly the failure this chain keeps producing.
+        """
+        emitted = set(main._BM_COUNTRY_CODE.values())
+
+        self.assertEqual(emitted - set(main._FIBER_COUNTRY3), set())
+
+    def test_the_segment_term_becomes_free_text(self):
+        params = main.build_fiber_people_params(
+            {"job_title": "Founder", "semantic_keywords": "ai saas"})
+
+        self.assertEqual(params["keywordsV2"]["clauses"][0]["terms"], ["ai saas"])
+
+
+class FiberIndustryTests(unittest.TestCase):
+    """An industry outside their enum is refused, never sent."""
+
+    def test_a_shared_spelling_passes_through(self):
+        self.assertEqual(main.fiber_industry("computer software"), "Computer Software")
+
+    def test_their_newer_spelling_is_used_where_it_differs(self):
+        self.assertEqual(main.fiber_industry("oil & energy"), "Oil and Gas")
+        self.assertEqual(main.fiber_industry("pharmaceuticals"),
+                         "Pharmaceutical Manufacturing")
+        self.assertEqual(main.fiber_industry("hospital & health care"),
+                         "Hospitals and Health Care")
+
+    def test_an_unknown_industry_is_none(self):
+        self.assertIsNone(main.fiber_industry("vertical ai agents"))
+
+    def test_the_search_refuses_rather_than_zeroing_itself(self):
+        # The Bytemine lesson: an unmapped industry does not error, it silently
+        # matches nothing, and the chain reads that as "no such people".
+        with self.assertRaises(main.ProviderUnsupported):
+            main.build_fiber_people_params(
+                {"job_title": "F", "industry": "vertical ai agents"})
+
+
+class FiberSearchTests(unittest.IsolatedAsyncioTestCase):
+    def _row(self):
+        return {"name": "Ada Lovelace", "first_name": "Ada", "last_name": "Lovelace",
+                "headline": "Founder at Acme", "primary_slug": "ada",
+                "locality": "London", "industry_name": "Computer Software",
+                "current_job": {"company_name": "Acme", "title": "Founder",
+                                "seniority": "Executive"}}
+
+    async def test_it_reads_the_people_search_envelope(self):
+        FiberClient.reset({"/v1/people-search":
+                           (200, {"output": {"data": [self._row()],
+                                             "nextCursor": "c2"}})})
+        with patch.object(main.httpx, "AsyncClient", FiberClient), _fb():
+            data = await main.fiber_person_search({"job_title": "Founder"}, 6)
+
+        self.assertEqual(data["total"], 1)
+        self.assertEqual(data["next_cursor"], "c2")
+
+    async def test_it_reads_the_combined_envelope_too(self):
+        # The combined endpoint returns the same profile shape under a
+        # different key, with its own cursor.
+        FiberClient.reset({"/v1/combined-search/paginated":
+                           (200, {"output": {"profiles": [self._row()],
+                                             "nextProfilesCursor": "p2"}})})
+        with patch.object(main.httpx, "AsyncClient", FiberClient), _fb():
+            data = await main.fiber_person_search(
+                {"job_title": "Founder", "company_size": "1-10"}, 6)
+
+        self.assertEqual(data["total"], 1)
+        self.assertEqual(data["next_cursor"], "p2")
+
+    async def test_the_key_travels_in_the_header_not_the_body(self):
+        # Every provider module here logs its request body, and a key in the
+        # body is a key in the Railway logs.
+        FiberClient.reset({"/v1/people-search": (200, {"output": {"data": []}})})
+        with patch.object(main.httpx, "AsyncClient", FiberClient), _fb():
+            await main.fiber_person_search({"job_title": "Founder"}, 6)
+
+        _, body, headers = FiberClient.calls[0]
+        self.assertEqual(headers["x-api-key"], "fb_key")
+        self.assertNotIn("apiKey", body)
+
+    async def test_an_error_is_an_empty_page_not_an_exception(self):
+        FiberClient.reset({"/v1/people-search": (402, {"error": "no credits"})})
+        with patch.object(main.httpx, "AsyncClient", FiberClient), _fb():
+            data = await main.fiber_person_search({"job_title": "Founder"}, 6)
+
+        self.assertEqual(data["profiles"], [])
+
+
+class FiberTransformTests(unittest.TestCase):
+    def test_the_documented_row_shape_maps_across(self):
+        lead = main.transform_fiber_profile({
+            "name": "Ada Lovelace", "first_name": "Ada", "last_name": "Lovelace",
+            "headline": "Founder at Acme", "primary_slug": "ada-lovelace",
+            "locality": "London", "industry_name": "Computer Software",
+            "current_job": {"company_name": "Acme", "title": "Founder"},
+        })
+
+        self.assertEqual(lead["contact_name"], "Ada Lovelace")
+        self.assertEqual(lead["job_title"], "Founder")
+        self.assertEqual(lead["company_name"], "Acme")
+        self.assertEqual(lead["linkedin_url"],
+                         "https://www.linkedin.com/in/ada-lovelace")
+        # Search returns no contact details — those are a separate, separately
+        # billed reveal.
+        self.assertIsNone(lead["business_email"])
+
+    def test_the_already_seen_filter_can_read_this_row(self):
+        # _profile_url has to find the URL or the repeat-lead filter matches
+        # nothing — the defect that had ColdIQ showing the same people.
+        lead = main.transform_fiber_profile({"name": "A", "primary_slug": "ada"})
+        self.assertIsNotNone(main._profile_url(lead))
+
+
+class FiberRevealTests(unittest.IsolatedAsyncioTestCase):
+    def _payload(self, emails, phones=None):
+        return {"output": {"profile": {"name": "Ada", "emails": emails,
+                                       "phoneNumbers": phones or []}}}
+
+    async def test_a_verified_address_wins_over_an_unverified_one(self):
+        # Only `valid` has passed deliverability verification upstream.
+        FiberClient.reset({"/v1/contact-details/single": (200, self._payload([
+            {"email": "guess@acme.com", "type": "work", "status": "unknown"},
+            {"email": "ada@acme.com", "type": "work", "status": "valid"},
+        ]))})
+        with patch.object(main.httpx, "AsyncClient", FiberClient), _fb():
+            contact = await main.fiber_reveal("https://linkedin.com/in/ada")
+
+        self.assertEqual(contact["email"], "ada@acme.com")
+        self.assertEqual(contact["email_status"], "valid")
+
+    async def test_personal_emails_are_never_paid_for(self):
+        FiberClient.reset({"/v1/contact-details/single": (200, self._payload([]))})
+        with patch.object(main.httpx, "AsyncClient", FiberClient), _fb():
+            await main.fiber_reveal("https://linkedin.com/in/ada")
+
+        sent = FiberClient.calls[0][1]["enrichmentType"]
+        self.assertIs(sent["getWorkEmails"], True)
+        self.assertIs(sent["getPersonalEmails"], False)
+
+    async def test_phones_are_requested_so_the_leg_does_not_lose_them(self):
+        # This leg returns early on a hit; without phones it would quietly drop
+        # the number Wiza would have supplied for the same lead.
+        FiberClient.reset({"/v1/contact-details/single": (200, self._payload(
+            [{"email": "a@b.com", "type": "work", "status": "valid"}],
+            [{"number": "+15551234567", "type": "mobile"}]))})
+        with patch.object(main.httpx, "AsyncClient", FiberClient), _fb():
+            contact = await main.fiber_reveal("https://linkedin.com/in/ada",
+                                              want_phone=True)
+
+        self.assertIs(FiberClient.calls[0][1]["enrichmentType"]["getPhoneNumbers"], True)
+        self.assertEqual(contact["phone"], "+15551234567")
+
+    async def test_no_url_is_no_call(self):
+        FiberClient.reset({})
+        with patch.object(main.httpx, "AsyncClient", FiberClient), _fb():
+            self.assertEqual(await main.fiber_reveal(""), {})
+        self.assertEqual(FiberClient.calls, [])
+
+
+class FiberVerifyTests(unittest.IsolatedAsyncioTestCase):
+    async def _verdict(self, payload, status=200):
+        FiberClient.reset({"/v1/validate-email/single": (status, payload)})
+        with patch.object(main.httpx, "AsyncClient", FiberClient), _fb():
+            return await main.fiber_verify_email("ada@acme.com")
+
+    async def test_ok_is_sendable(self):
+        v = await self._verdict({"output": {"verdict": "ok", "is_catch_all": False,
+                                            "is_role_based": False}})
+        self.assertEqual(v["status"], "deliverable")
+        self.assertIs(v["sendable"], True)
+        self.assertIs(v["catch_all"], False)
+
+    async def test_risky_is_a_real_answer_and_is_not_sendable(self):
+        # A catch-all domain accepts everything; that is a verdict, not a
+        # failure to reach one.
+        v = await self._verdict({"output": {"verdict": "risky", "is_catch_all": True}})
+
+        self.assertEqual(v["status"], "risky")
+        self.assertIs(v["sendable"], False)
+        self.assertIs(v["catch_all"], True)
+
+    async def test_inconclusive_says_nobody_could_tell(self):
+        v = await self._verdict({"output": {"verdict": "inconclusive"}})
+        self.assertEqual(v["status"], "unknown")
+        self.assertIsNone(v["sendable"])
+
+    async def test_out_of_credits_does_not_invent_a_verdict(self):
+        v = await self._verdict({"error": "no credits"}, status=402)
+        self.assertIsNone(v["sendable"])
+        self.assertIn("credits", v["reason"])
+
+
+class FiberVerifierOrderTests(unittest.IsolatedAsyncioTestCase):
+    """Fiber is asked before Findymail; ColdIQ is never second-guessed."""
+
+    async def test_it_is_tried_before_findymail(self):
+        asked: list = []
+
+        async def coldiq(email):
+            return {"status": "unknown", "sendable": None, "checked_by": "coldiq",
+                    "reason": "coldiq out of credits"}
+
+        async def fiber(email):
+            asked.append("fiber")
+            return {"status": "deliverable", "sendable": True, "checked_by": "fiber"}
+
+        async def findymail(email):
+            asked.append("findymail")
+            return {"status": "deliverable", "sendable": True, "checked_by": "findymail"}
+
+        with patch.object(main, "coldiq_verify_email", coldiq), \
+             patch.object(main, "fiber_verify_email", fiber), \
+             patch.object(main, "findymail_verify_email", findymail), \
+             patch.object(main, "provider_configured", lambda n: True):
+            lead = await main.verify_revealed_lead(
+                {"business_email": "ada@acme.com"}, "wiza")
+
+        self.assertEqual(asked, ["fiber"])
+        self.assertEqual(lead["email_verification"]["checked_by"], "fiber")
+        self.assertEqual(lead["email_verification"]["fell_back_from"],
+                         "coldiq out of credits")
+
+    async def test_a_coldiq_verdict_is_left_alone(self):
+        asked: list = []
+
+        async def coldiq(email):
+            return {"status": "deliverable", "sendable": True, "checked_by": "coldiq"}
+
+        async def fiber(email):
+            asked.append("fiber")
+            return {"status": "undeliverable", "sendable": False, "checked_by": "fiber"}
+
+        with patch.object(main, "coldiq_verify_email", coldiq), \
+             patch.object(main, "fiber_verify_email", fiber), \
+             patch.object(main, "provider_configured", lambda n: True):
+            lead = await main.verify_revealed_lead(
+                {"business_email": "ada@acme.com"}, "wiza")
+
+        self.assertEqual(asked, [])
+        self.assertIs(lead["email_verified"], True)
+
+
+class FiberChainTests(unittest.TestCase):
+    def test_it_sits_after_getleads_and_before_the_reveal_tools(self):
+        order = list(main.PROVIDER_ORDER)
+
+        self.assertGreater(order.index("fiber"), order.index("getleads"))
+        self.assertLess(order.index("fiber"), order.index("coldiq"))
+        self.assertLess(order.index("fiber"), order.index("wiza"))
+
+    def test_no_key_removes_it_rather_than_breaking_the_chain(self):
+        with patch.object(main.settings, "bytemine_api_key", "b"), \
+             patch.object(main.settings, "fiber_api_key", None), \
+             patch.object(main.settings, "search_provider", "bytemine"):
+            self.assertNotIn("fiber", main.provider_chain())
+
+    def test_a_key_is_all_it_takes(self):
+        with patch.object(main.settings, "bytemine_api_key", "b"), \
+             patch.object(main.settings, "fiber_api_key", "fb"), \
+             patch.object(main.settings, "search_provider", "bytemine"):
+            self.assertIn("fiber", main.provider_chain())
+
+
 class ProviderFilterDiagnosticTests(unittest.IsolatedAsyncioTestCase):
     """Turn "the search returns nothing" into "nothing once X is applied".
 
