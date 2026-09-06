@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import unittest
@@ -3227,6 +3228,117 @@ class FindymailPitchTests(unittest.TestCase):
         self.assertEqual(
             main.findymail_query_from_sentence("dental clinics https://x.com/a"),
             "dental clinics")
+
+
+class DuplicateSearchTests(unittest.IsolatedAsyncioTestCase):
+    """One search must not pay every provider twice.
+
+    The frontend dispatches every search from two connections a few hundred
+    milliseconds apart. Both missed the cache — neither had finished writing it
+    — so both walked the whole chain: two Wiza prospect lists created for one
+    search (ids 5333148 and 5333149 in the same second), two GetLeads pages,
+    two of everything that bills per record.
+    """
+
+    async def run_twice(self, request_kwargs, cache_enabled=True):
+        walks: list = []
+        stored: dict = {}
+
+        async def bytemine(params, limit, **kwargs):
+            walks.append("bytemine")
+            await asyncio.sleep(0.02)          # hold the lock like a real call
+            return {"profiles": [{"pid": "1", "first_name": "Ada"}],
+                    "total": 1, "next_cursor": None}
+
+        class Row:
+            """What cache_lookup really returns: a row carrying JSON text."""
+            def __init__(self, payload):
+                self.results = json.dumps(payload)
+
+        async def lookup(h):
+            return stored.get(h) if cache_enabled else None
+
+        async def store(h, params, payload):
+            stored[h] = Row(payload)
+
+        patches = [
+            patch.object(main.settings, "bytemine_api_key", "b"),
+            patch.object(main.settings, "search_provider", "bytemine"),
+            patch.object(main, "provider_chain", lambda: ("bytemine",)),
+            patch.object(main, "bytemine_person_search", bytemine),
+            patch.object(main, "cache_lookup", lookup),
+            patch.object(main, "cache_store", store),
+        ]
+        for p in patches:
+            p.start()
+        try:
+            results = await asyncio.gather(
+                main.search_leads(main.SearchRequest(**request_kwargs)),
+                main.search_leads(main.SearchRequest(**request_kwargs)),
+            )
+        finally:
+            for p in patches:
+                p.stop()
+        return results, walks
+
+    async def test_two_identical_searches_walk_the_chain_once(self):
+        results, walks = await self.run_twice(
+            {"job_title": "Founder", "location": "CA"})
+
+        self.assertEqual(walks, ["bytemine"])
+        self.assertEqual([r.count for r in results], [1, 1])
+
+    async def test_the_second_one_is_served_from_the_cache(self):
+        results, _ = await self.run_twice({"job_title": "Founder", "location": "CA"})
+
+        self.assertEqual(sorted(r.from_cache for r in results), [False, True])
+
+    async def test_a_refresh_still_does_its_own_work(self):
+        # Bypassing the cache is what refresh was asked for.
+        _, walks = await self.run_twice(
+            {"job_title": "Founder", "location": "CA", "refresh": True})
+
+        self.assertEqual(walks, ["bytemine", "bytemine"])
+
+    async def test_different_searches_are_not_serialised_into_one(self):
+        walks: list = []
+
+        async def bytemine(params, limit, **kwargs):
+            walks.append(params.get("job_title"))
+            return {"profiles": [{"pid": "1"}], "total": 1, "next_cursor": None}
+
+        async def no_cache(_h):
+            return None
+
+        async def no_store(*a, **k):
+            return None
+
+        patches = [
+            patch.object(main.settings, "bytemine_api_key", "b"),
+            patch.object(main.settings, "search_provider", "bytemine"),
+            patch.object(main, "provider_chain", lambda: ("bytemine",)),
+            patch.object(main, "bytemine_person_search", bytemine),
+            patch.object(main, "cache_lookup", no_cache),
+            patch.object(main, "cache_store", no_store),
+        ]
+        for p in patches:
+            p.start()
+        try:
+            await asyncio.gather(
+                main.search_leads(main.SearchRequest(job_title="Founder")),
+                main.search_leads(main.SearchRequest(job_title="CTO")),
+            )
+        finally:
+            for p in patches:
+                p.stop()
+
+        self.assertEqual(sorted(walks), ["CTO", "Founder"])
+
+    async def test_the_lock_is_forgotten_once_nobody_is_waiting(self):
+        # An unbounded dict keyed on every search body is a leak.
+        await self.run_twice({"job_title": "Founder", "location": "CA"})
+
+        self.assertEqual(main._search_locks, {})
 
 
 class PitchAsSemanticQueryTests(unittest.IsolatedAsyncioTestCase):

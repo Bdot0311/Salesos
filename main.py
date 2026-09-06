@@ -4,6 +4,7 @@ A FastAPI application that caches Wiza API results to reduce costs.
 """
 
 import asyncio
+from contextlib import asynccontextmanager
 import base64
 import contextvars
 import hashlib
@@ -5953,8 +5954,51 @@ def enforce_crustdata_search_scope(params: dict, allow_broad_search: bool) -> No
         )
 
 
+# Identical searches arriving together used to walk the chain twice.
+#
+# The frontend dispatches every search from two connections a few hundred
+# milliseconds apart. Both miss the cache, because neither has finished writing
+# it yet, so both walk the whole chain: two Wiza prospect lists created for one
+# search (ids 5333148 and 5333149 in the same second), two GetLeads pages, two
+# of everything that bills per record. The cache was never the wrong idea, it
+# just cannot help a request that has not finished yet.
+#
+# So the second one waits. When it gets through, the first has written the
+# cache and it returns from there — no provider is called twice for one search.
+# A refresh or a campaign search deliberately bypasses the cache, so those still
+# do their own work, which is what they were asked for.
+_search_locks: dict[str, list] = {}
+
+
+@asynccontextmanager
+async def one_search_at_a_time(key: str):
+    """Serialise byte-identical concurrent searches, and forget the key after."""
+    entry = _search_locks.setdefault(key, [asyncio.Lock(), 0])
+    entry[1] += 1
+    waited = entry[0].locked()
+    try:
+        async with entry[0]:
+            if waited:
+                print(f"An identical search was already running — waited for it "
+                      f"rather than paying every provider twice")
+            yield
+    finally:
+        entry[1] -= 1
+        if entry[1] <= 0:
+            _search_locks.pop(key, None)
+
+
 @app.post("/search", response_model=SearchResponse)
 async def search_leads(request: SearchRequest):
+    """Serialise duplicate in-flight searches, then run one."""
+    key = hashlib.sha256(
+        json.dumps(request.model_dump(), sort_keys=True, default=str).encode()
+    ).hexdigest()
+    async with one_search_at_a_time(key):
+        return await walk_search(request)
+
+
+async def walk_search(request: SearchRequest):
     """
     Cache-first lead search powered by Wiza.
 
@@ -6325,7 +6369,7 @@ async def search_leads(request: SearchRequest):
     wanted = max(int(params.get("limit") or 10), 1)
     collected = 0
 
-    for name in chain:
+    for position, name in enumerate(chain):
         try:
             outcome = await run_provider(name, wanted - collected)
         except ProviderUnsupported as outcome:
@@ -6359,9 +6403,13 @@ async def search_leads(request: SearchRequest):
         collected += len(found)
         if collected >= wanted:
             break
-        if found:
+        if found and position + 1 < len(chain):
             print(f"{name} filled {collected}/{wanted} — continuing the chain "
                   f"for {wanted - collected} more")
+        elif found:
+            # The last leg. "Continuing the chain" here was a line the logs told
+            # you on every partial Wiza page, with nothing left to continue to.
+            print(f"{name} filled {collected}/{wanted} — end of the chain")
 
     # Nothing ran at all. Distinguish the two ways that happens: every provider
     # refused the filter, or every provider errored. An empty success would
