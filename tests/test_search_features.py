@@ -3170,6 +3170,169 @@ class FiberChainTests(unittest.TestCase):
             self.assertIn("fiber", main.provider_chain())
 
 
+class SegmentTermBoundaryTests(unittest.TestCase):
+    """A filename is not a segment term."""
+
+    def test_a_filename_stem_is_not_a_match(self):
+        # Every pitch in production mentions "llm.txt robot.txt" as an SEO
+        # deliverable, and "llm" matched inside it — so a search for salon
+        # owners went out with company_description "llm", narrowing it to
+        # companies that talk about language models.
+        self.assertEqual(
+            main.semantic_terms_in("comes with SEO like llm.txt robot.txt"), [])
+
+    def test_the_real_term_still_matches(self):
+        self.assertEqual(
+            main.semantic_terms_in("Founders at B2B AI SaaS companies"), ["ai saas"])
+
+    def test_a_term_ending_a_sentence_still_matches(self):
+        self.assertEqual(main.semantic_terms_in("companies building with ai."), ["ai"])
+
+
+class FindymailPitchTests(unittest.TestCase):
+    """Intellimatch searches company descriptions, not the user's offer."""
+
+    def test_a_sales_pitch_is_not_a_company_description(self):
+        # Every Findymail search in production answered `failed`, having been
+        # sent several hundred words of offer, pricing and links.
+        pitch = ("I am selling a website to car showrooms, "
+                 "https://showroom.vercel.app/ the website is modern, fast and "
+                 "responsive, it cost only 50$ with included hosting. for "
+                 "maintaince I charge 5dolllar per month.")
+
+        self.assertEqual(main.findymail_query_from_sentence(pitch), "")
+
+    def test_a_description_of_the_buyer_is_kept(self):
+        icp = "early stage B2B AI SaaS companies with 1-10 employees"
+        self.assertEqual(main.findymail_query_from_sentence(icp), icp)
+
+    def test_a_pitch_falls_back_to_the_structured_filters(self):
+        query = main.findymail_intellimatch_query({
+            "semantic_query": "I am selling a website to salons, it cost only 50$",
+            "industry": "computer software", "company_size": "1-10"})
+
+        self.assertNotIn("selling", query)
+        self.assertIn("computer software", query)
+        self.assertIn("1-10", query)
+
+    def test_a_demoted_industry_reaches_the_synthesised_query(self):
+        # "Salon" is no longer an industry filter — it must still describe the
+        # companies here, or this leg searches for something else entirely.
+        query = main.findymail_intellimatch_query(
+            {"semantic_keywords": "Salon", "company_size": "1-10"})
+
+        self.assertIn("Salon", query)
+
+    def test_a_url_alone_does_not_disqualify_a_short_description(self):
+        self.assertEqual(
+            main.findymail_query_from_sentence("dental clinics https://x.com/a"),
+            "dental clinics")
+
+
+class PitchAsSemanticQueryTests(unittest.IsolatedAsyncioTestCase):
+    """A pitch ranks up the seller's competitors, not the buyer.
+
+    Crustdata ranks semantically on this sentence. Production sent it "I am
+    selling a website to car showrooms ... modern, fast and responsive ... SEO
+    ..." and got back a "Website Designer", a "Showit Website Designer for
+    female entrepreneurs", and an SEO consultant headlined "Ranking is vanity.
+    Sales is sanity." — ten of them. The search worked exactly as asked and
+    returned the user's own competitors.
+    """
+
+    async def resolve(self, **kwargs):
+        return await main.resolve_search_params(main.SearchRequest(**kwargs))
+
+    async def test_a_pitch_is_not_used_to_rank(self):
+        params = await self.resolve(
+            query=("I am selling a website to car showrooms, "
+                   "https://showroom.vercel.app/ it cost only 50$ with hosting"),
+            job_title="Owner", industry="automotive")
+
+        self.assertNotIn("semantic_query", params)
+
+    async def test_a_description_of_the_buyer_still_ranks(self):
+        sentence = "heads of RevOps at fintechs replacing Salesforce"
+        params = await self.resolve(
+            query=sentence, job_title="VP Sales", industry="financial services")
+
+        self.assertEqual(params["semantic_query"], sentence)
+
+    async def test_the_icp_survives_a_dropped_pitch(self):
+        # The structured filters the sentence was parsed into are still here,
+        # and so are the segment terms recovered from it.
+        params = await self.resolve(
+            query="I am selling to B2B AI SaaS founders, it cost only 50$",
+            job_title="Founder", industry="computer software")
+
+        self.assertEqual(params["job_title"], "Founder")
+        self.assertEqual(params["industry"], "computer software")
+        self.assertEqual(params["semantic_keywords"], "ai saas")
+
+    async def test_the_pitch_never_reaches_crustdata(self):
+        params = await self.resolve(
+            query="I am selling a website to salons, it cost only 50$ per month",
+            job_title="Owner", company_size="1-10")
+        body_text = json.dumps(main.build_crustdata_filters(params))
+
+        self.assertNotIn("selling", body_text)
+
+
+class ColdiqCreditLatchTests(unittest.IsolatedAsyncioTestCase):
+    """A 402 is a fact about the balance — there is no reason to keep asking."""
+
+    def setUp(self):
+        main._coldiq_exhausted_until = 0.0
+
+    def tearDown(self):
+        main._coldiq_exhausted_until = 0.0
+
+    async def test_a_402_stops_the_next_call_from_going_out(self):
+        # Three doomed round trips per enrich and one per search, 1-3 seconds
+        # each, on every request the product serves.
+        main.coldiq_note_status(402)
+
+        RoutedClient.reset({"/v1/email/find": (200, {"data": {"email": "a@b.com"}})})
+        with patch.object(main.httpx, "AsyncClient", RoutedClient), \
+             patch.object(main.settings, "coldiq_api_key", "key"):
+            result = await main.coldiq_verb("/v1/email/find", {"domain": "b.com"})
+
+        self.assertIsNone(result)
+        self.assertEqual(RoutedClient.calls, [])
+
+    async def test_the_search_leg_refuses_without_a_round_trip(self):
+        main.coldiq_note_status(402)
+
+        RoutedClient.reset({})
+        with patch.object(main.httpx, "AsyncClient", RoutedClient), \
+             patch.object(main.settings, "coldiq_api_key", "key"):
+            with self.assertRaises(main.HTTPException) as raised:
+                await main.coldiq_person_search({"job_title": "Founder"}, 6)
+
+        self.assertEqual(raised.exception.status_code, 402)
+        self.assertEqual(RoutedClient.calls, [])
+
+    async def test_the_latch_expires_so_a_top_up_needs_no_deploy(self):
+        main.coldiq_note_status(402)
+        self.assertTrue(main.coldiq_out_of_credits())
+
+        main._coldiq_exhausted_until = 0.0
+        RoutedClient.reset({"/v1/email/find": (200, {"data": {"email": "a@b.com"}})})
+        with patch.object(main.httpx, "AsyncClient", RoutedClient), \
+             patch.object(main.settings, "coldiq_api_key", "key"):
+            result = await main.coldiq_verb("/v1/email/find", {"domain": "b.com"})
+
+        self.assertIsNotNone(result)
+
+    async def test_a_healthy_response_leaves_the_latch_open(self):
+        RoutedClient.reset({"/v1/email/find": (200, {"data": {"email": "a@b.com"}})})
+        with patch.object(main.httpx, "AsyncClient", RoutedClient), \
+             patch.object(main.settings, "coldiq_api_key", "key"):
+            await main.coldiq_verb("/v1/email/find", {"domain": "b.com"})
+
+        self.assertFalse(main.coldiq_out_of_credits())
+
+
 class ModernIndustryVocabularyTests(unittest.TestCase):
     """GetLeads and Fiber are on current LinkedIn; Bytemine is on the classic."""
 
