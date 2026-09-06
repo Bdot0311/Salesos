@@ -3270,6 +3270,29 @@ class ProviderFilterDiagnosticTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(step["outcome"], "error")
         self.assertEqual(step["status"], 402)
 
+    async def test_it_is_reachable_from_a_url_bar(self):
+        """A diagnostic nobody can run does not diagnose anything.
+
+        The POST is the real shape, but running it needs a terminal or an HTTP
+        client. The GET takes the same filters as query params so it can be
+        pasted into a browser by whoever is watching the logs.
+        """
+        patches = [patch.object(main, "provider_configured", lambda n: True)]
+        for attr in ("bytemine_person_search", "crustdata_person_search",
+                     "getleads_person_search"):
+            patches.append(patch.object(main, attr, self._probe(empties_on="industry")))
+        for p in patches:
+            p.start()
+        try:
+            report = await main.diagnose_provider_filters_from_url(
+                job_title="Founder", industry="computer software")
+        finally:
+            for p in patches:
+                p.stop()
+
+        self.assertIn("industry", report["providers"]["bytemine"]["verdict"])
+        self.assertEqual(report["params"]["job_title"], "Founder")
+
     async def test_a_search_with_nothing_to_isolate_is_refused(self):
         with self.assertRaises(main.HTTPException) as raised:
             await self.diagnose(main.SearchRequest(company_domain="acme.com"))

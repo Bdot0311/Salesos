@@ -6628,6 +6628,28 @@ async def probe_provider_filters(name: str, params: dict) -> dict:
             "returned": len(result.get("profiles") or [])}
 
 
+@app.get("/diagnostics/provider-filters")
+async def diagnose_provider_filters_from_url(
+    query: str = None,
+    job_title: str = None,
+    industry: str = None,
+    company_size: str = None,
+    location: str = None,
+    seniority: str = None,
+    keywords: str = None,
+):
+    """The same probe, reachable from a browser address bar.
+
+    The POST below is the real shape, but a diagnostic nobody can run does not
+    diagnose anything: this is meant to be pasted into a URL bar by whoever is
+    watching the logs, without a terminal or an HTTP client in the way.
+    """
+    return await diagnose_provider_filters(SearchRequest(
+        query=query, job_title=job_title, industry=industry,
+        company_size=company_size, location=location, seniority=seniority,
+        keywords=keywords))
+
+
 @app.post("/diagnostics/provider-filters")
 async def diagnose_provider_filters(request: SearchRequest):
     """Find which filter empties a provider's search.
