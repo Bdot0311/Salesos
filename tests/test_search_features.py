@@ -3170,6 +3170,84 @@ class FiberChainTests(unittest.TestCase):
             self.assertIn("fiber", main.provider_chain())
 
 
+class ModernIndustryVocabularyTests(unittest.TestCase):
+    """GetLeads and Fiber are on current LinkedIn; Bytemine is on the classic."""
+
+    def test_getleads_gets_the_spelling_its_validator_demands(self):
+        # Production: 400 "Invalid industries: Food & Beverages. Valid values:
+        # IT Services and IT Consulting, Hospitals and Health Care, ..." — an
+        # error, so the leg dropped out of the search entirely.
+        f = main.build_getleads_filters(
+            {"job_title": "Owner", "industry": "food & beverages"})
+
+        self.assertEqual(f["industries"], ["Food and Beverage Services"])
+
+    def test_the_classic_spelling_is_never_sent_to_getleads(self):
+        for ours, theirs in (("hospital & health care", "Hospitals and Health Care"),
+                             ("oil & energy", "Oil and Gas"),
+                             ("pharmaceuticals", "Pharmaceutical Manufacturing")):
+            f = main.build_getleads_filters({"job_title": "O", "industry": ours})
+            self.assertEqual(f["industries"], [theirs])
+
+    def test_bytemine_still_gets_the_classic_spelling(self):
+        body = main.build_bytemine_filters(
+            {"job_title": "Owner", "industry": "hospital & health care"})
+
+        self.assertEqual(body["industries"], ["Hospital & Health Care"])
+
+    def test_fiber_and_getleads_agree(self):
+        self.assertEqual(main.fiber_industry("food & beverages"),
+                         main.modern_linkedin_industry("food & beverages"))
+
+
+class UnexpressibleIndustryTests(unittest.IsolatedAsyncioTestCase):
+    """An industry nobody has a field for is a search term, not a filter.
+
+    The frontend's parser invents segment names — "Beauty & Wellness", "Salon &
+    Spa", "Events". Every leg then correctly refuses a filter it cannot express,
+    and because they all refuse the same one the user gets an empty page: eight
+    providers, all of them right, nothing found.
+    """
+
+    async def resolve(self, **kwargs):
+        return await main.resolve_search_params(main.SearchRequest(**kwargs))
+
+    async def test_an_invented_industry_becomes_free_text(self):
+        params = await self.resolve(job_title="Owner", industry="Salon & Spa")
+
+        self.assertNotIn("industry", params)
+        self.assertEqual(params["semantic_keywords"], "Salon & Spa")
+
+    async def test_it_is_not_dropped(self):
+        # Dropping would silently broaden the ICP, which is exactly what the
+        # refusal exists to prevent. It moves, it does not disappear.
+        params = await self.resolve(job_title="Owner", industry="Beauty")
+        f = main.build_getleads_filters(params)
+
+        self.assertIn("Beauty", f["company_description"])
+
+    async def test_a_real_industry_stays_a_filter(self):
+        params = await self.resolve(job_title="Founder", industry="computer software")
+
+        self.assertEqual(params["industry"], "computer software")
+        self.assertNotIn("semantic_keywords", params)
+
+    async def test_it_joins_a_segment_term_rather_than_replacing_it(self):
+        params = await self.resolve(
+            query="Owners at AI SaaS salons", job_title="Owner", industry="Salon")
+
+        self.assertIn("ai saas", params["semantic_keywords"])
+        self.assertIn("Salon", params["semantic_keywords"])
+
+    async def test_the_chain_can_now_answer_a_salon_search(self):
+        # Every provider refused this before, so the page came back empty.
+        params = await self.resolve(job_title="Owner", industry="Beauty & Wellness")
+
+        main.build_getleads_filters(params)   # no ProviderUnsupported
+        main.build_fiber_people_params(params)
+        main.build_bytemine_filters(params)
+
+
 class ProviderFilterDiagnosticTests(unittest.IsolatedAsyncioTestCase):
     """Turn "the search returns nothing" into "nothing once X is applied".
 
