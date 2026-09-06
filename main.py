@@ -4379,9 +4379,22 @@ async def bytemine_person_search(params: dict, limit: int, cursor: str = None,
         body["after"] = cursor
 
     data = await bytemine_call("/contacts/search", body)
-    profiles = data.get("data") or []
+    # /contacts/search answers {"contacts": [...], "totalCount": N, "page": ...}.
+    # This read `data["data"]` and `data["pagination"]["total"]`, neither of
+    # which this endpoint has ever returned — so `profiles` was [] and `total`
+    # was 0 on every search since the provider was added, whatever the API
+    # actually found. The probe settles it: jobTitles=["Founder"] returns
+    # totalCount 1,297,933, and we reported nothing.
+    #
+    # Every previous theory about these zeros — the seniority double-filter, the
+    # industry vocabulary, the missing country field — was about the request.
+    # The request was fine. We were not reading the answer.
+    profiles = (data.get("contacts") or data.get("results")
+                or data.get("data") or [])
     pagination = data.get("pagination") or {}
-    total = pagination.get("total")
+    total = data.get("totalCount")
+    if total is None:
+        total = pagination.get("total")
     return {
         "profiles": profiles,
         "total": len(profiles) if total is None else total,
@@ -4597,20 +4610,27 @@ def build_crustdata_filters(p: dict):
         })
 
     if p.get("industry"):
-        # company_industries holds LinkedIn's industry names — "Computer
-        # Software", not our lowercase PDL-style "computer software". Sent
-        # through unmapped, a contains match looks for a string that is not
-        # written anywhere in the field, and the whole AND collapses to zero
-        # rows while still reporting a successful search. Every other provider
-        # in the chain translates industry into its own taxonomy; this one was
-        # the exception.
+        # Crustdata cannot filter on industry, and refuses to say so.
         #
-        # Unlike Bytemine an unmappable industry is not refused here: this is a
-        # contains match rather than an enum, and Crustdata is the only
-        # provider that can express a country, so refusing would cost more than
-        # a broad match. The raw term is passed through as before.
-        conds.append({"field": _CD_INDUSTRY, "type": "(.)",
-                      "value": linkedin_industry(p["industry"]) or p["industry"]})
+        # The shape probe asked it five ways, each ANDed with the same title
+        # filter that returns 4,353,682 rows on its own:
+        #
+        #   company_industries                     (.)  "Computer Software"  -> 0
+        #   company_industries                     (.)  "computer software"  -> 0
+        #   company_industries                     =    "Computer Software"  -> 0
+        #   company_professional_network_industry  (.)  "Computer Software"  -> 0
+        #   company_professional_network_industry  =    "Computer Software"   -> 0
+        #
+        # Every one returns a 200 and zero rows. The field reads back fine in a
+        # response — transform_crustdata_profile has always used it — but
+        # returnable and filterable are not the same thing here, and an
+        # unfilterable field silently annihilates the whole AND.
+        #
+        # So it is refused rather than sent. The chain then moves to a provider
+        # that can express an industry instead of Crustdata reporting "no such
+        # people" for an ICP it never actually searched. This is the same rule
+        # build_bytemine_filters applies to a country it has no field for.
+        raise ProviderUnsupported("industry", p["industry"])
 
     if p.get("company_size"):
         lo, hi = _size_bounds(p["company_size"])
