@@ -2377,6 +2377,12 @@ def bytemine_employee_band(size: str):
 
 GETLEADS_BASE = "https://app.getleads.io"
 
+# How many pages a single search will walk looking for people it has not shown
+# before. Each page is a round trip and is billed per record returned, so this
+# is deliberately small: three depths of "everyone here is already seen" is a
+# genuine no-new-results answer, not a reason to keep paying to page.
+GETLEADS_MAX_PAGES = 3
+
 # Their documented job-level enum: C-Team, VP, Director, Manager, Staff, Other.
 # Only mappings the docs evidence are listed. "founder" and "owner" have no
 # level of their own — the docs put founders under the CEO/Founder *persona*,
@@ -2457,8 +2463,15 @@ def build_getleads_filters(p: dict) -> dict:
 
     # A segment phrase belongs against the company's own description of itself,
     # which is where "AI SaaS" is actually written down.
-    if p.get("keywords"):
-        f["company_description"] = str(p["keywords"])
+    #
+    # semantic_keywords are the same kind of phrase recovered from the user's
+    # sentence when the frontend's parser folded it into an industry and dropped
+    # the rest. This leg is usually the one that actually returns rows, so
+    # without them a search for "B2B AI SaaS founders" was answered with any
+    # founder at any small software company anywhere.
+    segment = p.get("keywords") or p.get("semantic_keywords")
+    if segment:
+        f["company_description"] = str(segment)
 
     location = p.get("location") or p.get("company_location")
     if location:
@@ -5264,6 +5277,32 @@ async def resolve_search_params(request: SearchRequest) -> dict:
         params["semantic_query"] = raw_query
         print(f"Retaining semantic query alongside structured filters: {raw_query!r}")
 
+        # Retaining the sentence only helps the one provider that reads it.
+        # Crustdata searches semantic_query; every other leg sees the structured
+        # filters and nothing else. So "Founders at B2B AI SaaS companies" went
+        # out as job_title=Founder + industry=computer software, and when
+        # Crustdata returned nothing — which is most searches — what the user
+        # actually saw was any founder at any small software company anywhere.
+        # The AI part of their ICP was never applied to a single lead they were
+        # shown.
+        #
+        # The frontend does its own parsing and sends no keywords, so the
+        # backend parser below (which keeps these terms — see the comment in
+        # parse_icp) never runs. Recover them here.
+        #
+        # They are NOT promoted to `keywords`. That field means "a criterion the
+        # user stated", and a provider with no free-text field refuses the whole
+        # search rather than drop one — build_wiza_filters does exactly that. A
+        # term lifted out of the sentence has not been stated separately; it has
+        # the same provenance as semantic_query and gets the same treatment, so
+        # it narrows the providers that can express it and sidelines nobody.
+        if not params.get("keywords"):
+            terms = semantic_terms_in(raw_query)
+            if terms:
+                params["semantic_keywords"] = " ".join(terms)
+                print("Recovered segment terms the structured filters dropped: "
+                      f"{params['semantic_keywords']!r}")
+
     if raw_query and not any(params.get(f) for f in STRUCTURED_FIELDS):
         parsed_filters: dict = {}
         # The rule-based parser is free and deterministic — always run it. The
@@ -5501,26 +5540,55 @@ async def search_leads(request: SearchRequest):
             return found, result["total"], result.get("next_cursor")
 
         if name == "getleads":
-            # The one leg with a real offset: page two is fetched as page two
-            # rather than over-fetched and sliced, which matters because this
-            # provider bills per record returned. Exclusions are still applied
-            # after — the search has no exclude-by-profile field — but they trim
-            # a page that was already the right page.
-            data = await getleads_person_search(
-                params, params.get("limit", 10), offset=request.start_offset)
-            found = data["profiles"]
+            # The one leg with a real offset, so it is the one leg that can go
+            # and find people it has not shown before.
+            #
+            # It used to fetch offset=start_offset once and filter the result.
+            # start_offset is zero on every fresh search — the frontend sends
+            # page 1 each time — so the same first N rows came back for the same
+            # ICP, the already-seen list removed the ones the user had already
+            # been shown, and what was left was whatever remained of a fixed
+            # page. Search the same ICP a few times and that page is entirely
+            # seen: the provider is still answering, still billing, and the user
+            # gets nothing new. That is the "same leads over and over" this has
+            # been doing.
+            #
+            # So: page forward until the requested number of *unseen* people is
+            # found. Bounded, because this provider bills per record returned
+            # and each page is a round trip — a fully-seen page depth is a real
+            # "nothing new here" answer, not a reason to walk the whole index.
+            wanted = params.get("limit", 10)
+            offset = request.start_offset
+            seen = {i for i in (linkedin_identity(u) for u in (exclusions or [])) if i}
+            found: list = []
+            total = 0
 
-            if exclusions:
-                seen = {i for i in (linkedin_identity(u) for u in exclusions) if i}
-                found = [c for c in found
-                         if linkedin_identity(_profile_url(c)) not in seen]
-            if campaign_keys:
-                found = [c for c in found
-                         if _profile_lead_key(c) not in campaign_keys]
+            for _ in range(GETLEADS_MAX_PAGES):
+                data = await getleads_person_search(params, wanted, offset=offset)
+                page = data["profiles"]
+                total = data["total"]
+
+                fresh = page
+                if seen:
+                    fresh = [c for c in fresh
+                             if linkedin_identity(_profile_url(c)) not in seen]
+                if campaign_keys:
+                    fresh = [c for c in fresh
+                             if _profile_lead_key(c) not in campaign_keys]
+                found.extend(fresh)
+
+                next_offset = data.get("next_offset")
+                if len(found) >= wanted or not page or next_offset is None:
+                    break
+                print(f"GetLeads: {len(page)} row(s) at offset {offset} already "
+                      f"seen — paging to {next_offset} for new people")
+                offset = next_offset
+
+            found = found[:wanted]
             if request.campaign_id:
                 found = await record_new_campaign_profiles(request.campaign_id, found)
 
-            return found, data["total"], None
+            return found, total, None
 
         if name == "treg":
             # Treg's routed endpoint chooses among its lead-gen providers. It
