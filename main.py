@@ -6152,5 +6152,105 @@ async def debug_info():
 
 
 # =============================================================================
+# Provider filter diagnostics
+# =============================================================================
+#
+# Bytemine and Crustdata return totalCount 0 for ICPs that GetLeads answers with
+# a full page — the same job title, the same industry, the same headcount band.
+# Three fixes have been aimed at that from a reading of the request bodies and
+# none of them moved it, because a body that looks correct and a body that
+# matches their index are not the same thing and no amount of re-reading tells
+# them apart.
+#
+# So: stop guessing and ask. This adds one filter at a time and reports the
+# count after each, which turns "the search returns nothing" into "the search
+# returns nothing once <field> is added" — a fact rather than a hypothesis.
+#
+# It is safe to run. Every probe asks for a single row, and a probe that matches
+# nothing returns nothing, which is the case being investigated and the case
+# these providers do not bill for. A full sweep of a four-filter ICP across
+# three providers costs at most twelve records.
+
+DIAGNOSTIC_FILTER_ORDER = (
+    "job_title", "seniority", "industry", "company_size",
+    "location", "company_location", "departments", "keywords",
+)
+
+DIAGNOSTIC_PROVIDERS = ("bytemine", "crustdata", "getleads")
+
+
+async def probe_provider_filters(name: str, params: dict) -> dict:
+    """Run one provider's search for a single row and report what came back."""
+    try:
+        if name == "bytemine":
+            result = await bytemine_person_search(params, 1)
+        elif name == "crustdata":
+            result = await crustdata_person_search(params, 1)
+        elif name == "getleads":
+            result = await getleads_person_search(params, 1)
+        else:
+            return {"outcome": "not_probed"}
+    except ProviderUnsupported as refusal:
+        return {"outcome": "unsupported_filter", "field": refusal.field}
+    except HTTPException as failure:
+        return {"outcome": "error", "status": failure.status_code,
+                "detail": str(failure.detail)[:300]}
+    except Exception as failure:  # noqa: BLE001 — a probe reports, never raises
+        return {"outcome": "error", "detail": f"{type(failure).__name__}: {failure}"[:300]}
+
+    return {"outcome": "ok", "total": result.get("total"),
+            "returned": len(result.get("profiles") or [])}
+
+
+@app.post("/diagnostics/provider-filters")
+async def diagnose_provider_filters(request: SearchRequest):
+    """Find which filter empties a provider's search.
+
+    Send the ICP that returns nothing. Each provider is searched with the first
+    filter alone, then the first two, and so on; the step where the count drops
+    to zero names the filter their index disagrees with us about.
+
+    A provider whose count is zero on its very first filter has a problem with
+    the whole integration rather than one field, which is just as useful to
+    know and is not something the request body can tell us.
+    """
+    params = await resolve_search_params(request)
+    present = [f for f in DIAGNOSTIC_FILTER_ORDER if params.get(f)]
+    if not present:
+        raise HTTPException(
+            status_code=400,
+            detail="Send the search that returns nothing — there are no filters here to isolate.")
+
+    report: dict = {}
+    for name in DIAGNOSTIC_PROVIDERS:
+        if not provider_configured(name):
+            report[name] = {"steps": [], "verdict": "not configured"}
+            continue
+
+        steps: list = []
+        verdict = None
+        applied: dict = {}
+        for field in present:
+            applied[field] = params[field]
+            outcome = await probe_provider_filters(name, dict(applied))
+            steps.append({"added": field, "value": applied[field], **outcome})
+            print(f"probe {name}: +{field} -> {outcome}")
+
+            if outcome["outcome"] == "ok" and not outcome.get("total"):
+                verdict = (f"empty once {field}={applied[field]!r} is applied"
+                           if len(applied) > 1 else
+                           f"empty on {field}={applied[field]!r} alone — this is the "
+                           "whole integration, not one filter")
+                break
+            if outcome["outcome"] != "ok":
+                verdict = f"stopped at {field}: {outcome['outcome']}"
+                break
+
+        report[name] = {"steps": steps, "verdict": verdict or "no filter emptied it"}
+
+    return {"params": {f: params[f] for f in present}, "providers": report}
+
+
+# =============================================================================
 # Run with: uvicorn main:app --reload
 # =============================================================================
