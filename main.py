@@ -21,6 +21,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator, Field, AliasChoices
 from pydantic_settings import BaseSettings
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy import BigInteger, Column, String, Text, DateTime, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
@@ -2444,7 +2445,12 @@ def build_getleads_filters(p: dict) -> dict:
         f["job_functions"] = depts if isinstance(depts, list) else [depts]
 
     if p.get("industry"):
-        mapped = bytemine_industry(p["industry"])
+        # Their validator names the vocabulary in its own 400: "Valid values: IT
+        # Services and IT Consulting, Hospitals and Health Care, ...". That is
+        # current LinkedIn, not the classic spelling Bytemine takes, and the
+        # difference is not cosmetic — "Food & Beverages" is a 400 that drops
+        # this leg out of the search.
+        mapped = modern_linkedin_industry(p["industry"])
         if not mapped:
             raise ProviderUnsupported("industry", p["industry"])
         f["industries"] = [mapped]
@@ -3127,15 +3133,19 @@ async def fetch_from_findymail(params: dict) -> list:
 FIBER_BASE = "https://api.fiber.ai"
 FIBER_MAX_PAGE = 1000
 
-# Fiber names industries the way current LinkedIn does, which is not quite the
-# classic vocabulary the rest of this file holds — see linkedin_industry. These
-# are the eight of ours it spells differently; the rest pass through unchanged.
+# Fiber and GetLeads both name industries the way *current* LinkedIn does, which
+# is not the classic vocabulary the rest of this file holds — see
+# linkedin_industry. These are the eight of ours spelled differently there; the
+# rest pass through unchanged.
 #
-# An industry outside their enum is refused rather than sent. This is the
+# An industry outside the vocabulary is refused rather than sent. This is the
 # Bytemine lesson: an unmapped industry name does not error, it silently
 # matches nothing, and the chain reads that as "this provider has no such
-# people" instead of "we asked the wrong question".
-_FIBER_INDUSTRY_ALIASES = {
+# people" instead of "we asked the wrong question". GetLeads is not even that
+# quiet about it — it 400s with "Invalid industries: Food & Beverages. Valid
+# values: IT Services and IT Consulting, Hospitals and Health Care, ..." and
+# drops out of the search as an error.
+_MODERN_INDUSTRY_ALIASES = {
     "Computer & Network Security": "Computer and Network Security",
     "Education": "Education Management",
     "Food & Beverages": "Food and Beverage Services",
@@ -3146,8 +3156,8 @@ _FIBER_INDUSTRY_ALIASES = {
     "Pharmaceuticals": "Pharmaceutical Manufacturing",
 }
 
-# The industries we can produce that Fiber spells the same way we do.
-_FIBER_INDUSTRY_NATIVE = frozenset({
+# The industries we can produce that the modern vocabulary spells our way.
+_MODERN_INDUSTRY_NATIVE = frozenset({
     "Automotive", "Banking", "Biotechnology", "Computer Games",
     "Computer Software", "Construction", "E-Learning", "Financial Services",
     "Government Administration", "Hospitality",
@@ -3180,14 +3190,29 @@ _FIBER_COUNTRY3 = {
 FIBER_CITY_RADIUS_MILES = 25
 
 
-def fiber_industry(value: str) -> Optional[str]:
-    """Fiber's spelling of an industry, or None when it is not one of theirs."""
+def modern_linkedin_industry(value: str) -> Optional[str]:
+    """Current LinkedIn's spelling of an industry, or None when it has none.
+
+    Used by every provider on the newer taxonomy — Fiber and GetLeads today.
+    Bytemine is still on the classic names, which is what linkedin_industry
+    returns.
+    """
     mapped = linkedin_industry(value)
     if not mapped:
         return None
-    if mapped in _FIBER_INDUSTRY_ALIASES:
-        return _FIBER_INDUSTRY_ALIASES[mapped]
-    return mapped if mapped in _FIBER_INDUSTRY_NATIVE else None
+    if mapped in _MODERN_INDUSTRY_ALIASES:
+        return _MODERN_INDUSTRY_ALIASES[mapped]
+    return mapped if mapped in _MODERN_INDUSTRY_NATIVE else None
+
+
+def fiber_industry(value: str) -> Optional[str]:
+    """Fiber's spelling of an industry, or None when it is not one of theirs."""
+    return modern_linkedin_industry(value)
+
+
+def industry_is_expressible(value: str) -> bool:
+    """True when some provider in the chain has a field for this industry."""
+    return bool(linkedin_industry(value) or modern_linkedin_industry(value))
 
 
 async def fiber_call(path: str, body: dict) -> tuple:
@@ -5027,6 +5052,15 @@ async def cache_store(search_hash: str, params: dict, raw: list) -> None:
                     results=json.dumps(raw),
                 ))
             await session.commit()
+    except IntegrityError:
+        # Two identical searches raced: both missed the cache, both walked the
+        # chain, and the slower one lost the insert. The frontend fires every
+        # search twice from different connections, so this is the normal case
+        # rather than an exceptional one. The row the winner wrote is the same
+        # answer, so this is nothing to warn about — and the warning was noisy
+        # enough to look like a real failure in the logs.
+        print(f"Cache row for {search_hash[:12]}… already written by a "
+              "concurrent identical search")
     except Exception as e:
         print(f"WARNING: cache store failed ({e}) — result not cached")
 
@@ -5720,6 +5754,28 @@ async def resolve_search_params(request: SearchRequest) -> dict:
                 params["semantic_keywords"] = " ".join(terms)
                 print("Recovered segment terms the structured filters dropped: "
                       f"{params['semantic_keywords']!r}")
+
+    # An industry nobody has a field for is a search term, not a filter.
+    #
+    # The frontend's parser invents segment names — "Beauty & Wellness", "Salon
+    # & Spa", "Events" — that are in no provider's taxonomy. Each leg then
+    # correctly refuses a filter it cannot express, and because they all refuse
+    # the same one the user gets an empty page for every salon search: eight
+    # providers, all of them right, nothing found.
+    #
+    # Refusing is the correct answer to "express this or step aside" and the
+    # wrong answer to this. The term is not dropped — that would silently
+    # broaden the ICP, which is what the refusal exists to prevent — it moves to
+    # the free-text side, where GetLeads matches it against company descriptions
+    # and Fiber against headlines and summaries. "Salon" is a good filter there;
+    # it is only a bad enum value.
+    if params.get("industry") and not industry_is_expressible(params["industry"]):
+        demoted = str(params.pop("industry")).strip()
+        existing = params.get("semantic_keywords")
+        params["semantic_keywords"] = (
+            f"{existing} {demoted}".strip() if existing else demoted)
+        print(f"No provider has an industry field for {demoted!r} — searching it "
+              f"as free text instead of refusing every leg")
 
     if raw_query and not any(params.get(f) for f in STRUCTURED_FIELDS):
         parsed_filters: dict = {}
@@ -6742,13 +6798,33 @@ async def diagnose_provider_filters(request: SearchRequest):
 # Every probe asks for a single row.
 
 BYTEMINE_SHAPE_PROBES = (
-    # The decisive one: no filters at all.
+    # The decisive one: no filters at all. Answered 168,465,180 in production,
+    # which is how we learned the request arrives and the response parsing was
+    # the bug (see bytemine_person_search).
     ("no filters", {}),
     ("jobTitles (current)", {"jobTitles": ["Founder"]}),
     ("job_titles, the spelling GetLeads uses", {"job_titles": ["Founder"]}),
     ("titles", {"titles": ["Founder"]}),
     ("jobTitle, singular", {"jobTitle": "Founder"}),
     ("page 1 rather than 0", {"jobTitles": ["Founder"], "page": 1}),
+
+    # employeeSizes is the next zero. With the response parsing fixed,
+    # {"jobTitles": ["Owner"], "employeeSizes": ["1-10"]} still returns
+    # totalCount 0 while the title alone returns 1,297,933 — so the band string
+    # is the thing this endpoint does not recognise. These are the shapes worth
+    # trying before guessing at a fix.
+    ("employeeSizes 1-10 (current)",
+     {"jobTitles": ["Founder"], "employeeSizes": ["1-10"]}),
+    ("employeeSize, singular",
+     {"jobTitles": ["Founder"], "employeeSize": "1-10"}),
+    ("employeeSizes 1-10 spaced",
+     {"jobTitles": ["Founder"], "employeeSizes": ["1 - 10"]}),
+    ("employeeSizes 1_10",
+     {"jobTitles": ["Founder"], "employeeSizes": ["1_10"]}),
+    ("numeric min/max, the shape GetLeads takes",
+     {"jobTitles": ["Founder"], "employeesMin": 1, "employeesMax": 10}),
+    ("employeeCount min/max",
+     {"jobTitles": ["Founder"], "employeeCountMin": 1, "employeeCountMax": 10}),
 )
 
 # Each is ANDed with the title filter that already works, so the only thing
@@ -6836,6 +6912,12 @@ async def diagnose_provider_shapes(job_title: str = "Founder"):
                        "envelope, the path or the credentials, not the filters")
         else:
             verdict = f"could not complete the filterless probe: {empty.get('detail')}"
+
+        sizes = [r["shape"] for r in rows
+                 if "employee" in r["shape"].lower()
+                 and r.get("outcome") == "ok" and r.get("total")]
+        verdict += ("; headcount expressible as: " + ", ".join(sizes) if sizes
+                    else "; no headcount shape returns anything")
         report["bytemine"] = {"probes": rows, "verdict": verdict}
 
     if provider_configured("crustdata"):
