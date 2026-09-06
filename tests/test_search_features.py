@@ -25,7 +25,6 @@ class CrustdataFilterTests(unittest.TestCase):
             "seniority": "vp",
             "location": "US",
             "company_location": "New York",
-            "industry": "computer software",
             "company_size": "1-10",
             "keywords": "outbound automation",
         })
@@ -33,13 +32,10 @@ class CrustdataFilterTests(unittest.TestCase):
         by_field = {condition["field"]: condition for condition in conditions}
 
         self.assertEqual(by_field["basic_profile.location.country"]["value"], "United States")
-        # company_industries is LinkedIn's vocabulary — "Computer Software".
-        # This used to assert the raw lowercase term went through untranslated,
-        # which is a contains match on a string the field never holds.
-        self.assertEqual(
-            by_field["experience.employment_details.current.company_industries"]["value"],
-            "Computer Software",
-        )
+        # No industry condition: see test_industry_is_refused_because_it_cannot
+        # _be_filtered. It is not in the params above for the same reason.
+        self.assertNotIn(
+            "experience.employment_details.current.company_industries", by_field)
         self.assertEqual(
             by_field["experience.employment_details.current.seniority_level"]["value"],
             "VP",
@@ -141,7 +137,7 @@ class CrustdataRequestTests(unittest.IsolatedAsyncioTestCase):
         """
         await main.crustdata_person_search(
             {"job_title": "Founder", "company_size": "1-10",
-             "industry": "computer software", "keywords": "pre-revenue"},
+             "keywords": "pre-revenue"},
             10,
         )
         body = FakeClient.last_json
@@ -153,7 +149,7 @@ class CrustdataRequestTests(unittest.IsolatedAsyncioTestCase):
     async def test_sorts_are_sent_when_there_is_no_semantic_query(self):
         """Without a search query the stable sort still guards cursor paging."""
         await main.crustdata_person_search(
-            {"job_title": "CEO", "location": "DE", "industry": "manufacturing"},
+            {"job_title": "CEO", "location": "DE", "company_size": "51-200"},
             10,
             cursor="page-2",
         )
@@ -2653,9 +2649,13 @@ class LinkedInIndustryTests(unittest.TestCase):
             main.build_bytemine_filters({"job_title": "Founder",
                                          "industry": "vertical ai agents"})
 
-    def test_crustdata_passes_an_unmapped_industry_through(self):
-        filters = main.build_crustdata_filters({"industry": "vertical ai agents"})
-        self.assertEqual(filters["value"], "vertical ai agents")
+    def test_crustdata_refuses_every_industry_because_it_cannot_filter_one(self):
+        # Not a vocabulary problem: the shape probe asked five ways, including
+        # both field names and both operators, each ANDed with a title filter
+        # that returns 4.3M rows alone. All five returned zero.
+        for value in ("computer software", "Computer Software", "vertical ai agents"):
+            with self.assertRaises(main.ProviderUnsupported):
+                main.build_crustdata_filters({"job_title": "F", "industry": value})
 
 
 class FindymailVerifyTests(unittest.IsolatedAsyncioTestCase):
@@ -3298,6 +3298,62 @@ class ProviderFilterDiagnosticTests(unittest.IsolatedAsyncioTestCase):
             await self.diagnose(main.SearchRequest(company_domain="acme.com"))
 
         self.assertEqual(raised.exception.status_code, 400)
+
+
+class BytemineResponseShapeTests(unittest.IsolatedAsyncioTestCase):
+    """Bytemine had never returned a lead, and not because of any filter.
+
+    /contacts/search answers {"contacts": [...], "totalCount": N}. This read
+    data["data"] and data["pagination"]["total"], neither of which the endpoint
+    returns, so profiles was [] and total was 0 on every search since the
+    provider was added — whatever the API actually found.
+
+    The shape probe settles it: jobTitles=["Founder"] returns totalCount
+    1,297,933, and the chain reported nothing. Three separate fixes were aimed
+    at the request. The request was fine.
+    """
+
+    async def run_search(self, payload):
+        async def call(path, body, timeout=60.0):
+            return payload
+
+        with patch.object(main, "bytemine_call", call), \
+             patch.object(main.settings, "bytemine_api_key", "b"):
+            return await main.bytemine_person_search({"job_title": "Founder"}, 6)
+
+    async def test_the_documented_envelope_is_read(self):
+        data = await self.run_search({
+            "contacts": [{"pid": "1", "first_name": "Ada"}],
+            "totalCount": 1297933, "page": 0, "pageSize": 6,
+        })
+
+        self.assertEqual(len(data["profiles"]), 1)
+        self.assertEqual(data["total"], 1297933)
+
+    async def test_a_real_count_is_not_replaced_by_the_page_length(self):
+        # total fell back to len(profiles) whenever the count could not be
+        # found, which turned "1.3 million matches" into "6".
+        data = await self.run_search({
+            "contacts": [{"pid": str(i)} for i in range(6)],
+            "totalCount": 1297933,
+        })
+
+        self.assertEqual(data["total"], 1297933)
+
+    async def test_a_genuinely_empty_result_still_reads_as_empty(self):
+        data = await self.run_search({"contacts": [], "totalCount": 0})
+
+        self.assertEqual(data["profiles"], [])
+        self.assertEqual(data["total"], 0)
+
+    async def test_the_older_envelope_still_works(self):
+        # Kept as a fallback rather than swapped: other endpoints on this
+        # gateway do answer under "data".
+        data = await self.run_search({"data": [{"pid": "1"}],
+                                      "pagination": {"total": 42}})
+
+        self.assertEqual(len(data["profiles"]), 1)
+        self.assertEqual(data["total"], 42)
 
 
 class ProviderShapeProbeTests(unittest.IsolatedAsyncioTestCase):
