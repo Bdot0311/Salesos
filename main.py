@@ -6700,5 +6700,146 @@ async def diagnose_provider_filters(request: SearchRequest):
 
 
 # =============================================================================
+# Provider request-shape probes
+# =============================================================================
+#
+# The filter probe above narrowed the two zeros to different problems, and
+# neither is a filter value:
+#
+#   bytemine  — empty on job_title alone. Nothing is wrong with the ICP; the
+#               request itself is not reaching the index.
+#   crustdata — 4,353,682 for the title, 0 the moment industry is added. The
+#               "(.)" operator and the experience.employment_details.current.
+#               prefix are therefore both fine, since the title filter uses
+#               both. Only the industry field or its value is wrong.
+#
+# So this probe varies the *request shape* rather than the ICP, and reports the
+# count each shape returns. The decisive one for Bytemine is the empty body: a
+# filterless search that returns rows means the index is reachable and our
+# filter keys are wrong, and one that returns nothing means the envelope, the
+# path or the credentials are.
+#
+# Every probe asks for a single row.
+
+BYTEMINE_SHAPE_PROBES = (
+    # The decisive one: no filters at all.
+    ("no filters", {}),
+    ("jobTitles (current)", {"jobTitles": ["Founder"]}),
+    ("job_titles, the spelling GetLeads uses", {"job_titles": ["Founder"]}),
+    ("titles", {"titles": ["Founder"]}),
+    ("jobTitle, singular", {"jobTitle": "Founder"}),
+    ("page 1 rather than 0", {"jobTitles": ["Founder"], "page": 1}),
+)
+
+# Each is ANDed with the title filter that already works, so the only thing
+# changing between rows is how the industry is expressed.
+_CD_INDUSTRY_ALT = "experience.employment_details.current.company_professional_network_industry"
+
+CRUSTDATA_INDUSTRY_PROBES = (
+    ("company_industries (.) Title Case (current)", _CD_INDUSTRY, "(.)", "Computer Software"),
+    ("company_industries (.) lowercase", _CD_INDUSTRY, "(.)", "computer software"),
+    ("company_industries =", _CD_INDUSTRY, "=", "Computer Software"),
+    ("company_professional_network_industry (.)", _CD_INDUSTRY_ALT, "(.)", "Computer Software"),
+    ("company_professional_network_industry =", _CD_INDUSTRY_ALT, "=", "Computer Software"),
+)
+
+
+async def probe_bytemine_shape(body: dict) -> dict:
+    """One Bytemine contact search with a hand-built body."""
+    try:
+        data = await bytemine_call("/contacts/search", {"pageSize": 1, "page": 0, **body})
+    except HTTPException as failure:
+        return {"outcome": "error", "status": failure.status_code,
+                "detail": str(failure.detail)[:200]}
+    except Exception as failure:  # noqa: BLE001 — a probe reports, never raises
+        return {"outcome": "error", "detail": f"{type(failure).__name__}: {failure}"[:200]}
+    return {"outcome": "ok", "total": data.get("totalCount"),
+            "returned": len(data.get("contacts") or [])}
+
+
+async def probe_crustdata_shape(filters: dict) -> dict:
+    """One Crustdata person search with a hand-built filter tree."""
+    body = {
+        "limit": 1,
+        "fields": ["crustdata_person_id", "basic_profile", "experience"],
+        "filters": filters,
+        "sorts": [{"field": "crustdata_person_id", "order": "asc"}],
+    }
+    headers = {
+        "Authorization": f"Bearer {settings.crustdata_api_key}",
+        "x-api-version": CRUSTDATA_VERSION,
+        "Content-Type": "application/json",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(f"{CRUSTDATA_BASE}/person/search",
+                                     headers=headers, json=body)
+    except httpx.HTTPError as failure:
+        return {"outcome": "error", "detail": f"unreachable: {failure}"[:200]}
+
+    if resp.status_code != 200:
+        return {"outcome": "error", "status": resp.status_code,
+                "detail": resp.text[:200]}
+    data = resp.json()
+    return {"outcome": "ok", "total": data.get("total_count"),
+            "returned": len(data.get("profiles") or [])}
+
+
+@app.get("/diagnostics/provider-shapes")
+async def diagnose_provider_shapes(job_title: str = "Founder"):
+    """Vary the request shape, not the ICP, and report what each one finds.
+
+    Reachable from a browser for the same reason the filter probe is: the
+    person who needs the answer is the one reading the logs.
+    """
+    report: dict = {}
+
+    if provider_configured("bytemine"):
+        rows = []
+        for label, body in BYTEMINE_SHAPE_PROBES:
+            shaped = dict(body)
+            for key in ("jobTitles", "job_titles", "titles"):
+                if key in shaped:
+                    shaped[key] = [job_title]
+            if "jobTitle" in shaped:
+                shaped["jobTitle"] = job_title
+            outcome = await probe_bytemine_shape(shaped)
+            print(f"shape bytemine [{label}] -> {outcome}")
+            rows.append({"shape": label, "body": shaped, **outcome})
+
+        empty = next((r for r in rows if r["shape"] == "no filters"), {})
+        if empty.get("outcome") == "ok" and empty.get("total"):
+            verdict = ("the index is reachable and a filterless search finds "
+                       "people — so the filter keys are what it is not reading")
+        elif empty.get("outcome") == "ok":
+            verdict = ("even a filterless search finds nothing — this is the "
+                       "envelope, the path or the credentials, not the filters")
+        else:
+            verdict = f"could not complete the filterless probe: {empty.get('detail')}"
+        report["bytemine"] = {"probes": rows, "verdict": verdict}
+
+    if provider_configured("crustdata"):
+        rows = []
+        title = {"field": _CD_TITLE, "type": "(.)", "value": job_title}
+        for label, field, op, value in CRUSTDATA_INDUSTRY_PROBES:
+            filters = {"op": "and", "conditions": [
+                title, {"field": field, "type": op, "value": value}]}
+            outcome = await probe_crustdata_shape(filters)
+            print(f"shape crustdata [{label}] -> {outcome}")
+            rows.append({"shape": label, "field": field, "operator": op,
+                         "value": value, **outcome})
+
+        works = [r["shape"] for r in rows
+                 if r.get("outcome") == "ok" and r.get("total")]
+        report["crustdata"] = {
+            "probes": rows,
+            "verdict": (f"these express the industry: {', '.join(works)}" if works
+                        else "no spelling of the industry filter returns anything"),
+        }
+
+    return {"job_title": job_title, "providers": report}
+
+
+# =============================================================================
 # Run with: uvicorn main:app --reload
 # =============================================================================

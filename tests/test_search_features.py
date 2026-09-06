@@ -3300,5 +3300,88 @@ class ProviderFilterDiagnosticTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.status_code, 400)
 
 
+class ProviderShapeProbeTests(unittest.IsolatedAsyncioTestCase):
+    """The filter probe narrowed both zeros to something that is not a filter.
+
+    Bytemine came back empty on a bare job title, and Crustdata returned
+    4,353,682 for the same title and 0 the moment industry was added — so its
+    "(.)" operator and field prefix are both fine, since the title filter uses
+    both. This probe varies the request shape instead.
+    """
+
+    async def run_shapes(self, bytemine=None, crustdata=None, configured=("bytemine", "crustdata")):
+        async def bm(path, body, timeout=60.0):
+            return bytemine(body) if bytemine else {"contacts": [], "totalCount": 0}
+
+        patches = [
+            patch.object(main, "provider_configured", lambda n: n in configured),
+            patch.object(main, "bytemine_call", bm),
+        ]
+        if crustdata is not None:
+            patches.append(patch.object(main, "probe_crustdata_shape", crustdata))
+        for p in patches:
+            p.start()
+        try:
+            return await main.diagnose_provider_shapes()
+        finally:
+            for p in patches:
+                p.stop()
+
+    async def test_a_filterless_search_that_finds_people_blames_the_filter_keys(self):
+        # The decisive probe: if the index answers with no filters at all, the
+        # request is arriving and our filter names are what it cannot read.
+        def bytemine(body):
+            filtered = any(k in body for k in ("jobTitles", "job_titles", "titles", "jobTitle"))
+            return {"contacts": [] if filtered else [{"pid": "1"}],
+                    "totalCount": 0 if filtered else 900}
+
+        report = await self.run_shapes(bytemine=bytemine, configured=("bytemine",))
+
+        self.assertIn("filter keys", report["providers"]["bytemine"]["verdict"])
+
+    async def test_a_filterless_search_that_finds_nothing_blames_the_request(self):
+        report = await self.run_shapes(
+            bytemine=lambda body: {"contacts": [], "totalCount": 0},
+            configured=("bytemine",))
+
+        self.assertIn("envelope", report["providers"]["bytemine"]["verdict"])
+
+    async def test_the_empty_body_probe_really_is_empty(self):
+        seen: list = []
+
+        def bytemine(body):
+            seen.append(body)
+            return {"contacts": [], "totalCount": 0}
+
+        await self.run_shapes(bytemine=bytemine, configured=("bytemine",))
+
+        first = seen[0]
+        self.assertEqual(set(first), {"pageSize", "page"})
+
+    async def test_a_working_industry_spelling_is_named(self):
+        async def crustdata(filters):
+            field = filters["conditions"][1]["field"]
+            works = field.endswith("company_professional_network_industry")
+            return {"outcome": "ok", "total": 42 if works else 0,
+                    "returned": 1 if works else 0}
+
+        report = await self.run_shapes(crustdata=crustdata, configured=("crustdata",))
+        verdict = report["providers"]["crustdata"]["verdict"]
+
+        self.assertIn("company_professional_network_industry", verdict)
+
+    async def test_no_working_spelling_says_so_rather_than_picking_one(self):
+        async def crustdata(filters):
+            return {"outcome": "ok", "total": 0, "returned": 0}
+
+        report = await self.run_shapes(crustdata=crustdata, configured=("crustdata",))
+
+        self.assertIn("no spelling", report["providers"]["crustdata"]["verdict"])
+
+    async def test_an_unconfigured_provider_is_skipped(self):
+        report = await self.run_shapes(configured=())
+        self.assertEqual(report["providers"], {})
+
+
 if __name__ == "__main__":
     unittest.main()
