@@ -3229,6 +3229,55 @@ class FindymailPitchTests(unittest.TestCase):
             "dental clinics")
 
 
+class PitchAsSemanticQueryTests(unittest.IsolatedAsyncioTestCase):
+    """A pitch ranks up the seller's competitors, not the buyer.
+
+    Crustdata ranks semantically on this sentence. Production sent it "I am
+    selling a website to car showrooms ... modern, fast and responsive ... SEO
+    ..." and got back a "Website Designer", a "Showit Website Designer for
+    female entrepreneurs", and an SEO consultant headlined "Ranking is vanity.
+    Sales is sanity." — ten of them. The search worked exactly as asked and
+    returned the user's own competitors.
+    """
+
+    async def resolve(self, **kwargs):
+        return await main.resolve_search_params(main.SearchRequest(**kwargs))
+
+    async def test_a_pitch_is_not_used_to_rank(self):
+        params = await self.resolve(
+            query=("I am selling a website to car showrooms, "
+                   "https://showroom.vercel.app/ it cost only 50$ with hosting"),
+            job_title="Owner", industry="automotive")
+
+        self.assertNotIn("semantic_query", params)
+
+    async def test_a_description_of_the_buyer_still_ranks(self):
+        sentence = "heads of RevOps at fintechs replacing Salesforce"
+        params = await self.resolve(
+            query=sentence, job_title="VP Sales", industry="financial services")
+
+        self.assertEqual(params["semantic_query"], sentence)
+
+    async def test_the_icp_survives_a_dropped_pitch(self):
+        # The structured filters the sentence was parsed into are still here,
+        # and so are the segment terms recovered from it.
+        params = await self.resolve(
+            query="I am selling to B2B AI SaaS founders, it cost only 50$",
+            job_title="Founder", industry="computer software")
+
+        self.assertEqual(params["job_title"], "Founder")
+        self.assertEqual(params["industry"], "computer software")
+        self.assertEqual(params["semantic_keywords"], "ai saas")
+
+    async def test_the_pitch_never_reaches_crustdata(self):
+        params = await self.resolve(
+            query="I am selling a website to salons, it cost only 50$ per month",
+            job_title="Owner", company_size="1-10")
+        body_text = json.dumps(main.build_crustdata_filters(params))
+
+        self.assertNotIn("selling", body_text)
+
+
 class ColdiqCreditLatchTests(unittest.IsolatedAsyncioTestCase):
     """A 402 is a fact about the balance — there is no reason to keep asking."""
 

@@ -2955,10 +2955,11 @@ _PITCH_MARKERS = re.compile(
     r"our website|it cost|it costs|per month)\b", re.I)
 
 # Past this, a "description of target companies" is something else.
-FINDYMAIL_MAX_QUERY_CHARS = 300
+ICP_SENTENCE_MAX_CHARS = 300
+FINDYMAIL_MAX_QUERY_CHARS = ICP_SENTENCE_MAX_CHARS
 
 
-def findymail_query_from_sentence(sentence: str) -> str:
+def icp_sentence(sentence: str) -> str:
     """The user's sentence, when it describes the companies to find.
 
     Production sent this endpoint entire sales pitches — "I am selling a website
@@ -2972,9 +2973,14 @@ def findymail_query_from_sentence(sentence: str) -> str:
     this endpoint takes.
     """
     text = re.sub(r"https?://\S+", " ", sentence or "").strip()
-    if not text or _PITCH_MARKERS.search(text) or len(text) > FINDYMAIL_MAX_QUERY_CHARS:
+    if not text or _PITCH_MARKERS.search(text) or len(text) > ICP_SENTENCE_MAX_CHARS:
         return ""
     return " ".join(text.split())
+
+
+def findymail_query_from_sentence(sentence: str) -> str:
+    """The Findymail-facing name for icp_sentence."""
+    return icp_sentence(sentence)
 
 
 def findymail_intellimatch_query(p: dict) -> str:
@@ -5801,8 +5807,28 @@ async def resolve_search_params(request: SearchRequest) -> dict:
     # filters were derived from. Crustdata searches it; providers that cannot
     # step aside — see build_bytemine_filters.
     if raw_query and any(params.get(f) for f in STRUCTURED_FIELDS):
-        params["semantic_query"] = raw_query
-        print(f"Retaining semantic query alongside structured filters: {raw_query!r}")
+        # Only when the sentence describes the buyer. Crustdata ranks on this
+        # semantically, so a sales pitch pulls back people whose profiles look
+        # like the pitch — which is the seller, not the buyer.
+        #
+        # Production: "I am selling a website to car showrooms ... modern, fast
+        # and responsive ... SEO ..." returned a "Website Designer", a "Showit
+        # Website Designer for female entrepreneurs", and an SEO consultant
+        # headlined "Ranking is vanity. Sales is sanity." Ten of them — and the
+        # already-seen list filled up with ukwebsitedesign, silverwebsites and
+        # chrismcelroyseo. The search worked exactly as asked and returned the
+        # user's own competitors.
+        #
+        # Nothing is lost by dropping it: the structured filters the sentence
+        # was parsed into are in this request already, and the segment terms
+        # below are recovered from the same sentence.
+        described = icp_sentence(raw_query)
+        if described:
+            params["semantic_query"] = described
+            print(f"Retaining semantic query alongside structured filters: {described!r}")
+        else:
+            print("Sentence reads as a sales pitch rather than a description of "
+                  "the buyer — not ranking on it")
 
         # Retaining the sentence only helps the one provider that reads it.
         # Crustdata searches semantic_query; every other leg sees the structured
