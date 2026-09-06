@@ -52,6 +52,7 @@ class Settings(BaseSettings):
     # endpoints, while treg itself chooses among the eligible upstream tools.
     # Keep this org-scoped token on the backend: it pays for every customer.
     findymail_api_key: Optional[str] = None
+    fiber_api_key: Optional[str] = None
     treg_token: Optional[str] = None
     treg_org_id: Optional[str] = None
     treg_base_url: str = "https://treg.to"
@@ -125,8 +126,13 @@ TREG_META_VALUE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 # then fetch — so it is the slowest leg by a wide margin, and it bills per
 # result found. In a sequential waterfall that makes it the right answer only
 # once the fast, cheaper providers have come back empty.
-PROVIDER_ORDER = ("bytemine", "crustdata", "getleads", "treg", "coldiq",
-                  "findymail", "wiza")
+# fiber sits right after getleads: it is the only leg that can express this
+# product's whole ICP — title, industry, country and headcount — against
+# LinkedIn's own vocabulary, and it pages by cursor rather than offset. It is
+# billed per profile returned, like getleads, so it goes after the cheaper
+# masked-search providers and ahead of the per-record reveal tools.
+PROVIDER_ORDER = ("bytemine", "crustdata", "getleads", "fiber", "treg",
+                  "coldiq", "findymail", "wiza")
 
 
 def provider_configured(name: str) -> bool:
@@ -143,6 +149,8 @@ def provider_configured(name: str) -> bool:
         return bool(settings.treg_token)
     if name == "findymail":
         return bool(settings.findymail_api_key)
+    if name == "fiber":
+        return bool(settings.fiber_api_key)
     if name == "wiza":
         return bool(settings.wiza_api_key)
     return False
@@ -3100,6 +3108,358 @@ async def fetch_from_findymail(params: dict) -> list:
 
 
 # =============================================================================
+# Fiber AI  (https://api.fiber.ai)
+# =============================================================================
+#
+# The first provider in the chain that can express this product's whole ICP —
+# job title, industry, country, and headcount — against LinkedIn's own
+# vocabulary, with a real pagination cursor rather than an offset.
+#
+# It does all three jobs the chain needs, so it is wired into all three places:
+# people search, a reveal keyed on a LinkedIn URL, and email validation. The
+# validator matters most in the short term: ColdIQ is out of credits and
+# Findymail answers a bare boolean, while Fiber returns the catch-all,
+# role-based and disposable detail ColdIQ used to be the only source of.
+#
+# Cost: 1 credit per profile returned by search, 2 per revealed work email, 1
+# per validation. Nothing is charged for a search that matches nothing.
+
+FIBER_BASE = "https://api.fiber.ai"
+FIBER_MAX_PAGE = 1000
+
+# Fiber names industries the way current LinkedIn does, which is not quite the
+# classic vocabulary the rest of this file holds — see linkedin_industry. These
+# are the eight of ours it spells differently; the rest pass through unchanged.
+#
+# An industry outside their enum is refused rather than sent. This is the
+# Bytemine lesson: an unmapped industry name does not error, it silently
+# matches nothing, and the chain reads that as "this provider has no such
+# people" instead of "we asked the wrong question".
+_FIBER_INDUSTRY_ALIASES = {
+    "Computer & Network Security": "Computer and Network Security",
+    "Education": "Education Management",
+    "Food & Beverages": "Food and Beverage Services",
+    "Health Care": "Hospitals and Health Care",
+    "Hospital & Health Care": "Hospitals and Health Care",
+    "Non-Profit Organization Management": "Non-Profit Organizations",
+    "Oil & Energy": "Oil and Gas",
+    "Pharmaceuticals": "Pharmaceutical Manufacturing",
+}
+
+# The industries we can produce that Fiber spells the same way we do.
+_FIBER_INDUSTRY_NATIVE = frozenset({
+    "Automotive", "Banking", "Biotechnology", "Computer Games",
+    "Computer Software", "Construction", "E-Learning", "Financial Services",
+    "Government Administration", "Hospitality",
+    "Information Technology and Services", "Insurance", "Internet",
+    "Legal Services", "Logistics and Supply Chain", "Management Consulting",
+    "Manufacturing", "Marketing and Advertising", "Media Production",
+    "Real Estate", "Retail", "Staffing and Recruiting", "Telecommunications",
+})
+
+# Their country filter takes ISO-3; classify_location hands back ISO-2. This
+# covers every code our own parser can emit — FiberCountryCoverageTests holds
+# that true — so the refusal below is a guard against the map falling behind
+# _BM_COUNTRY_CODE, not an expected outcome.
+_FIBER_COUNTRY3 = {
+    "AE": "ARE", "AR": "ARG", "AT": "AUT", "AU": "AUS", "BE": "BEL",
+    "BR": "BRA", "CA": "CAN", "CH": "CHE", "CL": "CHL", "CN": "CHN",
+    "CO": "COL", "CZ": "CZE", "DE": "DEU", "DK": "DNK", "ES": "ESP",
+    "FI": "FIN", "FR": "FRA", "GB": "GBR", "HU": "HUN", "IE": "IRL",
+    "IL": "ISR", "IN": "IND", "IT": "ITA", "JP": "JPN", "KE": "KEN",
+    "KR": "KOR", "MX": "MEX", "NG": "NGA", "NL": "NLD", "NO": "NOR",
+    "NZ": "NZL", "PL": "POL", "PT": "PRT", "RO": "ROU", "RU": "RUS",
+    "SA": "SAU", "SE": "SWE", "SG": "SGP", "TR": "TUR", "TW": "TWN",
+    "UA": "UKR", "US": "USA", "ZA": "ZAF",
+}
+
+# free-form-city requires a radius, so one has to be chosen. A city in an ICP
+# means the metro, not the boundary line — nobody asking for founders in San
+# Francisco means to exclude Oakland — and this is the radius their own city
+# presets are built around.
+FIBER_CITY_RADIUS_MILES = 25
+
+
+def fiber_industry(value: str) -> Optional[str]:
+    """Fiber's spelling of an industry, or None when it is not one of theirs."""
+    mapped = linkedin_industry(value)
+    if not mapped:
+        return None
+    if mapped in _FIBER_INDUSTRY_ALIASES:
+        return _FIBER_INDUSTRY_ALIASES[mapped]
+    return mapped if mapped in _FIBER_INDUSTRY_NATIVE else None
+
+
+async def fiber_call(path: str, body: dict) -> tuple:
+    """Call Fiber. Returns (status_code, parsed body or None).
+
+    The key goes in the `x-api-key` header even though Fiber also accepts it in
+    the request body. Every provider module here logs its request body, and a
+    key in the body is a key in the Railway logs.
+
+    Returns rather than raises on 402 and 429: those are states of the account,
+    not failures of this request, and a leg that raises on them takes the whole
+    search down with it.
+    """
+    headers = {
+        "x-api-key": settings.fiber_api_key or "",
+        "Content-Type": "application/json",
+    }
+    print(f"Fiber {path} body: {json.dumps(body)[:400]}")
+    try:
+        async with httpx.AsyncClient(timeout=90.0) as client:
+            resp = await client.post(f"{FIBER_BASE}{path}", headers=headers, json=body)
+    except httpx.HTTPError as exc:
+        print(f"Fiber {path} unreachable: {exc}")
+        return 0, None
+
+    if resp.status_code != 200:
+        print(f"Fiber {path} status: {resp.status_code} {resp.text[:300]}")
+    try:
+        return resp.status_code, resp.json()
+    except ValueError:
+        return resp.status_code, None
+
+
+def build_fiber_people_params(p: dict) -> dict:
+    """The person-level half of a Fiber search.
+
+    Raises ProviderUnsupported for a filter their people index has no field for,
+    so the chain reaches a provider that does rather than searching without it.
+    """
+    sp: dict = {}
+
+    if p.get("job_title"):
+        sp["jobTitleV3"] = {"anyOf": [{"type": "plain", "term": p["job_title"]}]}
+
+    if p.get("industry"):
+        mapped = fiber_industry(p["industry"])
+        if not mapped:
+            raise ProviderUnsupported("industry", p["industry"])
+        sp["industry"] = {"anyOf": [mapped]}
+
+    location = p.get("location") or p.get("company_location")
+    if location:
+        kind, value = classify_location(str(location))
+        if kind == "country":
+            code = _FIBER_COUNTRY3.get(value)
+            if not code:
+                raise ProviderUnsupported("location", location)
+            sp["country3LetterCode"] = {"anyOf": [code]}
+        elif kind == "state":
+            sp["state"] = {"anyOf": [{
+                "stateName": _US_STATE_CODE_TO_NAME.get(value, value),
+                "countryCode": "USA",
+            }]}
+        elif kind == "city":
+            sp["location"] = {"unionAll": [{
+                "strategy": "free-form-city",
+                "city": str(location),
+                "radius": {"unit": "miles", "quantity": FIBER_CITY_RADIUS_MILES},
+            }]}
+        else:
+            # A continent or multi-country region. Their presets are metro
+            # areas, not continents, so there is nothing here to express it.
+            raise ProviderUnsupported("location", location)
+
+    # A segment phrase belongs in free text. keywordsV2 searches headlines,
+    # summaries and current job titles together, which is where "AI SaaS" is
+    # actually written on a profile.
+    segment = p.get("keywords") or p.get("semantic_keywords")
+    if segment:
+        terms = [t for t in str(segment).split(",") if t.strip()] or [str(segment)]
+        sp["keywordsV2"] = {
+            "operator": "AND",
+            "clauses": [{"operator": "OR", "terms": [t.strip() for t in terms]}],
+        }
+
+    if not sp:
+        raise HTTPException(status_code=400, detail="At least one search parameter required")
+    return sp
+
+
+def build_fiber_search(p: dict, limit: int, cursor: str = None) -> tuple:
+    """Return (path, body) for the endpoint that can express this ICP.
+
+    /v1/people-search has no headcount field. Refusing on company_size would be
+    honest and would also make Fiber sit out nearly every search this product
+    sends, the way Bytemine sits out every country-level one — so an ICP with a
+    size goes to the combined endpoint, which filters companies and people
+    together. It costs a company credit on top of the profile credit, which is
+    the price of expressing the whole ICP rather than most of it.
+    """
+    people = build_fiber_people_params(p)
+    page = max(min(limit, FIBER_MAX_PAGE), 1)
+
+    if not p.get("company_size"):
+        body = {"searchParams": people, "pageSize": page, "includeCount": False}
+        if cursor:
+            body["cursor"] = cursor
+        return "/v1/people-search", body
+
+    lo, hi = _size_bounds(p["company_size"])
+    if lo is None and hi is None:
+        raise ProviderUnsupported("company_size", p["company_size"])
+
+    company: dict = {}
+    # lowerBoundExclusive is exclusive: a 1-10 band starts above 0, not above 1.
+    if lo is not None:
+        company["lowerBoundExclusive"] = max(lo - 1, 0)
+    if hi is not None:
+        company["upperBoundInclusive"] = hi
+
+    body = {
+        "companyConfig": {"searchParams": {"employeeCountV2": company},
+                          "pageSize": page},
+        "profileConfig": {"searchParams": people, "pageSize": page},
+    }
+    if cursor:
+        body["profileConfig"]["profileCursor"] = cursor
+    return "/v1/combined-search/paginated", body
+
+
+async def fiber_person_search(params: dict, limit: int, cursor: str = None) -> dict:
+    """Search Fiber for people. Billed per profile returned, so never over-fetch."""
+    path, body = build_fiber_search(params, limit, cursor)
+    status, data = await fiber_call(path, body)
+    if status != 200 or not isinstance(data, dict):
+        return {"profiles": [], "total": 0, "next_cursor": None}
+
+    output = data.get("output") or {}
+    rows = output.get("profiles") if "profiles" in output else output.get("data")
+    rows = rows or []
+    # estimatedCount is only populated when includeCount is set, which costs a
+    # credit — the row count is what was actually returned and paid for.
+    next_cursor = output.get("nextProfilesCursor") or output.get("nextCursor")
+    print(f"Fiber returned {len(rows)} profile(s)")
+    return {"profiles": rows, "total": len(rows), "next_cursor": next_cursor}
+
+
+def transform_fiber_profile(row: dict, search_params: dict = None) -> dict:
+    """Map one Fiber profile onto our lead shape.
+
+    Search returns no contact details — those are a separate, separately billed
+    reveal — so email and phone are None here, exactly as for Bytemine and
+    Crustdata.
+    """
+    del search_params  # their ranking orders the page; we do not re-score it
+    job = row.get("current_job") or {}
+    name = row.get("name")
+    first, last = row.get("first_name"), row.get("last_name")
+    if name and not (first or last):
+        parts = name.split()
+        if len(parts) >= 2:
+            first, last = parts[0], " ".join(parts[1:])
+        elif parts:
+            first = parts[0]
+
+    slug = row.get("primary_slug")
+    linkedin_url = row.get("url") or (
+        f"https://www.linkedin.com/in/{slug}" if slug else None)
+
+    return {
+        "contact_name": name or " ".join(x for x in (first, last) if x) or None,
+        "first_name": first,
+        "last_name": last,
+        "job_title": job.get("title") or row.get("headline"),
+        "seniority": job.get("seniority"),
+        "company_name": job.get("company_name"),
+        "company_domain": None,
+        "industry": row.get("industry_name"),
+        "location": row.get("locality") or job.get("locality"),
+        "linkedin_url": linkedin_url,
+        "contact_linkedin_url": linkedin_url,
+        "headline": row.get("headline"),
+        "business_email": None,
+        "email": None,
+        "email_available": None,
+        "phone": None,
+        "phone_type": None,
+        "phone_available": None,
+        # No relevance score of our own: their ranking already ordered the
+        # page, and relevance_score is theirs to explain, not ours to fold in.
+        "score": row.get("relevance_score"),
+        "provider": "fiber",
+    }
+
+
+async def fiber_reveal(linkedin_url: str, want_phone: bool = False) -> dict:
+    """Reveal a work email (and optionally a phone) from a LinkedIn URL.
+
+    Charged per requested type, so personal emails are never asked for: this is
+    B2B outbound and a personal address is both dearer and less useful.
+    """
+    if not linkedin_url:
+        return {}
+
+    status, data = await fiber_call("/v1/contact-details/single", {
+        "linkedinUrl": linkedin_url,
+        "enrichmentType": {"getWorkEmails": True, "getPersonalEmails": False,
+                           "getPhoneNumbers": bool(want_phone)},
+        "patience": "MEDIUM",
+    })
+    if status != 200 or not isinstance(data, dict):
+        return {}
+
+    profile = ((data.get("output") or {}).get("profile")) or {}
+    emails = profile.get("emails") or []
+    # `valid` is the only status that has passed deliverability verification;
+    # their own docs say to treat `unknown` cautiously. Prefer a verified one.
+    best = next((e for e in emails if e.get("status") == "valid"), None) or (
+        emails[0] if emails else None)
+    phones = profile.get("phoneNumbers") or []
+
+    return {
+        "name": profile.get("name"),
+        "email": (best or {}).get("email"),
+        "email_status": (best or {}).get("status"),
+        "phone": (phones[0] or {}).get("number") if phones else None,
+        "phone_type": (phones[0] or {}).get("type") if phones else None,
+    }
+
+
+# Their verdict vocabulary, mapped onto ours. "risky" is a real answer — a
+# catch-all domain that accepts everything — and it is not sendable, so it is
+# kept distinct from "we could not tell".
+_FIBER_VERDICT = {
+    "ok": ("deliverable", True),
+    "undeliverable": ("undeliverable", False),
+    "risky": ("risky", False),
+    "inconclusive": ("unknown", None),
+}
+
+
+async def fiber_verify_email(email: str) -> dict:
+    """Verify one address through Fiber, in our shared verdict shape.
+
+    Richer than Findymail's bare boolean: catch-all, role-based and disposable
+    all come back, which is the detail ColdIQ was the only source of.
+    """
+    status, body = await fiber_call("/v1/validate-email/single", {"email": email})
+    output = (body or {}).get("output") if isinstance(body, dict) else None
+    if status != 200 or not isinstance(output, dict) or not output.get("verdict"):
+        reason = ("fiber out of credits" if status == 402
+                  else "fiber rate limited" if status == 429
+                  else "fiber returned no verdict")
+        return {"status": "unknown", "sendable": None,
+                "checked_by": "fiber", "reason": reason}
+
+    mapped, sendable = _FIBER_VERDICT.get(output["verdict"], ("unknown", None))
+    return {
+        "status": mapped,
+        "sendable": sendable,
+        "checked_by": "fiber",
+        "raw_status": output["verdict"],
+        "catch_all": output.get("is_catch_all"),
+        "role_based": output.get("is_role_based"),
+        "disposable": output.get("is_disposable"),
+        "free_provider": output.get("is_consumer"),
+        "vendor": output.get("email_provider"),
+        "score": None,
+    }
+
+
+# =============================================================================
 # ColdIQ  (https://api.coldiq.com)
 # =============================================================================
 #
@@ -3687,10 +4047,18 @@ async def verify_revealed_lead(lead: dict, provider: str = None) -> dict:
     # because of it. Findymail answers the same question and bills separately,
     # so a verdict ColdIQ could not reach is worth one more attempt rather than
     # being reported as unknown.
-    if (email and verdict.get("sendable") is None
-            and verdict.get("status") in ("unknown", "unverified")
-            and provider_configured("findymail")):
-        fallback = await findymail_verify_email(email)
+    # Fiber is asked before Findymail because it answers the same question with
+    # ColdIQ's detail — catch-all, role-based, disposable — where Findymail
+    # returns a bare boolean. Both are only reached when ColdIQ could not
+    # answer; a verdict ColdIQ actually reached is never second-guessed.
+    for name, check in (("fiber", fiber_verify_email),
+                        ("findymail", findymail_verify_email)):
+        if not (email and verdict.get("sendable") is None
+                and verdict.get("status") in ("unknown", "unverified")):
+            break
+        if not provider_configured(name):
+            continue
+        fallback = await check(email)
         if fallback.get("sendable") is not None:
             fallback["checked_at"] = datetime.now(timezone.utc).isoformat()
             fallback["fell_back_from"] = verdict.get("reason") or verdict.get("status")
@@ -5032,6 +5400,36 @@ async def enrich_lead(request: EnrichRequest):
                 "lead": lead,
             }
 
+    # Fiber reveals from a LinkedIn URL and grades the address while it is at
+    # it: an email that comes back `valid` has already passed deliverability
+    # verification upstream, which is the check ColdIQ cannot currently run.
+    # Work emails only — this is B2B outbound, and a personal address costs more
+    # and is worth less.
+    # Phones are asked for even though they cost more than an email alone. This
+    # leg returns early on a hit, so a reveal without them would quietly drop
+    # the phone number Wiza would have supplied for the same lead — a cheaper
+    # call that makes the product worse is not cheaper.
+    if "fiber" in chain and request.linkedin_url:
+        contact = await fiber_reveal(request.linkedin_url, want_phone=True)
+        if contact.get("email"):
+            lead = await verify_revealed_lead({
+                "contact_name": contact.get("name") or request.full_name,
+                "business_email": contact["email"],
+                "company_name": request.company,
+                "company_domain": request.company_domain,
+                "phone": contact.get("phone"),
+                "phone_type": classify_phone_type(contact.get("phone_type")),
+                "linkedin_url": request.linkedin_url,
+                "provider": "fiber",
+            }, "fiber")
+            return {
+                "success": True,
+                "provider": "fiber",
+                "enrichment_status": "complete",
+                "email_verification": lead["email_verification"],
+                "lead": lead,
+            }
+
     # Findymail last before Wiza, and worth reaching even when everything above
     # failed: it is charged only on a found email, so a miss here costs nothing.
     # It is also the natural partner to a ColdIQ lead, which can arrive as
@@ -5428,6 +5826,8 @@ async def search_leads(request: SearchRequest):
             return lambda profile: transform_coldiq_profile(profile, params)
         if name == "findymail":
             return lambda row: transform_findymail_row(row, params)
+        if name == "fiber":
+            return lambda row: transform_fiber_profile(row, params)
         if name == "getleads":
             return lambda record: transform_getleads_contact(record)
         if name == "treg":
@@ -5604,6 +6004,32 @@ async def search_leads(request: SearchRequest):
                 found = await record_new_campaign_profiles(request.campaign_id, found)
 
             return found, total, None
+
+        if name == "fiber":
+            # A real cursor, so a numbered page resumes rather than being
+            # over-fetched and sliced — and this leg bills per profile
+            # returned, so an over-fetch here is money.
+            #
+            # A cursor only exists once the caller has paged, so on a first page
+            # the already-seen filter is all that separates a repeat search from
+            # the same rows again. That is the GetLeads defect in a different
+            # shape; the difference is that a Fiber cursor, once we have one,
+            # resumes exactly where the last page stopped.
+            data = await fiber_person_search(
+                params, params.get("limit", 10), cursor=provider_cursor)
+            found = data["profiles"]
+
+            if exclusions:
+                seen = {i for i in (linkedin_identity(u) for u in exclusions) if i}
+                found = [r for r in found
+                         if linkedin_identity(_profile_url(r)) not in seen]
+            if campaign_keys:
+                found = [r for r in found
+                         if _profile_lead_key(r) not in campaign_keys]
+            if request.campaign_id:
+                found = await record_new_campaign_profiles(request.campaign_id, found)
+
+            return found, data["total"], data.get("next_cursor")
 
         if name == "treg":
             # Treg's routed endpoint chooses among its lead-gen providers. It
