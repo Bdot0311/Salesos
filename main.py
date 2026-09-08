@@ -3310,6 +3310,26 @@ def build_fiber_people_params(p: dict) -> dict:
             raise ProviderUnsupported("industry", p["industry"])
         sp["industry"] = {"anyOf": [mapped]}
 
+    # A named company is a hard constraint, and dropping it silently turns
+    # "Director of Sales at vectis.ai" into "any Director of Sales anywhere".
+    # Production did exactly that: the request went out as jobTitleV3 alone and
+    # came back with ten sales directors at ten other companies.
+    #
+    # Their company identifiers are all machine keys — domain, LinkedIn URL,
+    # slug, org id — so a company we only know by name cannot be expressed and
+    # is refused rather than dropped.
+    domain = p.get("company_domain")
+    company = p.get("company")
+    if company and not domain and looks_like_domain(company):
+        domain, company = company, None
+    if domain:
+        sp["jobs"] = {"anyOf": [{
+            "company": {"identifier": "domain", "value": domain_host(domain) or domain},
+            "status": "current",
+        }]}
+    elif company:
+        raise ProviderUnsupported("company", company)
+
     location = p.get("location") or p.get("company_location")
     if location:
         kind, value = classify_location(str(location))

@@ -2922,6 +2922,47 @@ class FiberSearchBodyTests(unittest.TestCase):
         self.assertEqual(params["keywordsV2"]["clauses"][0]["terms"], ["ai saas"])
 
 
+class FiberCompanyTests(unittest.TestCase):
+    """A named company is a hard constraint, not a hint.
+
+    Production searched for "Director Sales" at vectis.ai and the request went
+    out as jobTitleV3 alone — ten sales directors at ten other companies.
+    """
+
+    def test_a_domain_becomes_a_company_constraint(self):
+        params = main.build_fiber_people_params(
+            {"job_title": "Director Sales", "company_domain": "vectis.ai"})
+
+        self.assertEqual(params["jobs"]["anyOf"][0]["company"],
+                         {"identifier": "domain", "value": "vectis.ai"})
+        self.assertEqual(params["jobs"]["anyOf"][0]["status"], "current")
+
+    def test_a_domain_in_the_company_field_still_counts(self):
+        params = main.build_fiber_people_params(
+            {"job_title": "Director Sales", "company": "vectis.ai"})
+
+        self.assertEqual(params["jobs"]["anyOf"][0]["company"]["value"], "vectis.ai")
+
+    def test_a_url_is_reduced_to_its_host(self):
+        params = main.build_fiber_people_params(
+            {"job_title": "X", "company_domain": "https://www.vectis.ai/careers"})
+
+        self.assertEqual(params["jobs"]["anyOf"][0]["company"]["value"], "vectis.ai")
+
+    def test_a_company_known_only_by_name_is_refused(self):
+        # Their identifiers are all machine keys — domain, LinkedIn URL, slug,
+        # org id. A name cannot be expressed, so the chain must move on.
+        with self.assertRaises(main.ProviderUnsupported):
+            main.build_fiber_people_params(
+                {"job_title": "Director Sales", "company": "vectis"})
+
+    def test_the_domain_wins_when_both_are_given(self):
+        params = main.build_fiber_people_params(
+            {"job_title": "X", "company": "vectis", "company_domain": "vectis.ai"})
+
+        self.assertEqual(params["jobs"]["anyOf"][0]["company"]["value"], "vectis.ai")
+
+
 class FiberIndustryTests(unittest.TestCase):
     """An industry outside their enum is refused, never sent."""
 
