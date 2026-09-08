@@ -636,6 +636,22 @@ class ProviderUnsupported(Exception):
         self.field = field
         self.value = value
 
+def refuse_unexpressible(p: dict, *fields: str) -> None:
+    """Step aside on a stated filter this provider has no field for.
+
+    Silently dropping one returns leads outside the requested ICP while
+    reporting a successful search, which is the failure mode this whole file is
+    built to avoid — and an audit found four of them still sitting in four
+    different builders. Wiza expresses technologies, intent topics and revenue
+    bands, so refusing here routes the search to the leg that can answer it
+    rather than to a leg that will answer a different question.
+    """
+    for field in fields:
+        if p.get(field):
+            raise ProviderUnsupported(field, p[field])
+
+
+
 
 # Wiza's complete, fixed company_industry vocabulary (from the prospect-search
 # docs). Anything outside this set is silently ignored by Wiza, so we validate
@@ -2444,6 +2460,9 @@ def build_getleads_filters(p: dict) -> dict:
     """
     f: dict = {}
 
+    refuse_unexpressible(p, "technologies", "intent_topics",
+                         "revenue_min", "revenue_max")
+
     if p.get("job_title"):
         f["job_titles"] = [p["job_title"]]
     if p.get("seniority") and not seniority_implied_by_title(
@@ -3260,6 +3279,27 @@ _FIBER_COUNTRY3 = {
 FIBER_CITY_RADIUS_MILES = 25
 
 
+# Fiber's seniority vocabulary, from jobTitleV3's functional clause. Their enum
+# has no owner or founder tier, and this file already answers that question the
+# same way elsewhere: build_getleads_filters maps owner onto "C-Team". Company
+# owners sit in the top executive tier in every taxonomy here, so the mapping is
+# the one already in use rather than a new invention.
+_FIBER_SENIORITY = {
+    "c_suite": "c-suite", "c-suite": "c-suite", "cxo": "c-suite",
+    "c-level": "c-suite", "executive": "c-suite", "chief": "c-suite",
+    "owner": "c-suite", "founder": "c-suite",
+    "vp": "vp", "vice president": "vp",
+    "director": "director", "head": "head", "manager": "manager",
+    "senior": "senior", "staff": "staff", "principal": "principal",
+    "lead": "lead",
+}
+
+
+def fiber_seniority(value: str) -> Optional[str]:
+    """Fiber's spelling of a seniority level, or None when it has no tier."""
+    return _FIBER_SENIORITY.get(str(value or "").strip().lower())
+
+
 def modern_linkedin_industry(value: str) -> Optional[str]:
     """Current LinkedIn's spelling of an industry, or None when it has none.
 
@@ -3324,8 +3364,33 @@ def build_fiber_people_params(p: dict) -> dict:
     """
     sp: dict = {}
 
-    if p.get("job_title"):
-        sp["jobTitleV3"] = {"anyOf": [{"type": "plain", "term": p["job_title"]}]}
+    refuse_unexpressible(p, "technologies", "intent_topics",
+                         "revenue_min", "revenue_max", "departments")
+
+    # Seniority rides inside jobTitleV3, which is the only place their people
+    # index expresses it — and it was being dropped. Production sends
+    # job_title="Manager" with seniority="owner"; GetLeads received
+    # seniority ["C-Team"] and Bytemine ["Owner"], while Fiber received a bare
+    # title and answered with Managers at every level.
+    #
+    # allOf rather than anyOf: the two clauses are one constraint, not two
+    # alternatives. anyOf here would widen the search to every Manager *or*
+    # every executive, which is worse than the drop it replaces.
+    title = {"type": "plain", "term": p["job_title"]} if p.get("job_title") else None
+    level = None
+    if p.get("seniority") and not seniority_implied_by_title(
+            p.get("job_title"), p["seniority"]):
+        level = fiber_seniority(p["seniority"])
+        if not level:
+            raise ProviderUnsupported("seniority", p["seniority"])
+        level = {"type": "functional", "seniority": [level]}
+
+    if title and level:
+        sp["jobTitleV3"] = {"allOf": [title, level]}
+    elif title:
+        sp["jobTitleV3"] = {"anyOf": [title]}
+    elif level:
+        sp["jobTitleV3"] = {"anyOf": [level]}
 
     if p.get("industry"):
         mapped = fiber_industry(p["industry"])
@@ -3629,6 +3694,8 @@ def build_coldiq_filters(p: dict) -> dict:
     question.
     """
     body: dict = {}
+    refuse_unexpressible(p, "technologies", "intent_topics",
+                         "revenue_min", "revenue_max", "departments")
 
     if p.get("job_title"):
         body["job_titles"] = [p["job_title"]]
@@ -4295,6 +4362,9 @@ def build_bytemine_filters(p: dict) -> dict:
     has no field for. Crustdata handles both, so those searches fall through.
     """
     body: dict = {}
+
+    refuse_unexpressible(p, "technologies", "intent_topics",
+                         "revenue_min", "revenue_max")
 
     if p.get("job_title"):
         body["jobTitles"] = [p["job_title"]]
@@ -6162,10 +6232,15 @@ def enforce_crustdata_search_scope(params: dict, allow_broad_search: bool) -> No
         if params.get(field)
     ]
     if unsupported:
-        raise HTTPException(
-            status_code=422,
-            detail=("Crustdata does not map these requested filters yet: "
-                    f"{', '.join(unsupported)}. Refusing to silently ignore them."),
+        # ProviderUnsupported, not HTTPException. Refusing to drop a filter is
+        # right; reporting it as a broken leg is not. The chain reads an
+        # exception here as "crustdata:error" and, when every other leg has also
+        # stepped aside, re-raises the first failure — so a search for a
+        # technology Wiza can express could surface as a Crustdata error. This
+        # is the same "step aside" the rest of the file uses.
+        raise ProviderUnsupported(
+            ", ".join(unsupported),
+            "Crustdata has no field for these",
         )
 
 
