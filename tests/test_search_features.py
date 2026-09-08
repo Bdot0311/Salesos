@@ -3212,6 +3212,80 @@ class FiberChainTests(unittest.TestCase):
             self.assertIn("fiber", main.provider_chain())
 
 
+class BytemineEnvelopeTests(unittest.IsolatedAsyncioTestCase):
+    """The gateway does not answer the same shape on every endpoint.
+
+    /contacts/search returns {"contacts": [...]} — reading data["data"] there
+    meant Bytemine never returned a lead until #37. /contacts/enrich returns the
+    record flat, and the same read was still in place, so the reveal never
+    produced a record either:
+
+      Bytemine /contacts/enrich status: 200 {"first_name":null,"last_name":null,
+      "full_name":null,"job_title":null,...}
+    """
+
+    def test_a_flat_record_is_the_record(self):
+        record = main.bytemine_record(
+            {"first_name": "Ada", "work_email": "ada@acme.com"}, "data", "results")
+
+        self.assertEqual(record["first_name"], "Ada")
+
+    def test_a_wrapped_record_still_works(self):
+        record = main.bytemine_record({"data": {"first_name": "Ada"}}, "data")
+        self.assertEqual(record["first_name"], "Ada")
+
+    def test_a_wrapped_list_takes_the_first(self):
+        record = main.bytemine_record(
+            {"results": [{"first_name": "Ada"}, {"first_name": "Bob"}]},
+            "data", "results")
+
+        self.assertEqual(record["first_name"], "Ada")
+
+    def test_an_envelope_with_nothing_in_it_is_empty(self):
+        self.assertEqual(main.bytemine_record({"data": [], "totalCount": 0},
+                                              "data", "results"), {})
+
+    def test_an_unrecognisable_payload_is_not_mistaken_for_a_record(self):
+        # An error body must not become a lead with an error message in it.
+        self.assertEqual(main.bytemine_record({"error": "nope"}, "data"), {})
+
+    async def test_enrich_reads_the_flat_shape_it_actually_returns(self):
+        async def call(path, body, timeout=60.0):
+            return {"first_name": "Ada", "last_name": "Lovelace",
+                    "work_email": "ada@acme.com"}
+
+        with patch.object(main, "bytemine_call", call):
+            record = await main.bytemine_enrich({"linkedin": "https://x/in/ada"})
+
+        self.assertEqual(record["work_email"], "ada@acme.com")
+
+    async def test_unlock_accepts_the_search_envelope_too(self):
+        async def call(path, body, timeout=60.0):
+            return {"contacts": [{"pid": "1", "work_email": "ada@acme.com"}]}
+
+        with patch.object(main, "bytemine_call", call):
+            record = await main.bytemine_unlock("1")
+
+        self.assertEqual(record["work_email"], "ada@acme.com")
+
+
+class WizaRevealBudgetTests(unittest.TestCase):
+    """Our poll budget must fit inside the platform's request budget.
+
+    Twenty polls at three seconds is a minute of sleeping before request time is
+    counted, and it runs on top of every leg before it. Production reached
+    "Wiza reveal poll #20: status=resolving" and the gateway killed the request
+    — an opaque 504 with no body, after Wiza had been charged for the reveal.
+    """
+
+    def test_the_budget_leaves_room_inside_a_sixty_second_gateway(self):
+        self.assertLess(main.WIZA_REVEAL_BUDGET_SECONDS, 60)
+
+    def test_it_is_long_enough_for_a_reveal_that_takes_a_few_polls(self):
+        # Production reveals routinely finish on poll 7 or 8, ~24 seconds.
+        self.assertGreaterEqual(main.WIZA_REVEAL_BUDGET_SECONDS, 30)
+
+
 class BytemineHeadcountTests(unittest.TestCase):
     """Bytemine has no headcount field that works.
 
