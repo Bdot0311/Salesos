@@ -2922,6 +2922,47 @@ class FiberSearchBodyTests(unittest.TestCase):
         self.assertEqual(params["keywordsV2"]["clauses"][0]["terms"], ["ai saas"])
 
 
+class FiberCompanyTests(unittest.TestCase):
+    """A named company is a hard constraint, not a hint.
+
+    Production searched for "Director Sales" at vectis.ai and the request went
+    out as jobTitleV3 alone — ten sales directors at ten other companies.
+    """
+
+    def test_a_domain_becomes_a_company_constraint(self):
+        params = main.build_fiber_people_params(
+            {"job_title": "Director Sales", "company_domain": "vectis.ai"})
+
+        self.assertEqual(params["jobs"]["anyOf"][0]["company"],
+                         {"identifier": "domain", "value": "vectis.ai"})
+        self.assertEqual(params["jobs"]["anyOf"][0]["status"], "current")
+
+    def test_a_domain_in_the_company_field_still_counts(self):
+        params = main.build_fiber_people_params(
+            {"job_title": "Director Sales", "company": "vectis.ai"})
+
+        self.assertEqual(params["jobs"]["anyOf"][0]["company"]["value"], "vectis.ai")
+
+    def test_a_url_is_reduced_to_its_host(self):
+        params = main.build_fiber_people_params(
+            {"job_title": "X", "company_domain": "https://www.vectis.ai/careers"})
+
+        self.assertEqual(params["jobs"]["anyOf"][0]["company"]["value"], "vectis.ai")
+
+    def test_a_company_known_only_by_name_is_refused(self):
+        # Their identifiers are all machine keys — domain, LinkedIn URL, slug,
+        # org id. A name cannot be expressed, so the chain must move on.
+        with self.assertRaises(main.ProviderUnsupported):
+            main.build_fiber_people_params(
+                {"job_title": "Director Sales", "company": "vectis"})
+
+    def test_the_domain_wins_when_both_are_given(self):
+        params = main.build_fiber_people_params(
+            {"job_title": "X", "company": "vectis", "company_domain": "vectis.ai"})
+
+        self.assertEqual(params["jobs"]["anyOf"][0]["company"]["value"], "vectis.ai")
+
+
 class FiberIndustryTests(unittest.TestCase):
     """An industry outside their enum is refused, never sent."""
 
@@ -3288,17 +3329,32 @@ class DuplicateSearchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(walks, ["bytemine"])
         self.assertEqual([r.count for r in results], [1, 1])
 
-    async def test_the_second_one_is_served_from_the_cache(self):
+    async def test_the_waiter_is_handed_the_same_answer(self):
+        # Not "the second reads the cache": the first request writes every
+        # person it returned into the seen ledger, so a waiter that walked the
+        # chain would correctly conclude it had shown all of them and go looking
+        # for different people — one search becoming two pages and two bills.
         results, _ = await self.run_twice({"job_title": "Founder", "location": "CA"})
 
-        self.assertEqual(sorted(r.from_cache for r in results), [False, True])
+        self.assertIs(results[0], results[1])
 
-    async def test_a_refresh_still_does_its_own_work(self):
-        # Bypassing the cache is what refresh was asked for.
+    async def test_a_duplicate_refresh_is_still_one_search(self):
+        # refresh bypasses the cache, not the fact that two dispatches of the
+        # same search are one search.
         _, walks = await self.run_twice(
             {"job_title": "Founder", "location": "CA", "refresh": True})
 
-        self.assertEqual(walks, ["bytemine", "bytemine"])
+        self.assertEqual(walks, ["bytemine"])
+
+    async def test_a_later_identical_search_is_not_served_the_old_answer(self):
+        # The shared entry lives only while a request is in flight or waiting on
+        # it. It is a duplicate window, not a second cache.
+        await self.run_twice({"job_title": "Founder", "location": "CA"})
+        self.assertEqual(main._search_locks, {})
+
+        _, walks = await self.run_twice(
+            {"job_title": "Founder", "location": "CA", "refresh": True})
+        self.assertEqual(walks, ["bytemine"])
 
     async def test_different_searches_are_not_serialised_into_one(self):
         walks: list = []
@@ -3334,11 +3390,170 @@ class DuplicateSearchTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(sorted(walks), ["CTO", "Founder"])
 
-    async def test_the_lock_is_forgotten_once_nobody_is_waiting(self):
+    async def test_the_entry_is_forgotten_once_nobody_is_waiting(self):
         # An unbounded dict keyed on every search body is a leak.
         await self.run_twice({"job_title": "Founder", "location": "CA"})
 
         self.assertEqual(main._search_locks, {})
+
+
+class SeenLedgerScopeTests(unittest.IsolatedAsyncioTestCase):
+    """Every search must surface people this customer has not been shown.
+
+    The already-seen list the frontend sends is built from leads the user
+    *saved*, so anything shown and skipped was never excluded and came back on
+    the next search. The server is the only party that knows what it actually
+    returned.
+    """
+
+    def test_a_campaign_names_its_own_ledger(self):
+        scope = main.search_seen_scope(main.SearchRequest(campaign_id="camp-1"))
+        self.assertEqual(scope, "camp-1")
+
+    def test_everything_else_is_scoped_to_the_customer(self):
+        token = main._treg_request_context.set({"customer_id": "acme"})
+        try:
+            scope = main.search_seen_scope(main.SearchRequest(job_title="Founder"))
+        finally:
+            main._treg_request_context.reset(token)
+
+        self.assertEqual(scope, "customer:acme")
+
+    def test_no_identity_means_no_ledger_and_no_change(self):
+        token = main._treg_request_context.set({"customer_id": None})
+        try:
+            scope = main.search_seen_scope(main.SearchRequest(job_title="Founder"))
+        finally:
+            main._treg_request_context.reset(token)
+
+        self.assertIsNone(scope)
+
+    async def test_the_ledger_is_read_newest_first_and_bounded(self):
+        # The exclusions go into provider request bodies; an unbounded list
+        # would eventually be a megabyte of URLs on every search.
+        captured = {}
+
+        class Result:
+            def scalars(self):
+                return self
+
+            def all(self):
+                return []
+
+        class Session:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def execute(self, stmt):
+                captured["sql"] = str(stmt)
+                return Result()
+
+        with patch.object(main, "async_session", Session):
+            await main.campaign_seen("customer:acme")
+
+        self.assertIn("ORDER BY", captured["sql"].upper())
+        self.assertIn("LIMIT", captured["sql"].upper())
+
+    async def test_a_cached_page_of_seen_people_is_not_replayed(self):
+        """The heart of it: a re-search must not be answered from cache.
+
+        A cached page is by definition the same people. That is right for the
+        same search run twice in a moment and wrong for a user asking again
+        tomorrow for somebody new.
+        """
+        walks: list = []
+        row = {"pid": "1", "first_name": "Ada",
+               "linkedin_url": "https://www.linkedin.com/in/ada"}
+
+        async def bytemine(params, limit, **kwargs):
+            walks.append("bytemine")
+            return {"profiles": [row], "total": 1, "next_cursor": None}
+
+        class Row:
+            results = json.dumps({"buckets": [{"provider": "bytemine",
+                                               "profiles": [row], "total": 1,
+                                               "next_cursor": None}],
+                                  "total": 1, "provider": "bytemine"})
+
+        async def lookup(_h):
+            return Row()
+
+        async def store(*a, **k):
+            return None
+
+        async def seen(scope, limit=None):
+            return {main._profile_lead_key(row)}, []
+
+        async def record(scope, profiles):
+            return profiles
+
+        patches = [
+            patch.object(main.settings, "bytemine_api_key", "b"),
+            patch.object(main.settings, "search_provider", "bytemine"),
+            patch.object(main, "provider_chain", lambda: ("bytemine",)),
+            patch.object(main, "bytemine_person_search", bytemine),
+            patch.object(main, "cache_lookup", lookup),
+            patch.object(main, "cache_store", store),
+            patch.object(main, "campaign_seen", seen),
+            patch.object(main, "record_new_campaign_profiles", record),
+            patch.object(main, "search_seen_scope", lambda r: "customer:acme"),
+        ]
+        for p in patches:
+            p.start()
+        try:
+            response = await main.walk_search(
+                main.SearchRequest(job_title="Founder", location="CA"))
+        finally:
+            for p in patches:
+                p.stop()
+
+        self.assertEqual(walks, ["bytemine"])
+        self.assertFalse(response.from_cache)
+
+    async def test_a_cached_page_of_new_people_still_stands(self):
+        walks: list = []
+        row = {"pid": "1", "first_name": "Ada",
+               "linkedin_url": "https://www.linkedin.com/in/ada"}
+
+        async def bytemine(params, limit, **kwargs):
+            walks.append("bytemine")
+            return {"profiles": [row], "total": 1, "next_cursor": None}
+
+        class Row:
+            results = json.dumps({"buckets": [{"provider": "bytemine",
+                                               "profiles": [row], "total": 1,
+                                               "next_cursor": None}],
+                                  "total": 1, "provider": "bytemine"})
+
+        async def lookup(_h):
+            return Row()
+
+        async def seen(scope, limit=None):
+            return set(), []          # nobody shown yet
+
+        patches = [
+            patch.object(main.settings, "bytemine_api_key", "b"),
+            patch.object(main.settings, "search_provider", "bytemine"),
+            patch.object(main, "provider_chain", lambda: ("bytemine",)),
+            patch.object(main, "bytemine_person_search", bytemine),
+            patch.object(main, "cache_lookup", lookup),
+            patch.object(main, "campaign_seen", seen),
+            patch.object(main, "search_seen_scope", lambda r: "customer:acme"),
+        ]
+        for p in patches:
+            p.start()
+        try:
+            response = await main.walk_search(
+                main.SearchRequest(job_title="Founder", location="CA"))
+        finally:
+            for p in patches:
+                p.stop()
+
+        self.assertEqual(walks, [])
+        self.assertTrue(response.from_cache)
 
 
 class PitchAsSemanticQueryTests(unittest.IsolatedAsyncioTestCase):
