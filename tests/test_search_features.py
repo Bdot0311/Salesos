@@ -61,12 +61,17 @@ class CrustdataFilterTests(unittest.TestCase):
 
         main.enforce_crustdata_search_scope({"job_title": "Founder"}, True)
 
-    def test_ignored_filters_are_rejected(self):
-        with self.assertRaises(main.HTTPException) as raised:
+    def test_ignored_filters_make_it_step_aside_rather_than_error(self):
+        # ProviderUnsupported, not HTTPException. Refusing to drop a filter is
+        # right; reporting it as a broken leg is not — the chain reads an
+        # exception as "crustdata:error" and, when every other leg has also
+        # stepped aside, re-raises the first failure. A search for a technology
+        # Wiza can express would then surface as a Crustdata error.
+        with self.assertRaises(main.ProviderUnsupported) as raised:
             main.enforce_crustdata_search_scope(
                 {"job_title": "Founder", "revenue_max": 100_000}, False
             )
-        self.assertIn("revenue_max", raised.exception.detail)
+        self.assertIn("revenue_max", raised.exception.field)
 
     def test_profiles_are_deduped_by_crustdata_id(self):
         profiles = [
@@ -3210,6 +3215,100 @@ class FiberChainTests(unittest.TestCase):
              patch.object(main.settings, "fiber_api_key", "fb"), \
              patch.object(main.settings, "search_provider", "bytemine"):
             self.assertIn("fiber", main.provider_chain())
+
+
+class SilentlyDroppedFilterTests(unittest.TestCase):
+    """No provider may answer a different question than the one asked.
+
+    Found by sweeping every builder with one field at a time against a minimal
+    base: anything that left the body unchanged was being dropped. Four filters
+    were, in four different builders. Wiza expresses technologies, intent topics
+    and revenue bands, so refusing routes the search to the leg that can answer
+    it rather than to a leg that will answer something else.
+    """
+
+    BUILDERS = (
+        ("bytemine", staticmethod(lambda p: main.build_bytemine_filters(p))),
+        ("getleads", staticmethod(lambda p: main.build_getleads_filters(p))),
+        ("fiber", staticmethod(lambda p: main.build_fiber_people_params(p))),
+        ("coldiq", staticmethod(lambda p: main.build_coldiq_filters(p))),
+    )
+
+    def test_no_builder_silently_drops_a_stated_filter(self):
+        base = {"job_title": "Account Executive"}
+        fields = {"technologies": ["Salesforce"], "intent_topics": ["Funding"],
+                  "revenue_min": 1_000_000, "revenue_max": 5_000_000}
+
+        for name, build in self.BUILDERS:
+            build = build.__func__ if hasattr(build, "__func__") else build
+            unchanged = json.dumps(build(dict(base)), sort_keys=True)
+            for field, value in fields.items():
+                with self.subTest(provider=name, field=field):
+                    try:
+                        got = json.dumps(build({**base, field: value}),
+                                         sort_keys=True)
+                    except main.ProviderUnsupported:
+                        continue          # stepping aside is the point
+                    self.assertNotEqual(
+                        got, unchanged,
+                        f"{name} accepted {field} and did nothing with it")
+
+    def test_wiza_still_expresses_them_so_the_chain_can_answer(self):
+        # If nothing could express these, refusing everywhere would empty the
+        # page — which is the failure #38 fixed for industry.
+        base = json.dumps(main.build_wiza_filters({"job_title": "AE"}), sort_keys=True)
+        for field, value in (("technologies", ["Salesforce"]),
+                             ("intent_topics", ["Funding"]),
+                             ("revenue_min", 1_000_000)):
+            with self.subTest(field=field):
+                got = json.dumps(main.build_wiza_filters(
+                    {"job_title": "AE", field: value}), sort_keys=True)
+                self.assertNotEqual(got, base)
+
+
+class FiberSeniorityTests(unittest.TestCase):
+    """Seniority rides inside jobTitleV3, and was being dropped.
+
+    Production sends job_title="Manager" with seniority="owner". GetLeads
+    received seniority ["C-Team"] and Bytemine ["Owner"], while Fiber received a
+    bare title and answered with Managers at every level.
+    """
+
+    def test_seniority_reaches_fiber(self):
+        params = main.build_fiber_people_params(
+            {"job_title": "Manager", "seniority": "owner"})
+
+        self.assertEqual(params["jobTitleV3"]["allOf"], [
+            {"type": "plain", "term": "Manager"},
+            {"type": "functional", "seniority": ["c-suite"]},
+        ])
+
+    def test_it_is_an_and_not_an_or(self):
+        # anyOf would widen this to every Manager *or* every executive, which
+        # is worse than the drop it replaces.
+        params = main.build_fiber_people_params(
+            {"job_title": "Manager", "seniority": "owner"})
+
+        self.assertNotIn("anyOf", params["jobTitleV3"])
+
+    def test_owner_maps_the_way_this_file_already_maps_it(self):
+        # build_getleads_filters sends owner as "C-Team"; their enum has no
+        # owner tier and the top executive tier is the one already in use.
+        self.assertEqual(main.fiber_seniority("owner"), "c-suite")
+        self.assertEqual(main.fiber_seniority("founder"), "c-suite")
+        self.assertEqual(main.fiber_seniority("vp"), "vp")
+
+    def test_a_title_that_implies_it_does_not_send_it_twice(self):
+        params = main.build_fiber_people_params(
+            {"job_title": "Founder", "seniority": "owner"})
+
+        self.assertEqual(params["jobTitleV3"],
+                         {"anyOf": [{"type": "plain", "term": "Founder"}]})
+
+    def test_a_level_with_no_tier_steps_aside(self):
+        with self.assertRaises(main.ProviderUnsupported):
+            main.build_fiber_people_params(
+                {"job_title": "Analyst", "seniority": "intern"})
 
 
 class RevealLedgerTests(unittest.IsolatedAsyncioTestCase):
