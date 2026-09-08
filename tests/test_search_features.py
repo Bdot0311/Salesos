@@ -476,7 +476,6 @@ class BytemineFilterTests(unittest.TestCase):
             "job_title": "Account Executive",
             "seniority": "vp",
             "industry": "Information Technology and Services",
-            "company_size": "51-200",
             "company_domain": "stripe.com",
             # A state by name. "CA" would be Canada here — see
             # classify_location — and Bytemine has no country field.
@@ -486,8 +485,9 @@ class BytemineFilterTests(unittest.TestCase):
         self.assertEqual(body["jobTitles"], ["Account Executive"])
         self.assertEqual(body["seniorityLevels"], ["VP"])
         self.assertEqual(body["industries"], ["Information Technology and Services"])
-        self.assertEqual(body["employeeSizes"], ["51-200"])
         self.assertEqual(body["urls"], ["stripe.com"])
+        # No headcount: see test_a_sized_search_is_refused_rather_than_broadened.
+        self.assertNotIn("employeeSizes", body)
         self.assertEqual(body["states"], ["CA"])
 
     def test_founder_maps_to_the_owner_seniority(self):
@@ -3210,6 +3210,105 @@ class FiberChainTests(unittest.TestCase):
              patch.object(main.settings, "fiber_api_key", "fb"), \
              patch.object(main.settings, "search_provider", "bytemine"):
             self.assertIn("fiber", main.provider_chain())
+
+
+class BytemineHeadcountTests(unittest.TestCase):
+    """Bytemine has no headcount field that works.
+
+    The shape probe asked six ways, each alongside jobTitles=["Founder"], which
+    alone matches 1,297,933:
+
+        employeeSizes ["1-10"]            ->         0
+        employeeSize  "1-10"              ->         0
+        employeeSizes ["1 - 10"]          ->         0
+        employeeSizes ["1_10"]            ->         0
+        employeesMin/employeesMax         -> 1,297,933
+        employeeCountMin/employeeCountMax -> 1,297,933
+
+    The last two look like successes and are not: that is the count with no size
+    filter at all, so those keys are ignored rather than applied.
+    """
+
+    def test_a_sized_search_is_refused_rather_than_broadened(self):
+        with self.assertRaises(main.ProviderUnsupported) as raised:
+            main.build_bytemine_filters(
+                {"job_title": "Founder", "company_size": "1-10"})
+
+        self.assertEqual(raised.exception.field, "company_size")
+
+    def test_the_band_that_matches_nothing_is_never_sent(self):
+        # Recognised and matching nothing is the silent zero that hid the real
+        # defect — the response parsing — for weeks.
+        for size in ("1-10", "11-50", "10001+"):
+            with self.assertRaises(main.ProviderUnsupported):
+                main.build_bytemine_filters({"job_title": "F", "company_size": size})
+
+    def test_an_unsized_search_still_runs(self):
+        body = main.build_bytemine_filters(
+            {"job_title": "Founder", "industry": "computer software"})
+
+        self.assertEqual(body["jobTitles"], ["Founder"])
+        self.assertNotIn("employeeSizes", body)
+
+
+class GetleadsTimeoutTests(unittest.IsolatedAsyncioTestCase):
+    """Their timeout names its own remedy, and the retry is free."""
+
+    def _client(self, statuses):
+        calls = []
+
+        class Client:
+            def __init__(self, *a, **k):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def post(self, url, headers=None, json=None):
+                calls.append(json)
+                status, payload = statuses[len(calls) - 1]
+                return RoutedResponse(status, payload)
+
+        return Client, calls
+
+    async def test_a_timeout_is_retried_without_max_per_company(self):
+        timeout = {"ok": False, "error": "search_timeout",
+                   "message": "Search timed out after 50s. Narrow the query "
+                              "(... lower/remove max_per_company) and retry."}
+        Client, calls = self._client([
+            (502, timeout),
+            (200, {"ok": True, "contacts": [{"first_name": "Ada"}]}),
+        ])
+        with patch.object(main.httpx, "AsyncClient", Client), \
+             patch.object(main.settings, "getleads_api_key", "glb"):
+            data = await main.getleads_person_search({"job_title": "Founder"}, 5)
+
+        self.assertEqual(len(calls), 2)
+        self.assertIn("max_per_company", calls[0])
+        self.assertNotIn("max_per_company", calls[1])
+        self.assertEqual(len(data["profiles"]), 1)
+
+    async def test_it_is_retried_once_and_not_forever(self):
+        timeout = {"ok": False, "error": "search_timeout", "message": "timed out"}
+        Client, calls = self._client([(502, timeout), (502, timeout)])
+        with patch.object(main.httpx, "AsyncClient", Client), \
+             patch.object(main.settings, "getleads_api_key", "glb"):
+            with self.assertRaises(main.HTTPException):
+                await main.getleads_person_search({"job_title": "Founder"}, 5)
+
+        self.assertEqual(len(calls), 2)
+
+    async def test_another_error_is_not_retried(self):
+        Client, calls = self._client([(500, {"ok": False, "message": "boom"})])
+        with patch.object(main.httpx, "AsyncClient", Client), \
+             patch.object(main.settings, "getleads_api_key", "glb"):
+            with self.assertRaises(main.HTTPException):
+                await main.getleads_person_search({"job_title": "Founder"}, 5)
+
+        self.assertEqual(len(calls), 1)
 
 
 class SegmentTermBoundaryTests(unittest.TestCase):

@@ -2776,6 +2776,11 @@ async def getleads_call(path: str, body: dict) -> dict:
         raise HTTPException(status_code=502, detail="GetLeads returned a non-JSON body")
 
 
+def _getleads_timed_out(failure: HTTPException) -> bool:
+    """True for the 502 GetLeads returns when a search runs past its 50s budget."""
+    return "search_timeout" in str(getattr(failure, "detail", ""))
+
+
 async def getleads_person_search(params: dict, limit: int, offset: int = 0) -> dict:
     """Search the GetLeads contact index.
 
@@ -2791,7 +2796,21 @@ async def getleads_person_search(params: dict, limit: int, offset: int = 0) -> d
         "max_per_company": 3,
     }
     print(f"GetLeads search body: {json.dumps(body)[:400]}")
-    data = await getleads_call("/api/v1/contacts/search", body)
+    try:
+        data = await getleads_call("/api/v1/contacts/search", body)
+    except HTTPException as failure:
+        # "Search timed out after 50s. Narrow the query (add filters such as
+        # seniority, job_functions, industries, or countries; reduce limit; or
+        # lower/remove max_per_company) and retry." Their own message names the
+        # remedy, and query_credits_used is 0 on a timeout, so the retry is
+        # free. max_per_company is ours rather than the user's — dropping it can
+        # let one company fill the page, which is a worse page than no page.
+        if not _getleads_timed_out(failure) or "max_per_company" not in body:
+            raise
+        print("GetLeads timed out — retrying once without max_per_company, "
+              "which is the narrowing its own error suggests")
+        narrowed = {k: v for k, v in body.items() if k != "max_per_company"}
+        data = await getleads_call("/api/v1/contacts/search", narrowed)
 
     contacts = data.get("contacts") or data.get("results") or data.get("data") or []
     contacts = [c for c in contacts if isinstance(c, dict)]
@@ -4308,11 +4327,29 @@ def build_bytemine_filters(p: dict) -> dict:
     if urls:
         body["urls"] = list(dict.fromkeys(urls))
 
+    # /contacts/search has no headcount field that works, so a sized ICP is
+    # refused rather than answered wrongly. The shape probe asked six ways,
+    # each alongside jobTitles=["Founder"], which alone matches 1,297,933:
+    #
+    #   employeeSizes ["1-10"]                ->         0
+    #   employeeSize  "1-10"                  ->         0
+    #   employeeSizes ["1 - 10"]              ->         0
+    #   employeeSizes ["1_10"]                ->         0
+    #   employeesMin/employeesMax 1..10       -> 1,297,933
+    #   employeeCountMin/employeeCountMax     -> 1,297,933
+    #
+    # The last two look like successes and are not: 1,297,933 is the count for
+    # the job title with no size filter at all, so those keys are being ignored
+    # rather than applied. Sending them would return founders at companies of
+    # every size while reporting a sized search — the silent broadening this
+    # file refuses everywhere else. The band form is recognised and matches
+    # nothing, which is the silent zero that hid Bytemine's real defect for
+    # weeks.
+    #
+    # Neither is usable, so neither is sent. Bytemine still answers every search
+    # that does not carry a size.
     if p.get("company_size"):
-        band = bytemine_employee_band(p["company_size"])
-        if not band:
-            raise ProviderUnsupported("company_size", p["company_size"])
-        body["employeeSizes"] = [band]
+        raise ProviderUnsupported("company_size", p["company_size"])
 
     # /contacts/search filters location by US state or city only — there is no
     # country field. Anything that is not one of those two is refused so the
