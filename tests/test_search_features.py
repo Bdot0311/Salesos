@@ -3212,6 +3212,198 @@ class FiberChainTests(unittest.TestCase):
             self.assertIn("fiber", main.provider_chain())
 
 
+class RevealLedgerTests(unittest.IsolatedAsyncioTestCase):
+    """One person, one reveal. /enrich is where the money goes.
+
+    One production hour, one person each:
+
+        Akshat Bhatt    17:12:06   17:25:15   17:34:14
+        Rakibul Rakib   17:31:47   17:33:54
+        Zack Ensign     17:31:48   17:33:55
+
+    Three paid reveals for one lead, two for several more. The pairs sit about
+    two minutes apart, so this is the client re-enriching rather than a double
+    dispatch — waiting on a lock is not enough, the answer has to be remembered.
+    """
+
+    def setUp(self):
+        main._enrich_locks.clear()
+
+    def _answer(self, email="ada@acme.com"):
+        return {"success": True, "provider": "wiza", "enrichment_status": "complete",
+                "email_verification": {"sendable": True},
+                "lead": {"business_email": email, "contact_name": "Ada"}}
+
+    async def run_enrich(self, requests, answer=None, stored=None):
+        reveals = []
+        store: dict = {}
+
+        class Row:
+            def __init__(self, payload):
+                self.results = json.dumps(payload)
+
+        async def reveal(request):
+            reveals.append(request.full_name)
+            await asyncio.sleep(0.01)
+            return answer if answer is not None else self._answer()
+
+        async def lookup(key):
+            if stored is not None and key not in store:
+                return Row(stored)
+            return store.get(key)
+
+        async def save(key, params, payload):
+            store[key] = Row(payload)
+
+        patches = [
+            patch.object(main, "reveal_lead", reveal),
+            patch.object(main, "cache_lookup", lookup),
+            patch.object(main, "cache_store", save),
+        ]
+        for p in patches:
+            p.start()
+        try:
+            results = await asyncio.gather(
+                *(main.enrich_lead(r) for r in requests))
+        finally:
+            for p in patches:
+                p.stop()
+        return results, reveals
+
+    async def test_the_same_person_is_revealed_once(self):
+        # Two minutes apart in production; sequential here, same key.
+        who = main.EnrichRequest(full_name="Akshat Bhatt", company="Clumoss")
+        results, reveals = await self.run_enrich([who])
+        again, reveals2 = await self.run_enrich([who])
+
+        self.assertEqual(len(reveals), 1)
+        self.assertEqual(results[0]["lead"]["business_email"], "ada@acme.com")
+
+    async def test_concurrent_duplicates_share_one_reveal(self):
+        who = main.EnrichRequest(full_name="Rakibul Rakib", company="Periscale Ai")
+        results, reveals = await self.run_enrich([who, who])
+
+        self.assertEqual(reveals, ["Rakibul Rakib"])
+        self.assertIs(results[0], results[1])
+
+    async def test_a_remembered_reveal_is_returned_without_paying(self):
+        who = main.EnrichRequest(full_name="Zack Ensign", company="Portraits.Com")
+        _, reveals = await self.run_enrich([who], stored=[self._answer("z@p.com")])
+
+        self.assertEqual(reveals, [])
+
+    async def test_two_different_people_are_two_reveals(self):
+        a = main.EnrichRequest(full_name="Ada Lovelace", company="Acme")
+        b = main.EnrichRequest(full_name="Grace Hopper", company="Acme")
+        _, reveals = await self.run_enrich([a, b])
+
+        self.assertEqual(sorted(reveals), ["Ada Lovelace", "Grace Hopper"])
+
+    async def test_a_miss_is_not_remembered(self):
+        # The provider that missed may not be the one asked next time.
+        who = main.EnrichRequest(full_name="Nobody", company="Nowhere")
+        miss = {"success": False, "lead": {"business_email": None}}
+
+        _, first = await self.run_enrich([who], answer=miss)
+        _, second = await self.run_enrich([who], answer=miss)
+
+        self.assertEqual(len(first), 1)
+        self.assertEqual(len(second), 1)
+
+    def test_one_person_named_two_ways_is_one_key(self):
+        # http vs https, trailing slash, casing — see linkedin_identity.
+        a = main.EnrichRequest(linkedin_url="https://www.linkedin.com/in/ada/")
+        b = main.EnrichRequest(linkedin_url="http://linkedin.com/in/ada")
+
+        self.assertEqual(main.enrich_identity_key(a), main.enrich_identity_key(b))
+
+    def test_two_people_are_two_keys(self):
+        a = main.EnrichRequest(full_name="Ada", company="Acme")
+        b = main.EnrichRequest(full_name="Grace", company="Acme")
+
+        self.assertNotEqual(main.enrich_identity_key(a), main.enrich_identity_key(b))
+
+    async def test_the_lock_entry_is_forgotten_afterwards(self):
+        who = main.EnrichRequest(full_name="Ada", company="Acme")
+        await self.run_enrich([who, who])
+
+        self.assertEqual(main._enrich_locks, {})
+
+
+class BytemineEnvelopeTests(unittest.IsolatedAsyncioTestCase):
+    """The gateway does not answer the same shape on every endpoint.
+
+    /contacts/search returns {"contacts": [...]} — reading data["data"] there
+    meant Bytemine never returned a lead until #37. /contacts/enrich returns the
+    record flat, and the same read was still in place, so the reveal never
+    produced a record either:
+
+      Bytemine /contacts/enrich status: 200 {"first_name":null,"last_name":null,
+      "full_name":null,"job_title":null,...}
+    """
+
+    def test_a_flat_record_is_the_record(self):
+        record = main.bytemine_record(
+            {"first_name": "Ada", "work_email": "ada@acme.com"}, "data", "results")
+
+        self.assertEqual(record["first_name"], "Ada")
+
+    def test_a_wrapped_record_still_works(self):
+        record = main.bytemine_record({"data": {"first_name": "Ada"}}, "data")
+        self.assertEqual(record["first_name"], "Ada")
+
+    def test_a_wrapped_list_takes_the_first(self):
+        record = main.bytemine_record(
+            {"results": [{"first_name": "Ada"}, {"first_name": "Bob"}]},
+            "data", "results")
+
+        self.assertEqual(record["first_name"], "Ada")
+
+    def test_an_envelope_with_nothing_in_it_is_empty(self):
+        self.assertEqual(main.bytemine_record({"data": [], "totalCount": 0},
+                                              "data", "results"), {})
+
+    def test_an_unrecognisable_payload_is_not_mistaken_for_a_record(self):
+        # An error body must not become a lead with an error message in it.
+        self.assertEqual(main.bytemine_record({"error": "nope"}, "data"), {})
+
+    async def test_enrich_reads_the_flat_shape_it_actually_returns(self):
+        async def call(path, body, timeout=60.0):
+            return {"first_name": "Ada", "last_name": "Lovelace",
+                    "work_email": "ada@acme.com"}
+
+        with patch.object(main, "bytemine_call", call):
+            record = await main.bytemine_enrich({"linkedin": "https://x/in/ada"})
+
+        self.assertEqual(record["work_email"], "ada@acme.com")
+
+    async def test_unlock_accepts_the_search_envelope_too(self):
+        async def call(path, body, timeout=60.0):
+            return {"contacts": [{"pid": "1", "work_email": "ada@acme.com"}]}
+
+        with patch.object(main, "bytemine_call", call):
+            record = await main.bytemine_unlock("1")
+
+        self.assertEqual(record["work_email"], "ada@acme.com")
+
+
+class WizaRevealBudgetTests(unittest.TestCase):
+    """Our poll budget must fit inside the platform's request budget.
+
+    Twenty polls at three seconds is a minute of sleeping before request time is
+    counted, and it runs on top of every leg before it. Production reached
+    "Wiza reveal poll #20: status=resolving" and the gateway killed the request
+    — an opaque 504 with no body, after Wiza had been charged for the reveal.
+    """
+
+    def test_the_budget_leaves_room_inside_a_sixty_second_gateway(self):
+        self.assertLess(main.WIZA_REVEAL_BUDGET_SECONDS, 60)
+
+    def test_it_is_long_enough_for_a_reveal_that_takes_a_few_polls(self):
+        # Production reveals routinely finish on poll 7 or 8, ~24 seconds.
+        self.assertGreaterEqual(main.WIZA_REVEAL_BUDGET_SECONDS, 30)
+
+
 class BytemineHeadcountTests(unittest.TestCase):
     """Bytemine has no headcount field that works.
 

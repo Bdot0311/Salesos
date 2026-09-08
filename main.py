@@ -112,6 +112,10 @@ class Settings(BaseSettings):
 
 settings = Settings()
 
+# How long a single reveal may poll. Under the platform gateway's own request
+# budget, with room for the legs that run before it.
+WIZA_REVEAL_BUDGET_SECONDS = 35.0
+
 WIZA_BASE = "https://wiza.co/api"
 CRUSTDATA_BASE = "https://api.crustdata.com"
 CRUSTDATA_VERSION = "2025-11-01"
@@ -4654,13 +4658,43 @@ def transform_bytemine_unlocked(record: dict) -> dict:
     return lead
 
 
+# Fields that mark a payload as a contact record rather than an envelope.
+_BM_RECORD_FIELDS = ("first_name", "last_name", "full_name", "work_email",
+                     "personal_email", "linkedin_profile", "job_title", "pid")
+
+
+def bytemine_record(payload: dict, *containers: str) -> dict:
+    """The contact inside whichever envelope this endpoint happens to use.
+
+    The gateway does not answer the same shape everywhere. /contacts/search
+    returns {"contacts": [...]} — reading data["data"] there meant Bytemine
+    never returned a lead until #37. /contacts/enrich returns the record
+    *flat*, with first_name at the top level, and the same data["data"] read is
+    still in place here:
+
+      Bytemine /contacts/enrich status: 200 {"first_name":null,"last_name":null,
+      "full_name":null,"job_title":null,...}
+
+    So the reveal has never produced a record either. Rather than guess the
+    envelope again, the containers are tried in turn and a payload that is
+    plainly a record is used as one.
+    """
+    for key in containers:
+        value = payload.get(key)
+        if value:
+            if isinstance(value, list):
+                return value[0] if value else {}
+            if isinstance(value, dict):
+                return value
+    if any(field in payload for field in _BM_RECORD_FIELDS):
+        return payload
+    return {}
+
+
 async def bytemine_unlock(pid: str) -> dict:
     """Reveal one contact by PID via /contacts/unlock. Costs 1 credit."""
     data = await bytemine_call("/contacts/unlock", {"pids": [str(pid)]})
-    records = data.get("data") or data.get("results") or []
-    if isinstance(records, dict):
-        records = [records]
-    return records[0] if records else {}
+    return bytemine_record(data, "data", "results", "contacts")
 
 
 async def bytemine_enrich(identifiers: dict) -> dict:
@@ -4672,10 +4706,7 @@ async def bytemine_enrich(identifiers: dict) -> dict:
     body.setdefault("hasWorkEmail", True)
     body.setdefault("hasPhone", True)
     data = await bytemine_call("/contacts/enrich", body)
-    record = data.get("data") or {}
-    if isinstance(record, list):
-        record = record[0] if record else {}
-    return record
+    return bytemine_record(data, "data", "results", "contacts")
 
 
 # =============================================================================
@@ -5494,8 +5525,83 @@ class EnrichRequest(BaseModel):
         return cleaned
 
 
+# The reveal ledger. /enrich is the endpoint that spends money per call — a Wiza
+# individual_reveal, a ColdIQ find, a Fiber contact-details lookup — and it had
+# no protection against being asked the same question twice.
+#
+# One production hour, one person each:
+#
+#   Akshat Bhatt    17:12:06   17:25:15   17:34:14
+#   Rakibul Rakib   17:31:47   17:33:54
+#   Zack Ensign     17:31:48   17:33:55
+#   Sewell Mills    17:04:28   17:34:28
+#   Mahendra Sethi  17:32:18   17:33:55
+#
+# Three reveals for one lead, two for four more, all of them paid. The pairs sit
+# about two minutes apart, so this is the client re-enriching rather than a
+# double dispatch — which is why waiting on a lock is not enough on its own and
+# the answer has to be remembered.
+_enrich_locks: dict[str, dict] = {}
+
+
+def enrich_identity_key(request: EnrichRequest) -> str:
+    """One key for one person, however the caller named them."""
+    identity = {
+        "linkedin": linkedin_identity(request.linkedin_url or "") or None,
+        "email": (request.email or "").strip().lower() or None,
+        "name": (request.full_name or "").strip().lower() or None,
+        "domain": domain_host(request.company_domain or "") or None,
+        "company": (request.company or "").strip().lower() or None,
+        "pid": request.bytemine_pid or None,
+    }
+    return generate_search_hash({"_kind": "enrich", **identity})
+
+
 @app.post("/enrich")
 async def enrich_lead(request: EnrichRequest):
+    """Reveal one lead once, and remember the answer.
+
+    Concurrent duplicates share the first reveal; a repeat minutes later is
+    served from the reveal ledger. Both are the same question, and every
+    provider on this path bills per answer.
+    """
+    key = enrich_identity_key(request)
+
+    stored = await cache_lookup(key)
+    if stored:
+        try:
+            remembered = json.loads(stored.results)
+        except ValueError:
+            remembered = None
+        if isinstance(remembered, list) and remembered:
+            print("Lead already revealed — returning that reveal rather than "
+                  "paying for it again")
+            return remembered[0]
+
+    entry = _enrich_locks.setdefault(key, {"lock": asyncio.Lock(), "waiters": 0,
+                                           "result": None})
+    entry["waiters"] += 1
+    try:
+        async with entry["lock"]:
+            if entry["result"] is not None:
+                print("An identical reveal was already running — returning its "
+                      "result rather than paying twice")
+                return entry["result"]
+            result = await reveal_lead(request)
+            entry["result"] = result
+            # Only a reveal that found something is worth remembering; a miss
+            # should be retried, because the provider that missed may not be the
+            # one asked next time.
+            if (result or {}).get("lead", {}).get("business_email"):
+                await cache_store(key, {"_kind": "enrich"}, [result])
+            return result
+    finally:
+        entry["waiters"] -= 1
+        if entry["waiters"] <= 0:
+            _enrich_locks.pop(key, None)
+
+
+async def reveal_lead(request: EnrichRequest):
     """
     Enrich a single lead, trying each configured provider in turn.
 
@@ -5742,8 +5848,21 @@ async def enrich_lead(request: EnrichRequest):
         if not reveal_id:
             raise HTTPException(status_code=500, detail="Wiza returned no reveal ID")
 
-        # Poll until complete
-        for attempt in range(20):
+        # Poll to a wall-clock deadline, not a poll count.
+        #
+        # Twenty polls at three seconds is a minute of sleeping before the
+        # request time is counted, and it runs on top of every leg that came
+        # before it. Production reached "Wiza reveal poll #20: status=resolving"
+        # and the platform gateway killed the request — the caller got an opaque
+        # 504 with no body, after Wiza had already been charged for the reveal.
+        #
+        # A deadline cannot overrun the way a poll count can when each poll is
+        # slow, and this one leaves the rest of the enrich room inside a
+        # sixty-second gateway.
+        attempt = 0
+        deadline = time.monotonic() + WIZA_REVEAL_BUDGET_SECONDS
+        while time.monotonic() < deadline:
+            attempt += 1
             await asyncio.sleep(3.0)
             poll_resp = await client.get(
                 f"{WIZA_BASE}/individual_reveals/{reveal_id}",
@@ -5752,7 +5871,7 @@ async def enrich_lead(request: EnrichRequest):
             if poll_resp.status_code not in (200, 201):
                 break
             data = poll_resp.json().get("data", {})
-            print(f"Wiza reveal poll #{attempt + 1}: status={data.get('status')}")
+            print(f"Wiza reveal poll #{attempt}: status={data.get('status')}")
             if data.get("is_complete") or data.get("status") in ("finished", "failed"):
                 contact = {k: v for k, v in data.items()
                            if k not in ("id", "status", "is_complete", "enrichment_level",
@@ -5766,7 +5885,12 @@ async def enrich_lead(request: EnrichRequest):
                     "lead": lead,
                 }
 
-        raise HTTPException(status_code=504, detail="Wiza enrichment timed out")
+        # The reveal was paid for and will finish; naming it makes the credit
+        # traceable instead of vanishing behind a gateway timeout.
+        raise HTTPException(
+            status_code=504,
+            detail=f"Wiza reveal {reveal_id} did not finish within "
+                   f"{int(WIZA_REVEAL_BUDGET_SECONDS)}s — it is still resolving")
 
 
 async def _llm_parse_icp(text: str) -> dict:
