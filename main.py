@@ -5525,8 +5525,83 @@ class EnrichRequest(BaseModel):
         return cleaned
 
 
+# The reveal ledger. /enrich is the endpoint that spends money per call — a Wiza
+# individual_reveal, a ColdIQ find, a Fiber contact-details lookup — and it had
+# no protection against being asked the same question twice.
+#
+# One production hour, one person each:
+#
+#   Akshat Bhatt    17:12:06   17:25:15   17:34:14
+#   Rakibul Rakib   17:31:47   17:33:54
+#   Zack Ensign     17:31:48   17:33:55
+#   Sewell Mills    17:04:28   17:34:28
+#   Mahendra Sethi  17:32:18   17:33:55
+#
+# Three reveals for one lead, two for four more, all of them paid. The pairs sit
+# about two minutes apart, so this is the client re-enriching rather than a
+# double dispatch — which is why waiting on a lock is not enough on its own and
+# the answer has to be remembered.
+_enrich_locks: dict[str, dict] = {}
+
+
+def enrich_identity_key(request: EnrichRequest) -> str:
+    """One key for one person, however the caller named them."""
+    identity = {
+        "linkedin": linkedin_identity(request.linkedin_url or "") or None,
+        "email": (request.email or "").strip().lower() or None,
+        "name": (request.full_name or "").strip().lower() or None,
+        "domain": domain_host(request.company_domain or "") or None,
+        "company": (request.company or "").strip().lower() or None,
+        "pid": request.bytemine_pid or None,
+    }
+    return generate_search_hash({"_kind": "enrich", **identity})
+
+
 @app.post("/enrich")
 async def enrich_lead(request: EnrichRequest):
+    """Reveal one lead once, and remember the answer.
+
+    Concurrent duplicates share the first reveal; a repeat minutes later is
+    served from the reveal ledger. Both are the same question, and every
+    provider on this path bills per answer.
+    """
+    key = enrich_identity_key(request)
+
+    stored = await cache_lookup(key)
+    if stored:
+        try:
+            remembered = json.loads(stored.results)
+        except ValueError:
+            remembered = None
+        if isinstance(remembered, list) and remembered:
+            print("Lead already revealed — returning that reveal rather than "
+                  "paying for it again")
+            return remembered[0]
+
+    entry = _enrich_locks.setdefault(key, {"lock": asyncio.Lock(), "waiters": 0,
+                                           "result": None})
+    entry["waiters"] += 1
+    try:
+        async with entry["lock"]:
+            if entry["result"] is not None:
+                print("An identical reveal was already running — returning its "
+                      "result rather than paying twice")
+                return entry["result"]
+            result = await reveal_lead(request)
+            entry["result"] = result
+            # Only a reveal that found something is worth remembering; a miss
+            # should be retried, because the provider that missed may not be the
+            # one asked next time.
+            if (result or {}).get("lead", {}).get("business_email"):
+                await cache_store(key, {"_kind": "enrich"}, [result])
+            return result
+    finally:
+        entry["waiters"] -= 1
+        if entry["waiters"] <= 0:
+            _enrich_locks.pop(key, None)
+
+
+async def reveal_lead(request: EnrichRequest):
     """
     Enrich a single lead, trying each configured provider in turn.
 

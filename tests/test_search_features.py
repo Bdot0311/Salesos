@@ -3212,6 +3212,124 @@ class FiberChainTests(unittest.TestCase):
             self.assertIn("fiber", main.provider_chain())
 
 
+class RevealLedgerTests(unittest.IsolatedAsyncioTestCase):
+    """One person, one reveal. /enrich is where the money goes.
+
+    One production hour, one person each:
+
+        Akshat Bhatt    17:12:06   17:25:15   17:34:14
+        Rakibul Rakib   17:31:47   17:33:54
+        Zack Ensign     17:31:48   17:33:55
+
+    Three paid reveals for one lead, two for several more. The pairs sit about
+    two minutes apart, so this is the client re-enriching rather than a double
+    dispatch — waiting on a lock is not enough, the answer has to be remembered.
+    """
+
+    def setUp(self):
+        main._enrich_locks.clear()
+
+    def _answer(self, email="ada@acme.com"):
+        return {"success": True, "provider": "wiza", "enrichment_status": "complete",
+                "email_verification": {"sendable": True},
+                "lead": {"business_email": email, "contact_name": "Ada"}}
+
+    async def run_enrich(self, requests, answer=None, stored=None):
+        reveals = []
+        store: dict = {}
+
+        class Row:
+            def __init__(self, payload):
+                self.results = json.dumps(payload)
+
+        async def reveal(request):
+            reveals.append(request.full_name)
+            await asyncio.sleep(0.01)
+            return answer if answer is not None else self._answer()
+
+        async def lookup(key):
+            if stored is not None and key not in store:
+                return Row(stored)
+            return store.get(key)
+
+        async def save(key, params, payload):
+            store[key] = Row(payload)
+
+        patches = [
+            patch.object(main, "reveal_lead", reveal),
+            patch.object(main, "cache_lookup", lookup),
+            patch.object(main, "cache_store", save),
+        ]
+        for p in patches:
+            p.start()
+        try:
+            results = await asyncio.gather(
+                *(main.enrich_lead(r) for r in requests))
+        finally:
+            for p in patches:
+                p.stop()
+        return results, reveals
+
+    async def test_the_same_person_is_revealed_once(self):
+        # Two minutes apart in production; sequential here, same key.
+        who = main.EnrichRequest(full_name="Akshat Bhatt", company="Clumoss")
+        results, reveals = await self.run_enrich([who])
+        again, reveals2 = await self.run_enrich([who])
+
+        self.assertEqual(len(reveals), 1)
+        self.assertEqual(results[0]["lead"]["business_email"], "ada@acme.com")
+
+    async def test_concurrent_duplicates_share_one_reveal(self):
+        who = main.EnrichRequest(full_name="Rakibul Rakib", company="Periscale Ai")
+        results, reveals = await self.run_enrich([who, who])
+
+        self.assertEqual(reveals, ["Rakibul Rakib"])
+        self.assertIs(results[0], results[1])
+
+    async def test_a_remembered_reveal_is_returned_without_paying(self):
+        who = main.EnrichRequest(full_name="Zack Ensign", company="Portraits.Com")
+        _, reveals = await self.run_enrich([who], stored=[self._answer("z@p.com")])
+
+        self.assertEqual(reveals, [])
+
+    async def test_two_different_people_are_two_reveals(self):
+        a = main.EnrichRequest(full_name="Ada Lovelace", company="Acme")
+        b = main.EnrichRequest(full_name="Grace Hopper", company="Acme")
+        _, reveals = await self.run_enrich([a, b])
+
+        self.assertEqual(sorted(reveals), ["Ada Lovelace", "Grace Hopper"])
+
+    async def test_a_miss_is_not_remembered(self):
+        # The provider that missed may not be the one asked next time.
+        who = main.EnrichRequest(full_name="Nobody", company="Nowhere")
+        miss = {"success": False, "lead": {"business_email": None}}
+
+        _, first = await self.run_enrich([who], answer=miss)
+        _, second = await self.run_enrich([who], answer=miss)
+
+        self.assertEqual(len(first), 1)
+        self.assertEqual(len(second), 1)
+
+    def test_one_person_named_two_ways_is_one_key(self):
+        # http vs https, trailing slash, casing — see linkedin_identity.
+        a = main.EnrichRequest(linkedin_url="https://www.linkedin.com/in/ada/")
+        b = main.EnrichRequest(linkedin_url="http://linkedin.com/in/ada")
+
+        self.assertEqual(main.enrich_identity_key(a), main.enrich_identity_key(b))
+
+    def test_two_people_are_two_keys(self):
+        a = main.EnrichRequest(full_name="Ada", company="Acme")
+        b = main.EnrichRequest(full_name="Grace", company="Acme")
+
+        self.assertNotEqual(main.enrich_identity_key(a), main.enrich_identity_key(b))
+
+    async def test_the_lock_entry_is_forgotten_afterwards(self):
+        who = main.EnrichRequest(full_name="Ada", company="Acme")
+        await self.run_enrich([who, who])
+
+        self.assertEqual(main._enrich_locks, {})
+
+
 class BytemineEnvelopeTests(unittest.IsolatedAsyncioTestCase):
     """The gateway does not answer the same shape on every endpoint.
 
