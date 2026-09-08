@@ -5062,17 +5062,51 @@ def dedupe_crustdata_profiles(profiles: list[dict]) -> list[dict]:
     return output
 
 
-async def campaign_seen(campaign_id: str) -> tuple[set[str], list[str]]:
-    """Return the campaign's durable lead keys and usable provider exclusions."""
+# How far back a seen ledger is read. The exclusions go into provider request
+# bodies — Crustdata takes them as post_processing.exclude_profiles — so an
+# unbounded list would eventually be a megabyte of URLs on every search. Newest
+# first, because a lead shown months ago resurfacing is a far smaller problem
+# than one shown this morning.
+SEEN_LEDGER_DEPTH = 500
+
+
+async def campaign_seen(campaign_id: str,
+                        limit: int = SEEN_LEDGER_DEPTH) -> tuple[set[str], list[str]]:
+    """Return a scope's durable lead keys and usable provider exclusions."""
     try:
         async with async_session() as session:
             rows = (await session.execute(
-                select(CampaignSeenLead).where(CampaignSeenLead.campaign_id == campaign_id)
+                select(CampaignSeenLead)
+                .where(CampaignSeenLead.campaign_id == campaign_id)
+                .order_by(CampaignSeenLead.created_at.desc())
+                .limit(limit)
             )).scalars().all()
             return {row.lead_key for row in rows}, [row.profile_url for row in rows if row.profile_url]
     except Exception as e:
         print(f"WARNING: campaign seen lookup failed ({e})")
         return set(), []
+
+
+def search_seen_scope(request: SearchRequest) -> Optional[str]:
+    """The ledger this search reads and writes so nobody is shown twice.
+
+    A campaign names its own. Everything else is scoped to the customer, which
+    is the fix for the complaint that has outlived every other one: the
+    already-seen list the frontend sends is built from leads the user *saved*,
+    so anything shown and skipped was never excluded and came back on the next
+    search. The server is the only party that knows what it actually returned.
+
+    The middleware resolves a customer for every request, falling back to a
+    one-way client fingerprint, so this is available even without a tenant
+    header. When it is not, there is no ledger and behaviour is as before.
+    """
+    if request.campaign_id:
+        return request.campaign_id
+    try:
+        customer = treg_request_context().get("customer_id")
+    except Exception:
+        customer = None
+    return f"customer:{customer}" if customer else None
 
 
 async def record_new_campaign_profiles(campaign_id: str, profiles: list[dict]) -> list[dict]:
@@ -5990,32 +6024,38 @@ def enforce_crustdata_search_scope(params: dict, allow_broad_search: bool) -> No
 _search_locks: dict[str, list] = {}
 
 
-@asynccontextmanager
-async def one_search_at_a_time(key: str):
-    """Serialise byte-identical concurrent searches, and forget the key after."""
-    entry = _search_locks.setdefault(key, [asyncio.Lock(), 0])
-    entry[1] += 1
-    waited = entry[0].locked()
-    try:
-        async with entry[0]:
-            if waited:
-                print(f"An identical search was already running — waited for it "
-                      f"rather than paying every provider twice")
-            yield
-    finally:
-        entry[1] -= 1
-        if entry[1] <= 0:
-            _search_locks.pop(key, None)
-
-
 @app.post("/search", response_model=SearchResponse)
 async def search_leads(request: SearchRequest):
-    """Serialise duplicate in-flight searches, then run one."""
+    """Answer duplicate in-flight searches once, and share the answer.
+
+    The waiter is handed the first request's response rather than running its
+    own. Waiting alone is not enough any more: the first request writes every
+    person it returned into the seen ledger, so a waiter that then walked the
+    chain would correctly conclude it had shown all of them already and go
+    looking for different people — turning one search into two pages and two
+    bills. Two dispatches of the same search are one search.
+
+    The entry lives only while a request is in flight or waiting on it, so this
+    is a duplicate window, not a second cache.
+    """
     key = hashlib.sha256(
         json.dumps(request.model_dump(), sort_keys=True, default=str).encode()
     ).hexdigest()
-    async with one_search_at_a_time(key):
-        return await walk_search(request)
+    entry = _search_locks.setdefault(key, {"lock": asyncio.Lock(), "waiters": 0,
+                                           "result": None})
+    entry["waiters"] += 1
+    try:
+        async with entry["lock"]:
+            if entry["result"] is not None:
+                print("An identical search was already running — returning its "
+                      "result rather than paying every provider twice")
+                return entry["result"]
+            entry["result"] = await walk_search(request)
+            return entry["result"]
+    finally:
+        entry["waiters"] -= 1
+        if entry["waiters"] <= 0:
+            _search_locks.pop(key, None)
 
 
 async def walk_search(request: SearchRequest):
@@ -6081,10 +6121,15 @@ async def walk_search(request: SearchRequest):
 
     transform = transform_for(prov)
 
+    # Read once and use everywhere: the keys filter every leg's rows locally,
+    # and the URLs are handed to the providers that can exclude server-side.
+    # This used to be loaded only for Crustdata campaign searches, so the other
+    # legs filtered against an empty set.
+    seen_scope = search_seen_scope(request)
     campaign_keys: set[str] = set()
     campaign_exclusions: list[str] = []
-    if prov == "crustdata" and request.campaign_id:
-        campaign_keys, campaign_exclusions = await campaign_seen(request.campaign_id)
+    if seen_scope:
+        campaign_keys, campaign_exclusions = await campaign_seen(seen_scope)
 
     exclusions = list(dict.fromkeys(
         (request.exclude_profiles or []) + campaign_exclusions
@@ -6120,12 +6165,26 @@ async def walk_search(request: SearchRequest):
             data = cached_payload
             total = len(data)
             leads = [transform_for(prov)(r) for r in data]
-        return SearchResponse(
-            success=True, source="cache", from_cache=True,
-            count=len(leads), total=total, leads=leads, data=data,
-            next_cursor=next_cursor, campaign_id=request.campaign_id,
-            provider=served_by,
-        )
+
+        # A cached page is by definition the same people. That is the right
+        # answer to the same search run twice in a moment, and the wrong one to
+        # a user asking again tomorrow for somebody new — which is the shape the
+        # repeat-lead complaints have always had.
+        #
+        # So the ledger decides: if the page holds nobody already shown, it
+        # stands. If it holds anyone, this is a re-search rather than a repeat
+        # request, and the chain runs for real instead of replaying it.
+        stale = [r for r in data if _profile_lead_key(r) in campaign_keys]
+        if stale:
+            print(f"Cache HIT holds {len(stale)} person(s) already shown — "
+                  "walking the chain for new people instead")
+        else:
+            return SearchResponse(
+                success=True, source="cache", from_cache=True,
+                count=len(leads), total=total, leads=leads, data=data,
+                next_cursor=next_cursor, campaign_id=request.campaign_id,
+                provider=served_by,
+            )
 
     print(f"Cache MISS — walking chain {'+'.join(chain)}")
 
@@ -6191,8 +6250,8 @@ async def walk_search(request: SearchRequest):
             # seen stable IDs even when a profile has no URL.
             if campaign_keys:
                 found = [p for p in found if _profile_lead_key(p) not in campaign_keys]
-            if request.campaign_id:
-                found = await record_new_campaign_profiles(request.campaign_id, found)
+            if seen_scope:
+                found = await record_new_campaign_profiles(seen_scope, found)
             return found, result["total"], result.get("next_cursor")
 
         if name == "getleads":
@@ -6241,8 +6300,8 @@ async def walk_search(request: SearchRequest):
                 offset = next_offset
 
             found = found[:wanted]
-            if request.campaign_id:
-                found = await record_new_campaign_profiles(request.campaign_id, found)
+            if seen_scope:
+                found = await record_new_campaign_profiles(seen_scope, found)
 
             return found, total, None
 
@@ -6267,8 +6326,8 @@ async def walk_search(request: SearchRequest):
             if campaign_keys:
                 found = [r for r in found
                          if _profile_lead_key(r) not in campaign_keys]
-            if request.campaign_id:
-                found = await record_new_campaign_profiles(request.campaign_id, found)
+            if seen_scope:
+                found = await record_new_campaign_profiles(seen_scope, found)
 
             return found, data["total"], data.get("next_cursor")
 
@@ -6303,8 +6362,8 @@ async def walk_search(request: SearchRequest):
             if campaign_keys:
                 found = [r for r in found
                          if _profile_lead_key(r) not in campaign_keys]
-            if request.campaign_id:
-                found = await record_new_campaign_profiles(request.campaign_id, found)
+            if seen_scope:
+                found = await record_new_campaign_profiles(seen_scope, found)
             return (found[skip:] if skip else found), data["total"], None
 
         if name == "coldiq":
@@ -6339,8 +6398,8 @@ async def walk_search(request: SearchRequest):
             if campaign_keys:
                 found = [p for p in found
                          if _profile_lead_key(p) not in campaign_keys]
-            if request.campaign_id:
-                found = await record_new_campaign_profiles(request.campaign_id, found)
+            if seen_scope:
+                found = await record_new_campaign_profiles(seen_scope, found)
 
             if before and not found:
                 print(f"ColdIQ: all {before} record(s) already seen — "
