@@ -3,6 +3,7 @@ import json
 import os
 import unittest
 import base64
+import hashlib
 from unittest.mock import AsyncMock, patch
 
 os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost/test")
@@ -4987,6 +4988,92 @@ class ExhaustedPoolTests(unittest.IsolatedAsyncioTestCase):
         # nobody rather than the pool being spent.
         self.assertEqual(result.count, 0)
         self.assertEqual(result.suppressed_as_seen, 0)
+
+
+class LedgerIdentityTests(unittest.TestCase):
+    """The ledger key must know every shape the chain can produce.
+
+    A provider whose row shape is missing from _profile_url is invisible to
+    the ledger: its people are never recorded and never filtered, so they come
+    back on every search forever. That is not a degraded ledger — for that
+    provider there is no ledger at all.
+
+    Production ran with Fiber and Wiza both unreadable. The ledger sat at 26
+    while Fiber returned ten leads across two searches and recorded none of
+    them.
+    """
+
+    # One person, as each provider actually spells them.
+    SHAPES = {
+        "wiza": {"linkedin": "https://linkedin.com/in/ada"},
+        "getleads": {"person_linkedin_url": "https://www.linkedin.com/in/ada/"},
+        "fiber_url": {"url": "http://linkedin.com/in/ada"},
+        "fiber_slug": {"primary_slug": "ada"},
+        "findymail": {"contact_linkedin_url": "https://linkedin.com/in/ada"},
+        "bytemine": {"linkedin_url": "https://linkedin.com/in/ada"},
+        "coldiq": {"linkedin_url": "HTTPS://LinkedIn.com/in/ada"},
+        "crustdata": {"social_handles": {"professional_network_identifier":
+                      {"profile_url": "https://linkedin.com/in/ada"}}},
+    }
+
+    def test_every_provider_shape_is_readable(self):
+        for name, row in self.SHAPES.items():
+            self.assertIsNotNone(main._profile_url(row), f"{name} is invisible")
+            self.assertIsNotNone(main._profile_lead_key(row), f"{name} has no key")
+
+    def test_one_person_spelled_eight_ways_is_one_person(self):
+        # Hashing the raw URL made each spelling a different person, so the
+        # same lead arriving from a second provider read as new.
+        keys = {name: main._profile_lead_key(row) for name, row in self.SHAPES.items()}
+        self.assertEqual(len(set(keys.values())), 1, keys)
+
+    def test_a_generic_url_that_is_not_a_profile_is_not_an_identity(self):
+        # `url` is Fiber's key for a person, but it is too generic to trust on
+        # another provider's row. Treating a company as a person would suppress
+        # everyone who works there.
+        self.assertIsNone(main._profile_lead_key({"url": "https://acme.com"}))
+        self.assertIsNone(
+            main._profile_lead_key({"url": "https://linkedin.com/company/acme"}))
+
+    def test_a_named_person_key_is_taken_as_given(self):
+        # The key name already asserts whose profile it is, so an unusual
+        # spelling must not make the person untrackable all over again.
+        self.assertIsNotNone(
+            main._profile_lead_key({"linkedin_url": "linkedin.com/in/ada"}))
+
+    def test_a_crustdata_person_id_still_wins(self):
+        key = main._profile_lead_key(
+            {"crustdata_person_id": 42, "linkedin_url": "https://linkedin.com/in/ada"})
+        self.assertEqual(key, "id:42")
+
+    def test_matching_still_finds_rows_written_the_old_way(self):
+        # Normalising the key changes it. Without this the whole ledger would
+        # read as empty on deploy and replay everyone once more.
+        row = {"linkedin_url": "https://www.linkedin.com/in/ada/"}
+        legacy = f"url:{hashlib.sha256(row['linkedin_url'].encode()).hexdigest()}"
+
+        self.assertIn(legacy, main._profile_seen_keys(row))
+        self.assertIn(main._profile_lead_key(row), main._profile_seen_keys(row))
+
+    def test_a_legacy_row_still_suppresses_the_person(self):
+        row = {"linkedin_url": "https://www.linkedin.com/in/ada/"}
+        legacy = f"url:{hashlib.sha256(row['linkedin_url'].encode()).hexdigest()}"
+        suppressed: list = []
+
+        kept = main.drop_already_seen([row], {legacy}, suppressed)
+
+        self.assertEqual(kept, [])
+        self.assertEqual(suppressed, [1])
+
+    def test_only_the_new_form_is_ever_written(self):
+        # So the legacy spelling ages out of the ledger window on its own.
+        row = {"linkedin_url": "https://www.linkedin.com/in/ada/"}
+        self.assertEqual(main._profile_lead_key(row),
+                         main._profile_lead_key({"primary_slug": "ada"}))
+
+    def test_someone_with_no_profile_at_all_has_no_key(self):
+        self.assertIsNone(main._profile_lead_key({"first_name": "Ada"}))
+        self.assertEqual(main._profile_seen_keys({"first_name": "Ada"}), set())
 
 
 if __name__ == "__main__":
