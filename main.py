@@ -5264,28 +5264,89 @@ def aggregate_companies_crustdata(profiles: list) -> list:
 # Cache helper (generic, cache-first for any endpoint)
 # =============================================================================
 
+# A person's own LinkedIn profile, as opposed to a company page or any other
+# link a provider might put under a generic key.
+_LINKEDIN_PROFILE_RE = re.compile(r"linkedin\.com/(?:in|pub)/", re.I)
+
+# Keys whose *name* already asserts the value is this person's profile. Taken
+# as given: the provider has said what it is.
+_PERSON_URL_KEYS = ("linkedin_url", "linkedinUrl", "person_linkedin_url",
+                    "contact_linkedin_url", "linkedin")
+
+
 def _profile_url(profile: dict) -> Optional[str]:
     """The LinkedIn URL on a raw provider record, whichever shape it arrives in.
 
-    Crustdata nests it; ColdIQ puts it flat on the record. Reading only the
-    nested path meant every ColdIQ result was untrackable, so campaign history
-    never recorded one and the same people came back on every search.
+    This is the identity the seen ledger is built on, so a provider whose shape
+    is missing here is *invisible to it* — its people are never recorded and
+    never filtered, and they come back on every single search forever. That is
+    not a degraded ledger; for that provider there is no ledger at all.
+
+    Crustdata nests it. ColdIQ puts it flat. Wiza calls it `linkedin`. Fiber
+    calls it `url` and also offers a slug. Production ran with Fiber and Wiza
+    both unreadable: the ledger sat at 26 people while Fiber returned ten
+    leads across two searches and recorded none of them, which is exactly the
+    "leads I've seen several times already" report.
     """
     nested = (((profile.get("social_handles") or {})
                .get("professional_network_identifier") or {}).get("profile_url"))
-    return (nested or profile.get("linkedin_url") or profile.get("linkedinUrl")
-            or profile.get("person_linkedin_url")
-            or profile.get("contact_linkedin_url"))
+    if nested:
+        return nested
+
+    for key in _PERSON_URL_KEYS:
+        value = profile.get(key)
+        if value:
+            return value
+
+    # Fiber names the person's profile `url`. That key is too generic to trust
+    # on its own — on another provider's row it could be a company site, and
+    # treating a company as a person would suppress everyone who works there —
+    # so it counts only when it is plainly a LinkedIn profile.
+    url = profile.get("url")
+    if url and _LINKEDIN_PROFILE_RE.search(str(url)):
+        return url
+
+    slug = profile.get("primary_slug")
+    if slug:
+        return f"https://www.linkedin.com/in/{slug}"
+    return None
 
 
 def _profile_lead_key(profile: dict) -> Optional[str]:
+    """The ledger key for one person: what gets written when they are shown.
+
+    Hashed from the *normalised* profile, not the raw URL. Providers spell the
+    same profile differently — http against https, with or without www or a
+    trailing slash — and hashing the raw string made each spelling a different
+    person, so the same lead arriving from a second provider read as new.
+    linkedin_identity already settles that question everywhere else.
+    """
     person_id = profile.get("crustdata_person_id")
     if person_id is not None:
         return f"id:{person_id}"
     profile_url = _profile_url(profile)
+    if not profile_url:
+        return None
+    return f"url:{hashlib.sha256((linkedin_identity(profile_url) or profile_url).encode()).hexdigest()}"
+
+
+def _profile_seen_keys(profile: dict) -> set[str]:
+    """Every key this person could already be filed under.
+
+    Normalising the key changes it, which would silently orphan every row
+    written before — the ledger would read as empty and replay everyone once
+    more. Matching accepts the old raw-URL spelling too, so existing rows keep
+    working; only the new form is ever written, so the old one ages out of the
+    ledger window on its own.
+    """
+    keys = set()
+    key = _profile_lead_key(profile)
+    if key:
+        keys.add(key)
+    profile_url = _profile_url(profile)
     if profile_url:
-        return f"url:{hashlib.sha256(profile_url.encode()).hexdigest()}"
-    return None
+        keys.add(f"url:{hashlib.sha256(profile_url.encode()).hexdigest()}")
+    return keys
 
 
 def dedupe_crustdata_profiles(profiles: list[dict]) -> list[dict]:
@@ -5339,7 +5400,7 @@ def drop_already_seen(rows: list, seen_keys: set, suppressed: list) -> list:
     # identity, so it cannot be someone already shown — and a single None in
     # the seen set would otherwise suppress every untrackable person at once.
     kept = [row for row in rows
-            if (key := _profile_lead_key(row)) is None or key not in seen_keys]
+            if not (keys := _profile_seen_keys(row)) or not (keys & seen_keys)]
     suppressed.append(len(rows) - len(kept))
     return kept
 
@@ -6563,7 +6624,7 @@ async def walk_search(request: SearchRequest):
         # where the ledger came back empty because it could not be scoped —
         # which is precisely when a page of already-shown people was being
         # replayed as if it were new.
-        stale = [r for r in data if _profile_lead_key(r) in campaign_keys]
+        stale = [r for r in data if _profile_seen_keys(r) & campaign_keys]
         built_for = (cached_payload.get("built_for")
                      if isinstance(cached_payload, dict) else None)
         same_asker = bool(seen_scope) and built_for == seen_scope
