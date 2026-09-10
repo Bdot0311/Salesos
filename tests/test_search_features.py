@@ -3800,23 +3800,130 @@ class SeenLedgerScopeTests(unittest.IsolatedAsyncioTestCase):
         scope = main.search_seen_scope(main.SearchRequest(campaign_id="camp-1"))
         self.assertEqual(scope, "camp-1")
 
-    def test_everything_else_is_scoped_to_the_customer(self):
-        token = main._treg_request_context.set({"customer_id": "acme"})
+    @staticmethod
+    def scope_with(**ctx):
+        token = main._treg_request_context.set(ctx)
         try:
-            scope = main.search_seen_scope(main.SearchRequest(job_title="Founder"))
+            return main.search_seen_scope(main.SearchRequest(job_title="Founder"))
         finally:
             main._treg_request_context.reset(token)
 
-        self.assertEqual(scope, "customer:acme")
+    def test_everything_else_is_scoped_to_the_customer(self):
+        self.assertEqual(
+            self.scope_with(customer_id="acme", customer_source="header"),
+            "customer:acme")
+
+    def test_a_jwt_subject_identifies_a_person_too(self):
+        self.assertEqual(
+            self.scope_with(customer_id="auth_abc", customer_source="jwt"),
+            "customer:auth_abc")
 
     def test_no_identity_means_no_ledger_and_no_change(self):
-        token = main._treg_request_context.set({"customer_id": None})
+        self.assertIsNone(self.scope_with(customer_id=None))
+
+    def test_a_client_fingerprint_is_not_a_person(self):
+        # The caller is the edge function, not the browser: its egress address
+        # is shared by every user at once and changes when a worker recycles.
+        # A ledger keyed on it hides one user's leads from another and empties
+        # itself mid-session — and an empty ledger makes a cached page of
+        # already-shown people look fresh.
+        self.assertIsNone(
+            self.scope_with(customer_id="anon_9f2c", customer_source="fingerprint"))
+
+    def test_one_shared_default_customer_is_not_a_person(self):
+        # Every user would share one ledger, so the first person to be shown a
+        # lead would hide it from everybody else.
+        self.assertIsNone(
+            self.scope_with(customer_id="house", customer_source="default"))
+
+    def test_a_campaign_still_names_its_ledger_without_any_identity(self):
+        token = main._treg_request_context.set({"customer_id": "anon_9f2c",
+                                                "customer_source": "fingerprint"})
         try:
-            scope = main.search_seen_scope(main.SearchRequest(job_title="Founder"))
+            scope = main.search_seen_scope(main.SearchRequest(campaign_id="camp-1"))
         finally:
             main._treg_request_context.reset(token)
 
-        self.assertIsNone(scope)
+        self.assertEqual(scope, "camp-1")
+
+
+class CustomerIdentitySourceTests(unittest.TestCase):
+    """Who is asking, and how sure are we — the ledger needs both."""
+
+    @staticmethod
+    def request_with(headers: dict, client_host: str = "10.0.0.1"):
+        class Client:
+            host = client_host
+
+        class Req:
+            def __init__(self):
+                self.headers = headers
+                self.client = Client()
+
+        return Req()
+
+    def test_an_explicit_tenant_header_is_a_person(self):
+        self.assertEqual(
+            main.treg_customer_identity(self.request_with({"X-Customer-ID": "user-7"})),
+            ("user-7", "header"))
+
+    def test_a_jwt_subject_is_a_person(self):
+        claims = base64.urlsafe_b64encode(json.dumps({"sub": "user-7"}).encode()).decode()
+        token = f"aaa.{claims.rstrip('=')}.bbb"
+        value, source = main.treg_customer_identity(
+            self.request_with({"Authorization": f"Bearer {token}"}))
+        self.assertEqual(source, "jwt")
+        self.assertTrue(value.startswith("auth_"))
+
+    def test_a_static_api_key_is_not_a_jwt_and_falls_through(self):
+        # This is what the edge function actually sends. It is not three
+        # dot-separated segments, so there is no subject to read — and it is
+        # the same string for every user, so it could not identify one anyway.
+        _, source = main.treg_customer_identity(
+            self.request_with({"Authorization": "Bearer sk_live_static_key"}))
+        self.assertEqual(source, "fingerprint")
+
+    def test_the_fingerprint_says_so(self):
+        value, source = main.treg_customer_identity(
+            self.request_with({"X-Forwarded-For": "203.0.113.9", "User-Agent": "Deno"}))
+        self.assertEqual(source, "fingerprint")
+        self.assertTrue(value.startswith("anon_"))
+
+    def test_two_users_behind_one_egress_address_get_the_same_fingerprint(self):
+        # The reason it must never scope the ledger.
+        headers = {"X-Forwarded-For": "203.0.113.9", "User-Agent": "Deno"}
+        first, _ = main.treg_customer_identity(self.request_with(dict(headers)))
+        second, _ = main.treg_customer_identity(self.request_with(dict(headers)))
+        self.assertEqual(first, second)
+
+    def test_the_fingerprint_changes_when_the_egress_address_moves(self):
+        # The reason a ledger keyed on it empties itself mid-session.
+        first, _ = main.treg_customer_identity(
+            self.request_with({"X-Forwarded-For": "203.0.113.9", "User-Agent": "Deno"}))
+        second, _ = main.treg_customer_identity(
+            self.request_with({"X-Forwarded-For": "198.51.100.4", "User-Agent": "Deno"}))
+        self.assertNotEqual(first, second)
+
+    def test_a_supabase_user_uuid_survives_header_validation(self):
+        # The id the edge functions now send. treg_request_context() raises a
+        # 400 on a value it will not accept, so a UUID that failed this would
+        # take down every search rather than merely losing the ledger.
+        uuid = "f47ac10b-58cc-4372-a567-0e02b2c3d479"
+        token = main._treg_request_context.set(
+            {"customer_id": uuid, "customer_source": "header"})
+        try:
+            self.assertEqual(main.treg_request_context()["customer_id"], uuid)
+            self.assertEqual(
+                main.search_seen_scope(main.SearchRequest(job_title="Founder")),
+                f"customer:{uuid}")
+        finally:
+            main._treg_request_context.reset(token)
+
+    def test_the_id_only_helper_still_answers_for_billing(self):
+        self.assertEqual(
+            main.treg_customer_id_from_request(
+                self.request_with({"X-Customer-ID": "user-7"})),
+            "user-7")
 
     async def test_the_ledger_is_read_newest_first_and_bounded(self):
         # The exclusions go into provider request bodies; an unbounded list
@@ -4395,6 +4502,125 @@ class ProviderShapeProbeTests(unittest.IsolatedAsyncioTestCase):
     async def test_an_unconfigured_provider_is_skipped(self):
         report = await self.run_shapes(configured=())
         self.assertEqual(report["providers"], {})
+
+
+class CacheReplayTests(unittest.IsolatedAsyncioTestCase):
+    """A cached page is the people already shown. Serving it back is the bug.
+
+    Production ran the same search twice a minute apart. The first walked the
+    chain; the second took a cache hit and returned the identical six people,
+    because the seen ledger could not be scoped and so came back empty — and an
+    empty ledger makes a cached page look fresh.
+
+    `built_for` closes that without needing the ledger at all: the page records
+    who was shown it, and the same searcher asking again gets a real walk.
+    """
+
+    async def run_search(self, *, ctx: dict, stored: dict, walks: list):
+        async def bytemine(params, limit, **kwargs):
+            walks.append("bytemine")
+            n = len(walks)
+            return {"profiles": [{"pid": str(n), "first_name": f"Ada{n}"}],
+                    "total": 1, "next_cursor": None}
+
+        class Row:
+            def __init__(self, payload):
+                self.results = json.dumps(payload)
+
+        async def lookup(h):
+            return stored.get(h)
+
+        async def store(h, params, payload):
+            stored[h] = Row(payload)
+
+        async def no_ledger(scope, limit=None):
+            # The database is there but holds nothing for this scope — the
+            # exact state the churning identity produced in production.
+            return set(), []
+
+        async def record(scope, profiles):
+            return profiles
+
+        patches = [
+            patch.object(main.settings, "bytemine_api_key", "b"),
+            patch.object(main.settings, "search_provider", "bytemine"),
+            patch.object(main, "provider_chain", lambda: ("bytemine",)),
+            patch.object(main, "bytemine_person_search", bytemine),
+            patch.object(main, "cache_lookup", lookup),
+            patch.object(main, "cache_store", store),
+            patch.object(main, "campaign_seen", no_ledger),
+            patch.object(main, "record_new_campaign_profiles", record),
+        ]
+        for p in patches:
+            p.start()
+        token = main._treg_request_context.set(ctx)
+        try:
+            return await main.walk_search(main.SearchRequest(job_title="Founder"))
+        finally:
+            main._treg_request_context.reset(token)
+            for p in patches:
+                p.stop()
+
+    async def test_the_same_searcher_asking_again_gets_a_real_walk(self):
+        stored, walks = {}, []
+        ctx = {"customer_id": "user-7", "customer_source": "header"}
+
+        first = await self.run_search(ctx=ctx, stored=stored, walks=walks)
+        second = await self.run_search(ctx=ctx, stored=stored, walks=walks)
+
+        self.assertEqual(walks, ["bytemine", "bytemine"])
+        self.assertFalse(second.from_cache)
+        self.assertNotEqual(first.data[0]["pid"], second.data[0]["pid"])
+
+    async def test_a_different_searcher_is_still_served_the_cache(self):
+        # The saving is real and worth keeping: two people asking the same
+        # question should not both be billed for it.
+        stored, walks = {}, []
+
+        await self.run_search(
+            ctx={"customer_id": "user-7", "customer_source": "header"},
+            stored=stored, walks=walks)
+        second = await self.run_search(
+            ctx={"customer_id": "user-9", "customer_source": "header"},
+            stored=stored, walks=walks)
+
+        self.assertEqual(walks, ["bytemine"])
+        self.assertTrue(second.from_cache)
+
+    async def test_a_page_written_before_built_for_existed_is_still_served(self):
+        stored, walks = {}, []
+
+        class Row:
+            def __init__(self, payload):
+                self.results = json.dumps(payload)
+
+        ctx = {"customer_id": "user-7", "customer_source": "header"}
+        await self.run_search(ctx=ctx, stored=stored, walks=walks)
+
+        # Rewrite what was stored as a row from before `built_for` existed.
+        (search_hash, row), = stored.items()
+        legacy = json.loads(row.results)
+        legacy.pop("built_for")
+        stored[search_hash] = Row(legacy)
+
+        result = await self.run_search(ctx=ctx, stored=stored, walks=walks)
+
+        # No second walk, and no crash on the missing key.
+        self.assertEqual(walks, ["bytemine"])
+        self.assertTrue(result.from_cache)
+
+    async def test_an_unidentified_caller_is_no_worse_off_than_before(self):
+        # Without a per-user identity there is nothing to compare against, so
+        # the cache still serves. This is the state the header fixes; the point
+        # of the test is that it degrades rather than breaking.
+        stored, walks = {}, []
+        ctx = {"customer_id": "anon_9f2c", "customer_source": "fingerprint"}
+
+        await self.run_search(ctx=ctx, stored=stored, walks=walks)
+        second = await self.run_search(ctx=ctx, stored=stored, walks=walks)
+
+        self.assertEqual(walks, ["bytemine"])
+        self.assertTrue(second.from_cache)
 
 
 if __name__ == "__main__":
