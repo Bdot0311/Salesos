@@ -116,6 +116,35 @@ settings = Settings()
 # budget, with room for the legs that run before it.
 WIZA_REVEAL_BUDGET_SECONDS = 35.0
 
+# How long a whole /search may spend walking the chain before the legs it has
+# not reached yet are skipped.
+#
+# A waterfall runs its legs one after another, so one slow leg is not a slow
+# leg — it is a slow search, and every provider behind it pays for it. GetLeads
+# gives up at 50 seconds and answers 502 at about 60, and the retry its own
+# error message asks for costs another 60. Production spent 123 seconds on
+# those two attempts before Fiber — which answered in under a second — was
+# asked anything at all.
+#
+# The ceiling that matters is not ours. The platform gateway abandons a request
+# somewhere past two minutes and returns an opaque 504 with no body, so the
+# user loses the whole page including the legs that had already answered. A
+# short page now beats a 504 later.
+SEARCH_BUDGET_SECONDS = 75.0
+
+# What GetLeads costs when it gives up: it times out its own search at 50
+# seconds and answers at about 60. Used to decide whether a retry can finish.
+GETLEADS_TIMEOUT_SECONDS = 60.0
+
+# What is left of that budget, for code deep in a leg that cannot see the walk.
+_search_deadline = contextvars.ContextVar("search_deadline", default=None)
+
+
+def search_seconds_left() -> Optional[float]:
+    """Seconds until this search must stop, or None when it is not budgeted."""
+    deadline = _search_deadline.get()
+    return None if deadline is None else deadline - time.monotonic()
+
 WIZA_BASE = "https://wiza.co/api"
 CRUSTDATA_BASE = "https://api.crustdata.com"
 CRUSTDATA_VERSION = "2025-11-01"
@@ -1011,12 +1040,12 @@ def build_wiza_filters(p: dict) -> dict:
     # by the sentence; it searches the filters, which is a real contribution.
 
     # Seniority — only add if we have a known Wiza level, and only when the job
-    # title does not already imply it (see seniority_implied_by_title). Wiza's
+    # title does not already imply it (see title_supersedes_seniority). Wiza's
     # taxonomy happens to agree with ours on Founder/Owner where Bytemine's and
     # Crustdata's do not, so this leg was not the one losing people — but the
     # filter is redundant here too, and a redundant AND against someone else's
     # taxonomy is exactly the shape of that bug.
-    if p.get("seniority") and not seniority_implied_by_title(
+    if p.get("seniority") and not title_supersedes_seniority(
             p.get("job_title"), p["seniority"]):
         level = SENIORITY_MAP.get(p["seniority"].lower())
         if level:
@@ -2371,32 +2400,45 @@ def _canonical_seniority(value: str) -> str:
     return _CANONICAL_SENIORITY.get(key, key)
 
 
-def seniority_implied_by_title(job_title: str, seniority: str) -> bool:
-    """True when the job title already says what the seniority filter says.
+def title_supersedes_seniority(job_title: str, seniority: str) -> bool:
+    """True when the job title already speaks to level, so don't also filter on it.
 
-    One word in the request produces both. "AI SaaS founders" runs through
-    _SENIORITY_RULES to seniority="founder" and through _TITLE_PHRASES to
-    job_title="Founder" — the user stated one criterion and we send two, ANDed.
+    Two cases, one answer.
 
-    That costs nothing only if the provider agrees with us about which
-    seniority band a "Founder" sits in. Bytemine and Crustdata do not: both
+    **The title agrees.** One word in the request produced both: "AI SaaS
+    founders" runs through _SENIORITY_RULES to seniority="founder" and through
+    _TITLE_PHRASES to job_title="Founder". The user stated one criterion and we
+    send two, ANDed. That costs nothing only if the provider agrees with us
+    about which band a "Founder" sits in. Bytemine and Crustdata do not: both
     returned zero for every `title ~ "Founder" AND seniority = Owner` search in
     production, while Wiza — whose taxonomy happens to agree — returned real
-    people for the identical query. The provider was not out of data; the second
-    filter removed everyone the first one found.
+    people for the identical query. The provider was not out of data; the
+    second filter removed everyone the first one found.
 
-    Dropping the implied one cannot widen the search past what was asked for:
-    the title filter still carries the same word. It only stops us asserting a
-    taxonomy the provider does not share.
+    **The title disagrees.** From production: an ICP of "Founders, Heads of
+    Sales, or VPs of Sales" fans out to one search per title, and every one of
+    them carries the seniority the parser read off the word *Founders*:
+
+        job_title="VP of Sales", seniority="owner"
+
+    Nobody asked for a VP of Sales who is also an owner. The seniority is a
+    leftover from a sibling search. ANDing it either returns nobody or returns
+    whoever the provider's taxonomy happens to put in both buckets, which is
+    the "leads nothing like what I searched for" report.
+
+    Both cases resolve the same way: the title is the more specific statement
+    and the one the user actually typed, so it wins. This cannot widen the
+    search past what was asked — the title filter still carries the level word
+    — it only stops us asserting a second, weaker claim on top of it.
+
+    A title with no level in it (an "Account Executive", an "Engineer") states
+    nothing to supersede, so a seniority sent with one is a real criterion and
+    is kept.
     """
     if not job_title or not seniority:
         return False
     title = str(job_title).strip().lower()
-    stated = _canonical_seniority(str(seniority))
-    for pattern, key in _SENIORITY_RULES:
-        if re.search(pattern, title):
-            return _canonical_seniority(key) == stated
-    return False
+    return any(re.search(pattern, title) for pattern, _ in _SENIORITY_RULES)
 
 
 def bytemine_employee_band(size: str):
@@ -2492,7 +2534,7 @@ def build_getleads_filters(p: dict) -> dict:
 
     if p.get("job_title"):
         f["job_titles"] = [p["job_title"]]
-    if p.get("seniority") and not seniority_implied_by_title(
+    if p.get("seniority") and not title_supersedes_seniority(
             p.get("job_title"), p["seniority"]):
         mapped = _GL_SENIORITY.get(str(p["seniority"]).strip().lower())
         if mapped:
@@ -2856,6 +2898,15 @@ async def getleads_person_search(params: dict, limit: int, offset: int = 0) -> d
         # free. max_per_company is ours rather than the user's — dropping it can
         # let one company fill the page, which is a worse page than no page.
         if not _getleads_timed_out(failure) or "max_per_company" not in body:
+            raise
+        # The first attempt already spent ~60 seconds. A second one that cannot
+        # finish inside the search's remaining budget does not buy a page — it
+        # spends the time the legs behind this one need, and they are the ones
+        # that will actually answer.
+        left = search_seconds_left()
+        if left is not None and left < GETLEADS_TIMEOUT_SECONDS:
+            print(f"GetLeads timed out with {int(left)}s of the search budget left — "
+                  "not retrying, the rest of the chain needs that time")
             raise
         print("GetLeads timed out — retrying once without max_per_company, "
               "which is the narrowing its own error suggests")
@@ -3405,7 +3456,7 @@ def build_fiber_people_params(p: dict) -> dict:
     # every executive, which is worse than the drop it replaces.
     title = {"type": "plain", "term": p["job_title"]} if p.get("job_title") else None
     level = None
-    if p.get("seniority") and not seniority_implied_by_title(
+    if p.get("seniority") and not title_supersedes_seniority(
             p.get("job_title"), p["seniority"]):
         level = fiber_seniority(p["seniority"])
         if not level:
@@ -3729,7 +3780,7 @@ def build_coldiq_filters(p: dict) -> dict:
     if p.get("keywords"):
         body["keywords"] = [p["keywords"]]
 
-    if p.get("seniority") and not seniority_implied_by_title(
+    if p.get("seniority") and not title_supersedes_seniority(
             p.get("job_title"), p["seniority"]):
         mapped = _CIQ_SENIORITY.get(str(p["seniority"]).strip().lower())
         if mapped:
@@ -4110,17 +4161,35 @@ async def coldiq_reveal(request: "EnrichRequest") -> dict:
 #
 # Latched rather than permanent: a top-up should bring the provider back without
 # a deploy, so the latch simply expires and the next call finds out.
+#
+# It backs off, because "expires and finds out" costs a real user's request the
+# 1-3 seconds of a doomed round trip, and an account that has been empty since
+# yesterday will be empty in fifteen minutes too. Production has re-asked the
+# same balance of 0.1102 four times an hour, all day. Each consecutive 402
+# doubles the wait; any answer that is not a 402 resets it, so a top-up is
+# noticed within the hour without a deploy and without the provider being
+# probed on the user's time all day.
 COLDIQ_EXHAUSTED_SECONDS = 900.0
+COLDIQ_EXHAUSTED_MAX_SECONDS = 3600.0
 _coldiq_exhausted_until = 0.0
+_coldiq_exhausted_streak = 0
 
 
 def coldiq_note_status(status: int) -> None:
     """Record a 402 so the next few calls can skip the round trip."""
-    global _coldiq_exhausted_until
-    if status == 402:
-        _coldiq_exhausted_until = time.monotonic() + COLDIQ_EXHAUSTED_SECONDS
-        print("ColdIQ is out of credits — skipping it for "
-              f"{int(COLDIQ_EXHAUSTED_SECONDS // 60)} minutes")
+    global _coldiq_exhausted_until, _coldiq_exhausted_streak
+    if status != 402:
+        # Any real answer means there is something to spend again.
+        _coldiq_exhausted_streak = 0
+        return
+
+    _coldiq_exhausted_streak += 1
+    wait = min(COLDIQ_EXHAUSTED_SECONDS * (2 ** (_coldiq_exhausted_streak - 1)),
+               COLDIQ_EXHAUSTED_MAX_SECONDS)
+    _coldiq_exhausted_until = time.monotonic() + wait
+    print(f"ColdIQ is out of credits — skipping it for {int(wait // 60)} minutes"
+          + (f" (empty for {_coldiq_exhausted_streak} checks running)"
+             if _coldiq_exhausted_streak > 1 else ""))
 
 
 def coldiq_out_of_credits() -> bool:
@@ -4396,8 +4465,8 @@ def build_bytemine_filters(p: dict) -> dict:
     if p.get("job_title"):
         body["jobTitles"] = [p["job_title"]]
     # Skipped when the job title already implies it — see
-    # seniority_implied_by_title for why the redundant AND zeroed the search.
-    if p.get("seniority") and not seniority_implied_by_title(
+    # title_supersedes_seniority for why the redundant AND zeroed the search.
+    if p.get("seniority") and not title_supersedes_seniority(
             p.get("job_title"), p["seniority"]):
         mapped = _BM_SENIORITY.get(str(p["seniority"]).strip().lower())
         if mapped:
@@ -4877,10 +4946,10 @@ def build_crustdata_filters(p: dict):
     if p.get("job_title"):
         conds.append({"field": _CD_TITLE, "type": "(.)", "value": p["job_title"]})
 
-    # See seniority_implied_by_title: Crustdata's `=` on seniority_level is an
+    # See title_supersedes_seniority: Crustdata's `=` on seniority_level is an
     # exact match against its own taxonomy, so a title-implied seniority ANDs
     # away every person the title matched.
-    if p.get("seniority") and not seniority_implied_by_title(
+    if p.get("seniority") and not title_supersedes_seniority(
             p.get("job_title"), p["seniority"]):
         raw_seniority = p["seniority"].strip()
         seniority = _CD_SENIORITY_MAP.get(raw_seniority.lower(), raw_seniority)
@@ -6339,6 +6408,10 @@ async def walk_search(request: SearchRequest):
     2. Cache miss → Wiza 3-step: create list → poll → fetch contacts
     3. Cache and return results
     """
+    # The clock starts before any provider is called, because the budget is the
+    # user's wait rather than any one leg's.
+    _search_deadline.set(time.monotonic() + SEARCH_BUDGET_SECONDS)
+
     params = await resolve_search_params(request)
     chain = provider_chain()
     if not chain:
@@ -6741,6 +6814,18 @@ async def walk_search(request: SearchRequest):
     collected = 0
 
     for position, name in enumerate(chain):
+        # A leg that has not started yet is the cheapest thing to give up. The
+        # gateway will abandon the whole request shortly after this, taking the
+        # legs that already answered with it, so a short page returned now is
+        # strictly better than a 504 in a moment.
+        left = search_seconds_left()
+        if left is not None and left <= 0 and ran:
+            skipped = ", ".join(chain[position:])
+            print(f"Search budget of {int(SEARCH_BUDGET_SECONDS)}s spent — "
+                  f"returning {collected} lead(s) rather than a gateway timeout "
+                  f"(not asked: {skipped})")
+            break
+
         try:
             outcome = await run_provider(name, wanted - collected)
         except ProviderUnsupported as outcome:
