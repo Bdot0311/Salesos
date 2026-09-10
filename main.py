@@ -1536,6 +1536,11 @@ class SearchResponse(BaseModel):
     # the data changed between two identical-looking searches.
     provider: Optional[str] = None
     provider_attempts: Optional[list] = None
+    # How many people the providers returned and this searcher had already been
+    # shown. An empty page with a number here is a spent pool, not a bad query
+    # — the two look identical to someone staring at a blank result and call
+    # for opposite responses.
+    suppressed_as_seen: int = 0
 
 
 # =============================================================================
@@ -5321,6 +5326,24 @@ async def campaign_seen(campaign_id: str,
         return set(), []
 
 
+def drop_already_seen(rows: list, seen_keys: set, suppressed: list) -> list:
+    """Remove people this searcher has already been shown, and count them.
+
+    The count is what lets an empty page say *why* it is empty. "Nothing
+    matched your filters" and "you have already been shown everyone this
+    search can find" look identical to a user staring at a blank result, and
+    they call for opposite responses: change the query, or accept the pool is
+    spent. Without this the product could only offer the blank.
+    """
+    # A row with neither a stable id nor a profile URL keys to None. It has no
+    # identity, so it cannot be someone already shown — and a single None in
+    # the seen set would otherwise suppress every untrackable person at once.
+    kept = [row for row in rows
+            if (key := _profile_lead_key(row)) is None or key not in seen_keys]
+    suppressed.append(len(rows) - len(kept))
+    return kept
+
+
 def search_seen_scope(request: SearchRequest) -> Optional[str]:
     """The ledger this search reads and writes so nobody is shown twice.
 
@@ -6490,6 +6513,11 @@ async def walk_search(request: SearchRequest):
         (request.exclude_profiles or []) + campaign_exclusions
     ))
 
+    # How many people every leg dropped because this searcher had already been
+    # shown them. A list rather than an int so the legs can append without
+    # rebinding a name they do not own.
+    suppressed: list[int] = []
+
     # Campaign membership changes after every response, so campaign searches
     # must never reuse a shared cached page. Explicit refresh also bypasses it.
     use_cache = not request.refresh and not request.campaign_id
@@ -6578,7 +6606,22 @@ async def walk_search(request: SearchRequest):
             result = await bytemine_person_search(
                 params, max(min(params.get("limit", 10), 100), 1),
                 cursor=provider_cursor, offset=request.start_offset)
-            return result["profiles"], result["total"], result.get("next_cursor")
+            # This leg used to return its rows untouched: no already-seen
+            # filter and no record of who it had shown. It is first in the
+            # chain, so on every search it can express it was the one leg with
+            # no repeat protection at all — and the one leg whose people were
+            # never written to the ledger, so the legs behind it could not
+            # filter them either.
+            found = result["profiles"]
+            if exclusions:
+                seen = {i for i in (linkedin_identity(u) for u in exclusions) if i}
+                found = [r for r in found
+                         if linkedin_identity(_profile_url(r)) not in seen]
+            if campaign_keys:
+                found = drop_already_seen(found, campaign_keys, suppressed)
+            if seen_scope:
+                found = await record_new_campaign_profiles(seen_scope, found)
+            return found, result["total"], result.get("next_cursor")
 
         if name == "crustdata":
             # The title-only guard belongs to Crustdata's filter model, so it is
@@ -6614,7 +6657,7 @@ async def walk_search(request: SearchRequest):
             # Provider exclusions require profile URLs; this catches previously
             # seen stable IDs even when a profile has no URL.
             if campaign_keys:
-                found = [p for p in found if _profile_lead_key(p) not in campaign_keys]
+                found = drop_already_seen(found, campaign_keys, suppressed)
             if seen_scope:
                 found = await record_new_campaign_profiles(seen_scope, found)
             return found, result["total"], result.get("next_cursor")
@@ -6653,20 +6696,30 @@ async def walk_search(request: SearchRequest):
                     fresh = [c for c in fresh
                              if linkedin_identity(_profile_url(c)) not in seen]
                 if campaign_keys:
-                    fresh = [c for c in fresh
-                             if _profile_lead_key(c) not in campaign_keys]
+                    fresh = drop_already_seen(fresh, campaign_keys, suppressed)
                 found.extend(fresh)
 
                 next_offset = data.get("next_offset")
                 if len(found) >= wanted or not page or next_offset is None:
                     break
-                print(f"GetLeads: {len(page)} row(s) at offset {offset} already "
-                      f"seen — paging to {next_offset} for new people")
+                # Say what was actually filtered, not how big the page was.
+                # This line used to print len(page) and call it "already seen",
+                # so a page where one row of six was a repeat read the same as a
+                # page where all six were — and a search with an empty ledger
+                # still reported six people already shown, which is nonsense
+                # that cost real time to see past.
+                print(f"GetLeads: {len(page) - len(fresh)} of {len(page)} row(s) "
+                      f"at offset {offset} already seen, {len(found)}/{wanted} "
+                      f"collected — paging to {next_offset}")
                 offset = next_offset
 
+            exhausted = not found
             found = found[:wanted]
             if seen_scope:
                 found = await record_new_campaign_profiles(seen_scope, found)
+            if exhausted:
+                print(f"GetLeads has no one left for this search that "
+                      f"{seen_scope or 'this searcher'} has not already been shown")
 
             return found, total, None
 
@@ -6689,8 +6742,7 @@ async def walk_search(request: SearchRequest):
                 found = [r for r in found
                          if linkedin_identity(_profile_url(r)) not in seen]
             if campaign_keys:
-                found = [r for r in found
-                         if _profile_lead_key(r) not in campaign_keys]
+                found = drop_already_seen(found, campaign_keys, suppressed)
             if seen_scope:
                 found = await record_new_campaign_profiles(seen_scope, found)
 
@@ -6725,8 +6777,7 @@ async def walk_search(request: SearchRequest):
                 found = [r for r in found
                          if linkedin_identity(_profile_url(r)) not in seen]
             if campaign_keys:
-                found = [r for r in found
-                         if _profile_lead_key(r) not in campaign_keys]
+                found = drop_already_seen(found, campaign_keys, suppressed)
             if seen_scope:
                 found = await record_new_campaign_profiles(seen_scope, found)
             return (found[skip:] if skip else found), data["total"], None
@@ -6761,8 +6812,7 @@ async def walk_search(request: SearchRequest):
                 found = [p for p in found
                          if linkedin_identity(_profile_url(p)) not in seen]
             if campaign_keys:
-                found = [p for p in found
-                         if _profile_lead_key(p) not in campaign_keys]
+                found = drop_already_seen(found, campaign_keys, suppressed)
             if seen_scope:
                 found = await record_new_campaign_profiles(seen_scope, found)
 
@@ -6915,11 +6965,21 @@ async def walk_search(request: SearchRequest):
     if not request.campaign_id:
         await cache_store(search_hash, cache_params, cache_payload)
 
+    hidden = sum(suppressed)
+    if hidden and not leads:
+        print(f"Every one of the {hidden} person(s) the providers returned had "
+              "already been shown to this searcher — the pool for this search "
+              "is spent, not empty")
+    elif hidden:
+        print(f"{hidden} person(s) already shown were held back; "
+              f"{len(leads)} new one(s) returned")
+
     return SearchResponse(
         success=True, source="api", from_cache=False,
         count=len(leads), total=total, leads=leads, data=raw_results,
         next_cursor=next_cursor, campaign_id=request.campaign_id,
         provider=served_by, provider_attempts=attempts or None,
+        suppressed_as_seen=hidden,
     )
 
 

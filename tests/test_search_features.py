@@ -4822,5 +4822,172 @@ class SearchBudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(walked, ["bytemine", "getleads"])
 
 
+class ExhaustedPoolTests(unittest.IsolatedAsyncioTestCase):
+    """An empty page has two very different causes, and they looked identical.
+
+    "Nothing matched your filters" and "you have already been shown everyone
+    this search can find" both render as a blank result, and they call for
+    opposite responses — change the query, or accept the pool is spent. The
+    second is what a user sees after a few repeat searches on a narrow ICP,
+    and the product had no way to say so.
+    """
+
+    @staticmethod
+    def person(n: str) -> dict:
+        return {"linkedin_url": f"https://linkedin.com/in/{n}", "name": n}
+
+    def test_the_filter_counts_what_it_removes(self):
+        suppressed: list = []
+        rows = [self.person("a"), self.person("b"), self.person("c")]
+        keys = {main._profile_lead_key(self.person("a")),
+                main._profile_lead_key(self.person("c"))}
+
+        kept = main.drop_already_seen(rows, keys, suppressed)
+
+        self.assertEqual([r["name"] for r in kept], ["b"])
+        self.assertEqual(suppressed, [2])
+
+    def test_it_counts_nothing_when_nothing_was_seen(self):
+        suppressed: list = []
+        kept = main.drop_already_seen([self.person("a")], {"other"}, suppressed)
+
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(suppressed, [0])
+
+    def test_legs_accumulate_rather_than_overwrite(self):
+        # Each leg appends its own count; the walk sums them.
+        suppressed: list = []
+        keys = {main._profile_lead_key(self.person("a"))}
+        main.drop_already_seen([self.person("a")], keys, suppressed)
+        main.drop_already_seen([self.person("a"), self.person("b")], keys, suppressed)
+
+        self.assertEqual(sum(suppressed), 2)
+
+    def test_a_person_with_no_identity_is_never_already_seen(self):
+        # No stable id and no profile URL means no key. A single None in the
+        # seen set would otherwise suppress every untrackable person at once.
+        suppressed: list = []
+        rows = [{"name": "no id"}, {"name": "also none"}]
+
+        kept = main.drop_already_seen(rows, {None, "url:abc"}, suppressed)
+
+        self.assertEqual(len(kept), 2)
+        self.assertEqual(suppressed, [0])
+
+    async def test_a_spent_pool_reports_how_many_were_held_back(self):
+        shown = [self.person("ada"), self.person("bo")]
+        keys = {main._profile_lead_key(p) for p in shown}
+
+        async def bytemine(params, limit, **kwargs):
+            return {"profiles": shown, "total": 2, "next_cursor": None}
+
+        patches = [
+            patch.object(main.settings, "bytemine_api_key", "b"),
+            patch.object(main, "provider_chain", lambda: ("bytemine",)),
+            patch.object(main, "bytemine_person_search", bytemine),
+            patch.object(main, "cache_lookup", AsyncMock(return_value=None)),
+            patch.object(main, "cache_store", AsyncMock()),
+            patch.object(main, "campaign_seen", AsyncMock(return_value=(keys, []))),
+            patch.object(main, "record_new_campaign_profiles",
+                         AsyncMock(side_effect=lambda scope, rows: rows)),
+        ]
+        token = main._treg_request_context.set(
+            {"customer_id": "user-7", "customer_source": "header"})
+        for p in patches:
+            p.start()
+        try:
+            result = await main.walk_search(
+                main.SearchRequest(job_title="Founder", limit=10))
+        finally:
+            main._treg_request_context.reset(token)
+            for p in patches:
+                p.stop()
+
+        # Blank page, but not a blank answer: both people were held back
+        # because this searcher had already seen them.
+        self.assertEqual(result.count, 0)
+        self.assertEqual(result.suppressed_as_seen, 2)
+
+    async def test_every_leg_filters_and_records_what_it_showed(self):
+        """The Bytemine leg did neither, and it is first in the chain.
+
+        It returned its rows untouched — no already-seen filter, and no write
+        to the ledger. So on every search it could express, it was the one leg
+        with no repeat protection, and the one leg whose people the legs behind
+        it could not filter either, because they were never recorded.
+        """
+        recorded: list = []
+        already_shown = self.person("ada")
+        keys = {main._profile_lead_key(already_shown)}
+
+        async def bytemine(params, limit, **kwargs):
+            return {"profiles": [already_shown, self.person("new")],
+                    "total": 2, "next_cursor": None}
+
+        async def record(scope, rows):
+            recorded.extend(rows)
+            return rows
+
+        patches = [
+            patch.object(main.settings, "bytemine_api_key", "b"),
+            patch.object(main, "provider_chain", lambda: ("bytemine",)),
+            patch.object(main, "bytemine_person_search", bytemine),
+            patch.object(main, "cache_lookup", AsyncMock(return_value=None)),
+            patch.object(main, "cache_store", AsyncMock()),
+            patch.object(main, "campaign_seen", AsyncMock(return_value=(keys, []))),
+            patch.object(main, "record_new_campaign_profiles", record),
+        ]
+        token = main._treg_request_context.set(
+            {"customer_id": "user-7", "customer_source": "header"})
+        for p in patches:
+            p.start()
+        try:
+            result = await main.walk_search(
+                main.SearchRequest(job_title="Founder", limit=10))
+        finally:
+            main._treg_request_context.reset(token)
+            for p in patches:
+                p.stop()
+
+        # The person already shown is held back...
+        self.assertEqual(result.count, 1)
+        self.assertEqual(result.suppressed_as_seen, 1)
+        # ...and the new one is written to the ledger, so the next search --
+        # and every leg behind this one -- knows about them.
+        self.assertEqual([r["name"] for r in recorded], ["new"])
+
+    async def test_a_genuinely_empty_search_suppresses_nothing(self):
+        async def bytemine(params, limit, **kwargs):
+            return {"profiles": [], "total": 0, "next_cursor": None}
+
+        patches = [
+            patch.object(main.settings, "bytemine_api_key", "b"),
+            patch.object(main, "provider_chain", lambda: ("bytemine",)),
+            patch.object(main, "bytemine_person_search", bytemine),
+            patch.object(main, "cache_lookup", AsyncMock(return_value=None)),
+            patch.object(main, "cache_store", AsyncMock()),
+            patch.object(main, "campaign_seen",
+                         AsyncMock(return_value=({"someone-else"}, []))),
+            patch.object(main, "record_new_campaign_profiles",
+                         AsyncMock(side_effect=lambda scope, rows: rows)),
+        ]
+        token = main._treg_request_context.set(
+            {"customer_id": "user-7", "customer_source": "header"})
+        for p in patches:
+            p.start()
+        try:
+            result = await main.walk_search(
+                main.SearchRequest(job_title="Founder", limit=10))
+        finally:
+            main._treg_request_context.reset(token)
+            for p in patches:
+                p.stop()
+
+        # Zero either way, but zero for the other reason — the query matched
+        # nobody rather than the pool being spent.
+        self.assertEqual(result.count, 0)
+        self.assertEqual(result.suppressed_as_seen, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
