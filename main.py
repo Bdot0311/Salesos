@@ -1202,6 +1202,7 @@ def treg_request_context() -> dict:
     return {
         "customer_id": _valid_treg_meta_value(
             "customer_id", ctx.get("customer_id"), required=True),
+        "customer_source": ctx.get("customer_source"),
         "workspace_id": _valid_treg_meta_value(
             "workspace_id", ctx.get("workspace_id")),
         "idempotency_key": ctx.get("idempotency_key"),
@@ -1232,31 +1233,57 @@ def _jwt_subject(authorization: Optional[str]) -> Optional[str]:
     return None
 
 
-def treg_customer_id_from_request(request: Request) -> str:
-    """Resolve the most specific stable billing identity available.
+# Identity sources that name one *person*. Only these can scope the seen
+# ledger. The others are fine for billing attribution, where a coarse or
+# approximate identity still bills someone plausible, and ruinous for the
+# ledger, where being wrong in either direction breaks the product:
+#
+#   "default" is one id shared by every user, so one person's seen list hides
+#   everybody else's leads.
+#
+#   "fingerprint" hashes the caller's address, and the caller is the Supabase
+#   edge function rather than the browser. Its egress address is shared by every
+#   user at once and changes whenever a worker is recycled — so the ledger both
+#   collides between users and silently empties mid-session. An empty ledger
+#   makes a cached page look fresh, and the cached page is by definition the
+#   people already shown. That is the "each search surfaces previous searches"
+#   report, and no amount of fixing the ledger itself could have cured it.
+PER_USER_ID_SOURCES = frozenset({"header", "jwt"})
+
+
+def treg_customer_identity(request: Request) -> tuple[str, str]:
+    """Resolve the most specific stable billing identity, and say where from.
 
     Explicit tenant headers win. Authenticated JWT subjects are next. The final
     fallback is a one-way client fingerprint (never the raw IP or user agent),
     which keeps production searches working and attributable even for the
     current caller that sends no tenant header.
+
+    The source is returned because callers that need a *person* — not merely
+    someone to bill — cannot tell the difference from the id alone.
     """
     explicit = request.headers.get("X-Customer-ID")
     if explicit:
-        return explicit
+        return explicit, "header"
 
     subject = _jwt_subject(request.headers.get("Authorization"))
     if subject:
         digest = hashlib.sha256(subject.encode()).hexdigest()[:24]
-        return f"auth_{digest}"
+        return f"auth_{digest}", "jwt"
 
     if settings.treg_default_customer_id:
-        return settings.treg_default_customer_id
+        return settings.treg_default_customer_id, "default"
 
     forwarded = (request.headers.get("X-Forwarded-For") or "").split(",", 1)[0].strip()
     peer = forwarded or (request.client.host if request.client else "unknown")
     agent = request.headers.get("User-Agent") or "unknown"
     digest = hashlib.sha256(f"{peer}|{agent}".encode()).hexdigest()[:24]
-    return f"anon_{digest}"
+    return f"anon_{digest}", "fingerprint"
+
+
+def treg_customer_id_from_request(request: Request) -> str:
+    """The billing identity alone, for callers that do not care how it was found."""
+    return treg_customer_identity(request)[0]
 
 
 def _treg_meta_header(ctx: dict, feature: str) -> str:
@@ -5234,17 +5261,24 @@ def search_seen_scope(request: SearchRequest) -> Optional[str]:
     so anything shown and skipped was never excluded and came back on the next
     search. The server is the only party that knows what it actually returned.
 
-    The middleware resolves a customer for every request, falling back to a
-    one-way client fingerprint, so this is available even without a tenant
-    header. When it is not, there is no ledger and behaviour is as before.
+    It has to be the *user*, though. A ledger keyed on anything coarser hides
+    one person's leads from the next; keyed on anything that churns it silently
+    empties, and an empty ledger makes a cached page of already-shown people
+    look fresh. Both failures read to the user as "it keeps showing me leads I
+    have already seen", which is why this insists on a per-user identity and
+    takes no ledger at all over a wrong one — see PER_USER_ID_SOURCES.
     """
     if request.campaign_id:
         return request.campaign_id
     try:
-        customer = treg_request_context().get("customer_id")
+        ctx = treg_request_context()
+        customer = ctx.get("customer_id")
+        source = ctx.get("customer_source")
     except Exception:
-        customer = None
-    return f"customer:{customer}" if customer else None
+        customer, source = None, None
+    if not customer or source not in PER_USER_ID_SOURCES:
+        return None
+    return f"customer:{customer}"
 
 
 async def record_new_campaign_profiles(campaign_id: str, profiles: list[dict]) -> list[dict]:
@@ -5387,8 +5421,10 @@ app.add_middleware(
 @app.middleware("http")
 async def attach_treg_billing_context(request: Request, call_next):
     """Bind trusted tenant headers once; provider code never accepts model tags."""
+    customer_id, customer_source = treg_customer_identity(request)
     token = _treg_request_context.set({
-        "customer_id": treg_customer_id_from_request(request),
+        "customer_id": customer_id,
+        "customer_source": customer_source,
         "workspace_id": request.headers.get("X-Workspace-ID"),
         "idempotency_key": request.headers.get("Idempotency-Key"),
     })
@@ -6366,6 +6402,16 @@ async def walk_search(request: SearchRequest):
     campaign_exclusions: list[str] = []
     if seen_scope:
         campaign_keys, campaign_exclusions = await campaign_seen(seen_scope)
+        print(f"Seen ledger: {len(campaign_keys)} person(s) already shown to this searcher")
+    else:
+        # Worth a line every time. The ledger silently having no scope is what
+        # made repeat leads look unfixable from the logs for weeks.
+        try:
+            source = treg_request_context().get("customer_source")
+        except Exception:
+            source = None
+        print(f"No seen ledger for this search (identity source: {source or 'none'}) — "
+              "the caller is not sending X-Customer-ID, so repeat leads cannot be filtered")
 
     exclusions = list(dict.fromkeys(
         (request.exclude_profiles or []) + campaign_exclusions
@@ -6410,10 +6456,20 @@ async def walk_search(request: SearchRequest):
         # So the ledger decides: if the page holds nobody already shown, it
         # stands. If it holds anyone, this is a re-search rather than a repeat
         # request, and the chain runs for real instead of replaying it.
+        # Two independent ways to know this page is a repeat rather than a
+        # first ask. The ledger is exact but needs a per-user identity and a
+        # readable database; `built_for` needs neither, and catches the case
+        # where the ledger came back empty because it could not be scoped —
+        # which is precisely when a page of already-shown people was being
+        # replayed as if it were new.
         stale = [r for r in data if _profile_lead_key(r) in campaign_keys]
-        if stale:
-            print(f"Cache HIT holds {len(stale)} person(s) already shown — "
-                  "walking the chain for new people instead")
+        built_for = (cached_payload.get("built_for")
+                     if isinstance(cached_payload, dict) else None)
+        same_asker = bool(seen_scope) and built_for == seen_scope
+        if stale or same_asker:
+            reason = (f"holds {len(stale)} person(s) already shown" if stale
+                      else "was built for this same searcher")
+            print(f"Cache HIT {reason} — walking the chain for new people instead")
         else:
             return SearchResponse(
                 success=True, source="cache", from_cache=True,
@@ -6761,8 +6817,16 @@ async def walk_search(request: SearchRequest):
 
     # Stored per provider, because a merged page can only be rebuilt by reading
     # each provider's rows with its own transform.
+    #
+    # `built_for` is who was shown these people. It is what lets the same party
+    # asking again be told apart from somebody else asking the same question,
+    # without depending on the seen ledger being readable — the ledger is the
+    # precise instrument and this is the one that still works when there is no
+    # ledger to read. Absent on rows written before this existed, which reads as
+    # "unknown" and serves the page, exactly as it did then.
     cache_payload = {"buckets": buckets, "total": total,
-                     "next_cursor": next_cursor, "provider": served_by}
+                     "next_cursor": next_cursor, "provider": served_by,
+                     "built_for": seen_scope}
     if not request.campaign_id:
         await cache_store(search_hash, cache_params, cache_payload)
 
