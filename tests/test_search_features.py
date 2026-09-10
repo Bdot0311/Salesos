@@ -22,7 +22,9 @@ def flatten_conditions(filters):
 class CrustdataFilterTests(unittest.TestCase):
     def test_correct_fields_and_values_are_used(self):
         filters = main.build_crustdata_filters({
-            "job_title": "Founder",
+            # A title with no level in it, so the seniority below survives to be
+            # checked here — see title_supersedes_seniority.
+            "job_title": "Account Executive",
             "seniority": "vp",
             "location": "US",
             "company_location": "New York",
@@ -48,7 +50,7 @@ class CrustdataFilterTests(unittest.TestCase):
             condition["value"] for condition in conditions
             if condition["field"] == "experience.employment_details.current.title"
         ]
-        self.assertEqual(title_values, ["Founder"])
+        self.assertEqual(title_values, ["Account Executive"])
 
     def test_non_country_location_uses_full_location(self):
         condition = main.build_crustdata_filters({"location": "San Francisco"})
@@ -1862,32 +1864,45 @@ class SeniorityImpliedByTitleTests(unittest.TestCase):
     returned real people for the identical search.
     """
 
-    def test_a_title_that_states_the_seniority_implies_it(self):
+    def test_a_title_that_states_the_seniority_supersedes_it(self):
         for title, seniority in (("Founder", "founder"), ("Founder", "owner"),
                                  ("Co-Founder", "founder"), ("CEO", "cxo"),
                                  ("CEO", "c_suite"), ("VP of Sales", "vp"),
                                  ("Head of Growth", "manager"),
                                  ("Director of Ops", "director")):
-            self.assertTrue(main.seniority_implied_by_title(title, seniority),
+            self.assertTrue(main.title_supersedes_seniority(title, seniority),
                             f"{title} / {seniority}")
 
-    def test_a_seniority_the_title_does_not_state_is_a_real_criterion(self):
-        for title, seniority in (("Account Executive", "vp"),
-                                 ("Engineer", "founder"),
+    def test_a_title_that_contradicts_the_seniority_also_wins(self):
+        # The fan-out case. An ICP of "Founders, Heads of Sales, or VPs of
+        # Sales" runs one search per title, and each carries the seniority the
+        # parser read off the word *Founders*. Nobody asked for a VP of Sales
+        # who is also an owner; the title is what the user typed.
+        for title, seniority in (("VP of Sales", "owner"),
+                                 ("Head of Sales", "owner"),
                                  ("Sales Manager", "vp"),
                                  ("Founder", "vp")):
-            self.assertFalse(main.seniority_implied_by_title(title, seniority),
+            self.assertTrue(main.title_supersedes_seniority(title, seniority),
+                            f"{title} / {seniority}")
+
+    def test_a_seniority_beside_a_level_less_title_is_a_real_criterion(self):
+        # These titles say nothing about level, so there is nothing to
+        # supersede and the seniority is the only thing narrowing the search.
+        for title, seniority in (("Account Executive", "vp"),
+                                 ("Engineer", "founder"),
+                                 ("Recruiter", "director")):
+            self.assertFalse(main.title_supersedes_seniority(title, seniority),
                              f"{title} / {seniority}")
 
     def test_spelling_differences_are_not_two_criteria(self):
         # "CEO" + "cxo" is one thing said twice; comparing raw strings missed it.
-        self.assertTrue(main.seniority_implied_by_title("CEO", "c-level"))
-        self.assertTrue(main.seniority_implied_by_title("VP Sales", "vice president"))
+        self.assertTrue(main.title_supersedes_seniority("CEO", "c-level"))
+        self.assertTrue(main.title_supersedes_seniority("VP Sales", "vice president"))
 
     def test_nothing_is_implied_by_a_missing_side(self):
-        self.assertFalse(main.seniority_implied_by_title("", "founder"))
-        self.assertFalse(main.seniority_implied_by_title("Founder", ""))
-        self.assertFalse(main.seniority_implied_by_title(None, None))
+        self.assertFalse(main.title_supersedes_seniority("", "founder"))
+        self.assertFalse(main.title_supersedes_seniority("Founder", ""))
+        self.assertFalse(main.title_supersedes_seniority(None, None))
 
     def test_the_redundant_filter_is_dropped_for_every_provider(self):
         params = {"job_title": "Founder", "seniority": "founder"}
@@ -3269,27 +3284,40 @@ class SilentlyDroppedFilterTests(unittest.TestCase):
 class FiberSeniorityTests(unittest.TestCase):
     """Seniority rides inside jobTitleV3, and was being dropped.
 
-    Production sends job_title="Manager" with seniority="owner". GetLeads
-    received seniority ["C-Team"] and Bytemine ["Owner"], while Fiber received a
-    bare title and answered with Managers at every level.
+    Production sent a bare title to Fiber while GetLeads and Bytemine both
+    received a seniority alongside it, so Fiber answered with people at every
+    level.
+
+    The title here has no level of its own. A title that states one supersedes
+    the seniority entirely (see title_supersedes_seniority), so it could not
+    show that the seniority reaches Fiber at all.
     """
 
     def test_seniority_reaches_fiber(self):
         params = main.build_fiber_people_params(
-            {"job_title": "Manager", "seniority": "owner"})
+            {"job_title": "Account Executive", "seniority": "owner"})
 
         self.assertEqual(params["jobTitleV3"]["allOf"], [
-            {"type": "plain", "term": "Manager"},
+            {"type": "plain", "term": "Account Executive"},
             {"type": "functional", "seniority": ["c-suite"]},
         ])
 
     def test_it_is_an_and_not_an_or(self):
-        # anyOf would widen this to every Manager *or* every executive, which
-        # is worse than the drop it replaces.
+        # anyOf would widen this to every Account Executive *or* every
+        # executive, which is worse than the drop it replaces.
         params = main.build_fiber_people_params(
-            {"job_title": "Manager", "seniority": "owner"})
+            {"job_title": "Account Executive", "seniority": "owner"})
 
         self.assertNotIn("anyOf", params["jobTitleV3"])
+
+    def test_a_title_that_states_its_own_level_sends_only_the_title(self):
+        # The production fan-out case: "VP of Sales" carrying the seniority
+        # parsed from the word *Founders* in the same sentence.
+        params = main.build_fiber_people_params(
+            {"job_title": "VP of Sales", "seniority": "owner"})
+
+        self.assertEqual(params["jobTitleV3"],
+                         {"anyOf": [{"type": "plain", "term": "VP of Sales"}]})
 
     def test_owner_maps_the_way_this_file_already_maps_it(self):
         # build_getleads_filters sends owner as "C-Team"; their enum has no
@@ -4107,9 +4135,37 @@ class ColdiqCreditLatchTests(unittest.IsolatedAsyncioTestCase):
 
     def setUp(self):
         main._coldiq_exhausted_until = 0.0
+        main._coldiq_exhausted_streak = 0
 
     def tearDown(self):
         main._coldiq_exhausted_until = 0.0
+        main._coldiq_exhausted_streak = 0
+
+    def test_a_still_empty_account_is_asked_less_and_less_often(self):
+        # Production re-asked the same balance of 0.1102 four times an hour all
+        # day, and every one of those round trips was on a user's request.
+        waits = []
+        for _ in range(6):
+            before = main.time.monotonic()
+            main.coldiq_note_status(402)
+            waits.append(round(main._coldiq_exhausted_until - before))
+
+        self.assertEqual(waits[:3], [900, 1800, 3600])
+        # Capped, so a top-up is still noticed within the hour.
+        self.assertTrue(all(w == 3600 for w in waits[2:]), waits)
+
+    def test_one_real_answer_clears_the_backoff(self):
+        for _ in range(4):
+            main.coldiq_note_status(402)
+        main.coldiq_note_status(200)
+
+        before = main.time.monotonic()
+        main.coldiq_note_status(402)
+        self.assertEqual(round(main._coldiq_exhausted_until - before), 900)
+
+    def test_a_non_payment_error_does_not_latch(self):
+        main.coldiq_note_status(429)
+        self.assertFalse(main.coldiq_out_of_credits())
 
     async def test_a_402_stops_the_next_call_from_going_out(self):
         # Three doomed round trips per enrich and one per search, 1-3 seconds
@@ -4621,6 +4677,149 @@ class CacheReplayTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(walks, ["bytemine"])
         self.assertTrue(second.from_cache)
+
+
+class SearchBudgetTests(unittest.IsolatedAsyncioTestCase):
+    """A waterfall runs its legs in order, so one slow leg is a slow search.
+
+    Production spent 123 seconds on a GetLeads timeout and the retry its own
+    error message asks for, before Fiber — which answered in under a second —
+    was asked anything at all. The platform gateway abandons a request shortly
+    after that and returns an opaque 504 with no body, which costs the user the
+    whole page including the legs that had already answered.
+    """
+
+    def tearDown(self):
+        main._search_deadline.set(None)
+
+    def test_an_unbudgeted_call_is_not_constrained(self):
+        # Enrich and the diagnostics run outside a search walk.
+        main._search_deadline.set(None)
+        self.assertIsNone(main.search_seconds_left())
+
+    def test_the_budget_fits_inside_the_gateway(self):
+        # The whole point is to answer before the gateway gives up. The reveal
+        # budget has to fit inside the same window.
+        self.assertLess(main.SEARCH_BUDGET_SECONDS, 120)
+        self.assertLess(main.WIZA_REVEAL_BUDGET_SECONDS, main.SEARCH_BUDGET_SECONDS)
+
+    def test_getleads_retries_when_there_is_time(self):
+        main._search_deadline.set(main.time.monotonic() + 70)
+        self.assertGreater(main.search_seconds_left(), main.GETLEADS_TIMEOUT_SECONDS)
+
+    async def test_getleads_does_not_retry_into_a_spent_budget(self):
+        calls = []
+
+        async def timing_out(path, body):
+            calls.append(body)
+            raise main.HTTPException(
+                status_code=502,
+                detail='GetLeads error: {"error":"search_timeout"}')
+
+        main._search_deadline.set(main.time.monotonic() + 5)
+        with patch.object(main, "getleads_call", timing_out):
+            with self.assertRaises(main.HTTPException):
+                await main.getleads_person_search({"job_title": "Founder"}, 6)
+
+        # One attempt, not two: the second could not have finished.
+        self.assertEqual(len(calls), 1)
+
+    async def test_getleads_still_retries_when_the_budget_allows(self):
+        calls = []
+
+        async def timing_out_then_answering(path, body):
+            calls.append(body)
+            if len(calls) == 1:
+                raise main.HTTPException(
+                    status_code=502,
+                    detail='GetLeads error: {"error":"search_timeout"}')
+            return {"contacts": [{"first_name": "Ada"}], "total_available": 1}
+
+        main._search_deadline.set(main.time.monotonic() + 300)
+        with patch.object(main, "getleads_call", timing_out_then_answering):
+            data = await main.getleads_person_search({"job_title": "Founder"}, 6)
+
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn("max_per_company", calls[1])
+        self.assertEqual(len(data["profiles"]), 1)
+
+    async def test_a_spent_budget_returns_the_page_so_far(self):
+        walked = []
+
+        async def bytemine(params, limit, **kwargs):
+            walked.append("bytemine")
+            # Answers, but eats the whole budget doing it.
+            main._search_deadline.set(main.time.monotonic() - 1)
+            return {"profiles": [{"pid": "1", "first_name": "Ada"}],
+                    "total": 1, "next_cursor": None}
+
+        async def crustdata(*a, **k):
+            walked.append("crustdata")
+            return {"profiles": [], "total": 0}
+
+        patches = [
+            patch.object(main.settings, "bytemine_api_key", "b"),
+            patch.object(main.settings, "crustdata_api_key", "c"),
+            patch.object(main, "provider_chain", lambda: ("bytemine", "crustdata")),
+            patch.object(main, "bytemine_person_search", bytemine),
+            patch.object(main, "crustdata_person_search", crustdata),
+            patch.object(main, "cache_lookup", AsyncMock(return_value=None)),
+            patch.object(main, "cache_store", AsyncMock()),
+            patch.object(main, "campaign_seen", AsyncMock(return_value=(set(), []))),
+            patch.object(main, "record_new_campaign_profiles",
+                         AsyncMock(side_effect=lambda scope, rows: rows)),
+        ]
+        for p in patches:
+            p.start()
+        try:
+            result = await main.walk_search(
+                main.SearchRequest(job_title="Founder", limit=10))
+        finally:
+            for p in patches:
+                p.stop()
+
+        # The second leg was never asked, and the page it had is still returned
+        # rather than lost to a gateway timeout.
+        self.assertEqual(walked, ["bytemine"])
+        self.assertEqual(result.count, 1)
+
+    async def test_the_budget_never_returns_an_empty_page_it_could_have_filled(self):
+        # `ran` guards this: giving up before any leg has answered would turn a
+        # slow first provider into a blank result.
+        walked = []
+
+        async def slow_then_fine(params, limit, **kwargs):
+            walked.append("bytemine")
+            return {"profiles": [], "total": 0, "next_cursor": None}
+
+        async def getleads(params, limit, offset=0, **kwargs):
+            walked.append("getleads")
+            return {"profiles": [{"first_name": "Ada", "org_domain": "b.com"}],
+                    "total": 1, "next_offset": None}
+
+        main._search_deadline.set(main.time.monotonic() - 1)
+        patches = [
+            patch.object(main.settings, "bytemine_api_key", "b"),
+            patch.object(main.settings, "getleads_api_key", "g"),
+            patch.object(main, "provider_chain", lambda: ("bytemine", "getleads")),
+            patch.object(main, "bytemine_person_search", slow_then_fine),
+            patch.object(main, "getleads_person_search", getleads),
+            patch.object(main, "cache_lookup", AsyncMock(return_value=None)),
+            patch.object(main, "cache_store", AsyncMock()),
+            patch.object(main, "campaign_seen", AsyncMock(return_value=(set(), []))),
+            patch.object(main, "record_new_campaign_profiles",
+                         AsyncMock(side_effect=lambda scope, rows: rows)),
+        ]
+        for p in patches:
+            p.start()
+        try:
+            await main.walk_search(main.SearchRequest(job_title="Founder", limit=10))
+        finally:
+            for p in patches:
+                p.stop()
+
+        # walk_search resets the deadline itself, so both legs run.
+        self.assertEqual(walked, ["bytemine", "getleads"])
 
 
 if __name__ == "__main__":
