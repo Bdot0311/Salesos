@@ -132,6 +132,12 @@ WIZA_REVEAL_BUDGET_SECONDS = 35.0
 # short page now beats a 504 later.
 SEARCH_BUDGET_SECONDS = 75.0
 
+# What the legs behind the current one need. A provider that pages in a loop
+# must leave this much of the budget for everyone after it, or one slow leg
+# quietly becomes the whole search — which is how a 101-second GetLeads walk
+# meant Fiber was never asked.
+CHAIN_RESERVE_SECONDS = 20.0
+
 # What GetLeads costs when it gives up: it times out its own search at 50
 # seconds and answers at about 60. Used to decide whether a retry can finish.
 GETLEADS_TIMEOUT_SECONDS = 60.0
@@ -6748,7 +6754,9 @@ async def walk_search(request: SearchRequest):
             total = 0
 
             for _ in range(GETLEADS_MAX_PAGES):
+                page_started = time.monotonic()
                 data = await getleads_person_search(params, wanted, offset=offset)
+                page_seconds = time.monotonic() - page_started
                 page = data["profiles"]
                 total = data["total"]
 
@@ -6762,6 +6770,22 @@ async def walk_search(request: SearchRequest):
 
                 next_offset = data.get("next_offset")
                 if len(found) >= wanted or not page or next_offset is None:
+                    break
+
+                # The search budget is checked between legs, and this loop sits
+                # *inside* one. GetLeads slowed to 40 seconds a page and took
+                # three of them, so a single leg spent 101 seconds and the
+                # budget only noticed afterwards — by which time Fiber, which
+                # had people and answers in under two seconds, was never asked
+                # and the caller had already given up on the whole request.
+                #
+                # The next page costs about what the last one did, so take it
+                # only if the chain behind this leg still has time afterwards.
+                left = search_seconds_left()
+                if left is not None and left < page_seconds + CHAIN_RESERVE_SECONDS:
+                    print(f"GetLeads: {int(left)}s of the search budget left and "
+                          f"a page costs about {int(page_seconds)}s — stopping "
+                          "here so the rest of the chain still runs")
                     break
                 # Say what was actually filtered, not how big the page was.
                 # This line used to print len(page) and call it "already seen",

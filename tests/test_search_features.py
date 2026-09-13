@@ -4744,6 +4744,102 @@ class SearchBudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("max_per_company", calls[1])
         self.assertEqual(len(data["profiles"]), 1)
 
+    async def test_a_paging_leg_leaves_time_for_the_chain_behind_it(self):
+        """The budget is checked between legs; GetLeads pages inside one.
+
+        Production: GetLeads slowed to 40 seconds a page and took three, so a
+        single leg spent 101 seconds. The budget only noticed afterwards — by
+        which time Fiber, which answers in under two seconds, was never asked
+        and the caller had already given up on the whole request.
+        """
+        pages = []
+        # Rows do come back -- they are simply all people already shown, which
+        # is what makes the loop page onward. An empty page would stop it for a
+        # different reason and prove nothing.
+        stale = [{"person_linkedin_url": f"https://linkedin.com/in/seen{i}"}
+                 for i in range(5)]
+        seen_keys = {main._profile_lead_key(row) for row in stale}
+
+        # A fake clock, because the page has to actually *cost* time. Advancing
+        # a real deadline instead would keep resetting it, which is the opposite
+        # of a page eating the budget.
+        clock = [1000.0]
+
+        async def slow_page(params, limit, offset=0, **kwargs):
+            pages.append(offset)
+            clock[0] += 40          # what a GetLeads page cost in production
+            return {"profiles": stale, "total": 99, "next_offset": offset + limit}
+
+        patches = [
+            patch.object(main.time, "monotonic", lambda: clock[0]),
+            patch.object(main.settings, "getleads_api_key", "g"),
+            patch.object(main.settings, "fiber_api_key", "f"),
+            patch.object(main, "provider_chain", lambda: ("getleads", "fiber")),
+            patch.object(main, "getleads_person_search", slow_page),
+            patch.object(main, "fiber_person_search",
+                         AsyncMock(return_value={"profiles": [
+                             {"url": "https://linkedin.com/in/ada", "name": "Ada"}],
+                             "total": 1, "next_cursor": None})),
+            patch.object(main, "cache_lookup", AsyncMock(return_value=None)),
+            patch.object(main, "cache_store", AsyncMock()),
+            patch.object(main, "campaign_seen",
+                         AsyncMock(return_value=(seen_keys, []))),
+            patch.object(main, "record_new_campaign_profiles",
+                         AsyncMock(side_effect=lambda scope, rows: rows)),
+        ]
+        token = main._treg_request_context.set(
+            {"customer_id": "user-7", "customer_source": "header"})
+        for p in patches:
+            p.start()
+        try:
+            result = await main.walk_search(
+                main.SearchRequest(job_title="Founder", limit=5))
+        finally:
+            main._treg_request_context.reset(token)
+            for p in patches:
+                p.stop()
+
+        # One page, not three — and Fiber still got asked, and answered.
+        self.assertEqual(len(pages), 1, pages)
+        self.assertEqual(result.count, 1)
+
+    async def test_it_keeps_paging_while_pages_are_cheap(self):
+        # The reserve is measured against what a page actually costs, so a fast
+        # provider is not stopped from doing its job.
+        pages = []
+        stale = [{"person_linkedin_url": f"https://linkedin.com/in/seen{i}"}
+                 for i in range(5)]
+        seen_keys = {main._profile_lead_key(row) for row in stale}
+
+        async def fast_page(params, limit, offset=0, **kwargs):
+            pages.append(offset)
+            return {"profiles": stale, "total": 99, "next_offset": offset + limit}
+
+        main._search_deadline.set(main.time.monotonic() + 75)
+        patches = [
+            patch.object(main.settings, "getleads_api_key", "g"),
+            patch.object(main, "provider_chain", lambda: ("getleads",)),
+            patch.object(main, "getleads_person_search", fast_page),
+            patch.object(main, "cache_lookup", AsyncMock(return_value=None)),
+            patch.object(main, "cache_store", AsyncMock()),
+            patch.object(main, "campaign_seen",
+                         AsyncMock(return_value=(seen_keys, []))),
+            patch.object(main, "record_new_campaign_profiles",
+                         AsyncMock(side_effect=lambda scope, rows: rows)),
+        ]
+        token = main._treg_request_context.set(
+            {"customer_id": "user-7", "customer_source": "header"})
+        for p in patches:
+            p.start()
+        try:
+            await main.walk_search(main.SearchRequest(job_title="Founder", limit=5))
+        finally:
+            main._treg_request_context.reset(token)
+            for p in patches:
+                p.stop()
+
+        self.assertEqual(len(pages), main.GETLEADS_MAX_PAGES, pages)
+
     async def test_a_spent_budget_returns_the_page_so_far(self):
         walked = []
 
