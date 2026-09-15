@@ -1994,7 +1994,16 @@ async def wiza_prospect_search(params: dict, size: int) -> dict:
     async with httpx.AsyncClient(timeout=60.0) as client:
         resp = None
         for _drop_attempt in range(len(DROPPABLE) + 1):
-            body = {"size": size, "filters": filters}
+            # No `size`. Wiza rejects it outright now — "The size parameter is
+            # not allowed" — and it is the only field in this body besides the
+            # filters, so every call carrying it 400ed. Company autocomplete
+            # runs through here, which is why searching for a company by name
+            # returned nothing at all.
+            #
+            # The cap is applied to what comes back instead. That is where it
+            # always mattered: `size` was never a billing control on this
+            # endpoint, which is credit-free.
+            body = {"filters": filters}
             print(f"Wiza prospect search body: {json.dumps(body)}")
 
             for attempt in range(3):
@@ -2012,13 +2021,21 @@ async def wiza_prospect_search(params: dict, size: int) -> dict:
             if resp.status_code == 429:
                 raise HTTPException(status_code=429, detail="Wiza rate limit reached — please try again in a moment")
             if resp.status_code in (200, 201):
-                return resp.json().get("data", {}) or {}
+                data = resp.json().get("data", {}) or {}
+                profiles = data.get("profiles") or []
+                if size and len(profiles) > size:
+                    data = {**data, "profiles": profiles[:size]}
+                return data
 
             # Error → try dropping a filter and retry
             err_text = resp.text.lower()
             dropped = False
             for key in DROPPABLE:
-                if key in filters and (key in err_text or "invalid" in err_text or "parameter" in err_text):
+                # "parameter" alone used to be enough to blame a filter, so a
+                # complaint about a body field sent us dropping the user's
+                # criteria one at a time to fix something they had not asked
+                # for. The filter has to be named.
+                if key in filters and (key in err_text or "invalid" in err_text):
                     print(f"Dropping filter '{key}' and retrying")
                     del filters[key]
                     dropped = True
@@ -6846,6 +6863,14 @@ async def walk_search(request: SearchRequest):
                 seen = {i for i in (linkedin_identity(u) for u in exclusions) if i}
                 found = [p for p in found
                          if linkedin_identity(_profile_url(p)) not in seen]
+            # This leg read the caller's exclusion list and stopped there: no
+            # ledger filter, and no record of who it had shown. Production ran
+            # the same company search three times over two hours and got the
+            # same seven people every time, with the ledger frozen at 44.
+            if campaign_keys:
+                found = drop_already_seen(found, campaign_keys, suppressed)
+            if seen_scope:
+                found = await record_new_campaign_profiles(seen_scope, found)
             return (found[skip:] if skip else found), data["total"], data.get("next_cursor")
 
         if name == "findymail":
@@ -6907,18 +6932,33 @@ async def walk_search(request: SearchRequest):
 
             return (found[skip:] if skip else found), data["total"], None
 
+        # Wiza, on both its paths. Neither filtered the ledger nor wrote to
+        # it, so every person Wiza found stayed permanently new — and once the
+        # account was topped up and Wiza became the leg actually returning
+        # people, that was the whole page repeating.
+        async def wiza_page(found: list) -> list:
+            if exclusions:
+                seen = {i for i in (linkedin_identity(u) for u in exclusions) if i}
+                found = [p for p in found
+                         if linkedin_identity(_profile_url(p)) not in seen]
+            if campaign_keys:
+                found = drop_already_seen(found, campaign_keys, suppressed)
+            if seen_scope:
+                found = await record_new_campaign_profiles(seen_scope, found)
+            return found
+
         if degraded:
             # Credit-free preview search — see provider_state(). Wiza caps this
             # endpoint at 30 profiles per call.
             skip = request.start_offset
             data = await wiza_prospect_search(
                 params, max(min(params.get("limit", 10) + skip, 30), 1))
-            found = data.get("profiles") or []
+            found = await wiza_page(data.get("profiles") or [])
             return (found[skip:] if skip else found), data.get("total", len(found)), None
 
         skip = request.start_offset
-        found = await fetch_from_wiza(
-            {**params, "limit": params.get("limit", 10) + skip} if skip else params)
+        found = await wiza_page(await fetch_from_wiza(
+            {**params, "limit": params.get("limit", 10) + skip} if skip else params))
         total = len(found)
         return (found[skip:] if skip else found), total, None
 
