@@ -5005,6 +5005,58 @@ class ExhaustedPoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.count, 0)
         self.assertEqual(result.suppressed_as_seen, 2)
 
+    def test_no_leg_can_quietly_skip_the_ledger(self):
+        """The audit, as a test, because finding these one at a time has cost
+        three rounds: Bytemine, then Treg, then Wiza — each the leg that
+        happened to be serving results at the time, each invisible to the
+        ledger, each repeating its people forever.
+
+        A leg that calls neither function is not a weaker leg. For that
+        provider there is no ledger at all.
+        """
+        import inspect
+        import re
+
+        source = inspect.getsource(main.walk_search)
+        body = source[source.index("async def run_provider"):
+                      source.index("    attempts: list")]
+
+        # Split the body at each `if name == "..."`, keeping the trailing
+        # stretch after the last one — that is Wiza, which has no guard of its
+        # own and is exactly where the last of these hid.
+        marks = [(m.start(), m.group(1))
+                 for m in re.finditer(r'if name == "(\w+)"', body)]
+        self.assertTrue(marks, "run_provider has no provider branches")
+
+        legs = {}
+        for i, (at, leg) in enumerate(marks):
+            end = marks[i + 1][0] if i + 1 < len(marks) else len(body)
+            legs[leg] = body[at:end]
+        legs["wiza"] = body[marks[-1][0]:]
+
+        missing = [leg for leg, chunk in legs.items()
+                   if "drop_already_seen" not in chunk
+                   or "record_new_campaign_profiles" not in chunk]
+
+        self.assertEqual(missing, [],
+                         f"these legs are invisible to the seen ledger: {missing}")
+
+    def test_the_audit_covers_every_provider_in_the_chain(self):
+        # The sweep above only proves something if it actually reaches every
+        # leg. A provider added to PROVIDER_ORDER without a branch in
+        # run_provider would pass it by saying nothing.
+        import inspect
+        import re
+
+        source = inspect.getsource(main.walk_search)
+        body = source[source.index("async def run_provider"):
+                      source.index("    attempts: list")]
+        branches = set(re.findall(r'if name == "(\w+)"', body)) | {"wiza"}
+
+        # `degraded` swaps Wiza's search for its credit-free preview; both run
+        # under the same trailing branch.
+        self.assertEqual(set(main.PROVIDER_ORDER) - branches, set())
+
     async def test_every_leg_filters_and_records_what_it_showed(self):
         """The Bytemine leg did neither, and it is first in the chain.
 
@@ -5170,6 +5222,113 @@ class LedgerIdentityTests(unittest.TestCase):
     def test_someone_with_no_profile_at_all_has_no_key(self):
         self.assertIsNone(main._profile_lead_key({"first_name": "Ada"}))
         self.assertEqual(main._profile_seen_keys({"first_name": "Ada"}), set())
+
+
+class WizaProspectSearchTests(unittest.IsolatedAsyncioTestCase):
+    """Company autocomplete was returning nothing, on every query.
+
+        Wiza prospect search body: {"size": 30, "filters": {...}}
+        Wiza prospect search status: 400 {"message":"The size parameter is not allowed."}
+        POST /company/search 400 Bad Request
+
+    Four in a row in production. `size` is not a filter Wiza dislikes — it is
+    a body field it no longer accepts at all, so every call carrying it failed
+    before the filters were even considered.
+    """
+
+    async def run_search(self, response, params=None, size=30):
+        sent = {}
+
+        class Resp:
+            status_code = response[0]
+            text = json.dumps(response[1])
+
+            @staticmethod
+            def json():
+                return response[1]
+
+        class Client:
+            def __init__(self, *a, **k): pass
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return False
+
+            async def post(self, url, headers=None, json=None):
+                sent.update(json or {})
+                return Resp()
+
+        with patch.object(main.httpx, "AsyncClient", Client), \
+             patch.object(main.settings, "wiza_api_key", "k"), \
+             patch.object(main, "resolve_company_domain", AsyncMock()):
+            data = await main.wiza_prospect_search(
+                params or {"company": "Trendara"}, size)
+        return data, sent
+
+    async def test_the_rejected_field_is_not_sent(self):
+        _, sent = await self.run_search((200, {"data": {"profiles": [], "total": 0}}))
+
+        self.assertNotIn("size", sent)
+        self.assertIn("filters", sent)
+
+    async def test_the_cap_is_applied_to_what_comes_back(self):
+        # It has to be enforced somewhere, and the response is the only place
+        # left. This endpoint is credit-free, so the cap was never billing.
+        rows = [{"full_name": f"P{i}"} for i in range(12)]
+        data, _ = await self.run_search(
+            (200, {"data": {"profiles": rows, "total": 12}}), size=5)
+
+        self.assertEqual(len(data["profiles"]), 5)
+        # The provider's own count is not rewritten to match the slice.
+        self.assertEqual(data["total"], 12)
+
+    async def test_a_short_page_is_left_alone(self):
+        rows = [{"full_name": "P0"}]
+        data, _ = await self.run_search(
+            (200, {"data": {"profiles": rows, "total": 1}}), size=30)
+
+        self.assertEqual(len(data["profiles"]), 1)
+
+    async def test_a_response_with_no_profiles_does_not_crash(self):
+        data, _ = await self.run_search((200, {"data": {"total": 0}}), size=5)
+        self.assertEqual(data.get("profiles", []), [])
+
+    async def test_a_complaint_about_a_body_field_does_not_drop_the_users_filters(self):
+        """"parameter" alone used to be enough to blame a filter.
+
+        So a complaint about a *body field* sent us dropping the user's search
+        criteria one at a time, trying to fix something they had not asked for
+        — and each attempt still carried the field Wiza was objecting to.
+        """
+        # Filters Wiza accepts, so the only thing it can object to is `size`.
+        params = {"company": "Trendara", "job_title": "Founder",
+                  "company_size": "1-10"}
+        bodies = []
+
+        class Resp:
+            status_code = 400
+            text = '{"message":"The size parameter is not allowed."}'
+
+            @staticmethod
+            def json():
+                return {}
+
+        class Client:
+            def __init__(self, *a, **k): pass
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return False
+
+            async def post(self, url, headers=None, json=None):
+                bodies.append(json)
+                return Resp()
+
+        with patch.object(main.httpx, "AsyncClient", Client), \
+             patch.object(main.settings, "wiza_api_key", "k"), \
+             patch.object(main, "resolve_company_domain", AsyncMock()):
+            with self.assertRaises(main.HTTPException):
+                await main.wiza_prospect_search(params, 30)
+
+        # One attempt, and the filters the user asked for are intact.
+        self.assertEqual(len(bodies), 1, bodies)
+        self.assertNotIn("size", bodies[0])
 
 
 if __name__ == "__main__":
