@@ -5711,6 +5711,146 @@ class ContactOutRevealTests(unittest.IsolatedAsyncioTestCase):
                 await main.contactout_reveal("https://linkedin.com/in/ada"), {})
 
 
+class ContactOutEnrichTests(unittest.IsolatedAsyncioTestCase):
+    """Most reveals here arrive as a name and a company, not a LinkedIn URL.
+
+    Their contact-info endpoint cannot answer that shape at all, so gating the
+    whole leg on a URL meant those reveals skipped ContactOut entirely.
+    """
+
+    def _request(self, **over):
+        return main.EnrichRequest(**over)
+
+    async def test_a_name_and_company_reach_the_enrich_endpoint(self):
+        ContactOutClient.reset({("POST", "/v1/people/enrich"): (200, {
+            "status_code": 200,
+            "profile": {"full_name": "Ada Lovelace",
+                        "work_email": ["ada@acme.com"],
+                        "work_email_status": {"ada@acme.com": "Verified"},
+                        "phone": ["+15551234"]},
+        })})
+        with patch.object(main.httpx, "AsyncClient", ContactOutClient), _co():
+            contact = await main.contactout_enrich(
+                self._request(full_name="Ada Lovelace", company="Acme"))
+
+        _, path, _, body, _ = ContactOutClient.calls[0]
+        self.assertEqual(path, "/v1/people/enrich")
+        self.assertEqual(body["full_name"], "Ada Lovelace")
+        self.assertEqual(body["company"], ["Acme"])
+        self.assertEqual(contact["email"], "ada@acme.com")
+        self.assertEqual(contact["email_status"], "verified")
+        self.assertEqual(contact["phone"], "+15551234")
+
+    async def test_contact_details_are_opt_in_and_asked_for(self):
+        # They are omitted by default, which would make the call pointless.
+        ContactOutClient.reset({("POST", "/v1/people/enrich"):
+                                (200, {"profile": {"work_email": ["a@b.com"]}})})
+        with patch.object(main.httpx, "AsyncClient", ContactOutClient), _co():
+            await main.contactout_enrich(
+                self._request(full_name="Ada Lovelace", company="Acme"))
+
+        self.assertIn("work_email", ContactOutClient.calls[0][3]["include"])
+
+    async def test_a_domain_is_sent_as_a_bare_host(self):
+        ContactOutClient.reset({("POST", "/v1/people/enrich"):
+                                (200, {"profile": {"work_email": ["a@b.com"]}})})
+        with patch.object(main.httpx, "AsyncClient", ContactOutClient), _co():
+            await main.contactout_enrich(self._request(
+                full_name="Ada Lovelace", company_domain="https://acme.com/x"))
+
+        self.assertEqual(ContactOutClient.calls[0][3]["company_domain"], ["acme.com"])
+
+    async def test_a_request_that_cannot_match_is_never_sent(self):
+        # Their rule: a primary identifier, or a name plus a secondary. A bare
+        # name satisfies neither and can only come back 404.
+        ContactOutClient.reset({("POST", "/v1/people/enrich"):
+                                (200, {"profile": {"work_email": ["a@b.com"]}})})
+        with patch.object(main.httpx, "AsyncClient", ContactOutClient), _co():
+            contact = await main.contactout_enrich(
+                self._request(full_name="Ada Lovelace"))
+
+        self.assertEqual(contact, {})
+        self.assertEqual(ContactOutClient.calls, [])
+
+    async def test_an_email_alone_is_a_primary_identifier(self):
+        ContactOutClient.reset({("POST", "/v1/people/enrich"):
+                                (200, {"profile": {"work_email": ["a@b.com"]}})})
+        with patch.object(main.httpx, "AsyncClient", ContactOutClient), _co():
+            contact = await main.contactout_enrich(
+                self._request(email="ada@acme.com"))
+
+        self.assertEqual(contact["email"], "a@b.com")
+
+    async def test_their_camel_case_spelling_is_read_too(self):
+        # The same endpoint's response table describes camelCase scalars where
+        # its example shows snake_case arrays. Reading one spelling means a
+        # reveal that was paid for and then thrown away.
+        ContactOutClient.reset({("POST", "/v1/people/enrich"): (200, {
+            "profile": {"fullName": "Ada Lovelace",
+                        "workEmail": "ada@acme.com",
+                        "workEmailStatus": "Verified",
+                        "phone": "+15551234"},
+        })})
+        with patch.object(main.httpx, "AsyncClient", ContactOutClient), _co():
+            contact = await main.contactout_enrich(
+                self._request(email="ada@acme.com"))
+
+        self.assertEqual(contact["name"], "Ada Lovelace")
+        self.assertEqual(contact["email"], "ada@acme.com")
+        self.assertEqual(contact["email_status"], "verified")
+        self.assertEqual(contact["phone"], "+15551234")
+
+    async def test_their_empty_profile_is_an_array_not_an_object(self):
+        ContactOutClient.reset({("POST", "/v1/people/enrich"):
+                                (200, {"status_code": 200, "profile": []})})
+        with patch.object(main.httpx, "AsyncClient", ContactOutClient), _co():
+            contact = await main.contactout_enrich(
+                self._request(email="ada@acme.com"))
+
+        self.assertEqual(contact, {})
+
+    async def test_a_url_takes_the_cheaper_endpoint(self):
+        # A URL costs an email credit on contact-info and an email credit plus
+        # a search credit on enrich, so the cheap call has to win.
+        ContactOutClient.reset({
+            ("GET", "/v1/people/linkedin"):
+                (200, {"profile": {"work_email": ["ada@acme.com"]}}),
+            ("POST", "/v1/people/enrich"):
+                (200, {"profile": {"work_email": ["ada@acme.com"]}}),
+        })
+        request = main.EnrichRequest(linkedin_url="https://linkedin.com/in/ada",
+                                     full_name="Ada Lovelace", company="Acme")
+        with patch.object(main.httpx, "AsyncClient", ContactOutClient), \
+             patch.object(main, "provider_chain", lambda: ("contactout",)), \
+             patch.object(main, "verify_revealed_lead",
+                          AsyncMock(side_effect=lambda lead, p=None: {
+                              **lead, "email_verification": {}, "email_verified": True})), \
+             _co():
+            result = await main.enrich_lead(request)
+
+        self.assertEqual(result["provider"], "contactout")
+        self.assertEqual([c[1] for c in ContactOutClient.calls],
+                         ["/v1/people/linkedin"])
+
+    async def test_a_name_and_company_reveal_reaches_the_leg_at_all(self):
+        # The regression this closes: with no URL the leg used to be skipped.
+        ContactOutClient.reset({("POST", "/v1/people/enrich"):
+                                (200, {"profile": {"work_email": ["ada@acme.com"]}})})
+        request = main.EnrichRequest(full_name="Ada Lovelace", company="Acme")
+        with patch.object(main.httpx, "AsyncClient", ContactOutClient), \
+             patch.object(main, "provider_chain", lambda: ("contactout",)), \
+             patch.object(main, "verify_revealed_lead",
+                          AsyncMock(side_effect=lambda lead, p=None: {
+                              **lead, "email_verification": {}, "email_verified": True})), \
+             _co():
+            result = await main.enrich_lead(request)
+
+        self.assertEqual(result["provider"], "contactout")
+        self.assertEqual(result["lead"]["business_email"], "ada@acme.com")
+        self.assertEqual([c[1] for c in ContactOutClient.calls],
+                         ["/v1/people/enrich"])
+
+
 class ContactOutVerifyTests(unittest.IsolatedAsyncioTestCase):
     async def run_verify(self, status, payload):
         ContactOutClient.reset({("GET", "/v1/email/verify"): (status, payload)})

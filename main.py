@@ -4102,21 +4102,101 @@ async def contactout_reveal(linkedin_url: str, want_phone: bool = False) -> dict
     if status != 200 or not isinstance(data, dict):
         return {}
 
-    profile = data.get("profile") or {}
-    emails = profile.get("work_email") or profile.get("email") or []
-    phones = profile.get("phone") or []
+    # Their empty shape for the profile endpoints is `"profile": []` — an
+    # array where the hit is an object, the same trap the search envelope sets.
+    profile = data.get("profile")
+    if not isinstance(profile, dict):
+        return {}
+    return _contactout_contact(profile)
+
+
+def _contactout_contact(profile: dict) -> dict:
+    """Pull our reveal shape out of one of their profile objects.
+
+    Shared because their profile endpoints disagree with themselves about
+    casing: the People Enrich example is snake_case and array-valued
+    (`work_email: [...]`), while that same endpoint's response *table*
+    describes camelCase scalars (`workEmail`), which is what the email-enrich
+    endpoint actually returns. Reading only one spelling means a reveal that
+    was paid for and then discarded, so both are read here, once.
+    """
+    def first(*keys):
+        for key in keys:
+            value = profile.get(key)
+            if isinstance(value, list):
+                if value:
+                    return value[0]
+            elif value:
+                return value
+        return None
+
+    email = first("work_email", "workEmail", "email")
+    phone = first("phone")
+
+    # Verification status arrives either as a dict keyed by address or as a
+    # bare word, depending on which endpoint answered.
     statuses = profile.get("work_email_status")
-    email = emails[0] if emails else None
-    verified = None
+    verified = profile.get("workEmailStatus")
     if email and isinstance(statuses, dict):
-        verified = str(statuses.get(email) or "").strip().lower() or None
+        verified = statuses.get(email)
+    verified = str(verified or "").strip().lower() or None
 
     return {
+        "name": first("full_name", "fullName"),
         "email": email,
         "email_status": verified,
-        "phone": phones[0] if phones else None,
+        "phone": phone,
         "phone_type": None,
     }
+
+
+async def contactout_enrich(request) -> dict:
+    """Reveal from whatever identifiers the caller has, not just a URL.
+
+    Most reveals in this product do not arrive with a LinkedIn URL — they
+    arrive as a name and a company, which is the shape ColdIQ and Wiza catch.
+    Their contact-info endpoint cannot answer that; this one can.
+
+    Kept behind the URL path rather than replacing it: a reveal keyed on a URL
+    costs an email credit here and an email credit *plus a search credit*
+    there, so the cheaper call goes first and this one picks up what it cannot
+    take.
+    """
+    payload: dict = {}
+    if request.linkedin_url:
+        payload["linkedin_url"] = request.linkedin_url
+    if request.email:
+        payload["email"] = request.email
+    if request.full_name:
+        payload["full_name"] = request.full_name
+    if request.company:
+        payload["company"] = [request.company]
+    if request.company_domain:
+        payload["company_domain"] = [domain_host(request.company_domain)
+                                     or request.company_domain]
+
+    # Their documented matching rule: one primary identifier, or a name plus at
+    # least one secondary. Checked before the call rather than after, because a
+    # request that cannot match is a round trip that can only return 404 —
+    # and while this endpoint bills on a hit, the latency is spent either way.
+    primary = any(payload.get(k) for k in ("linkedin_url", "email", "phone"))
+    secondary = any(payload.get(k) for k in ("company", "company_domain",
+                                             "location", "education"))
+    if not primary and not (payload.get("full_name") and secondary):
+        return {}
+
+    # Contact details are opt-in on this endpoint and cost nothing when left
+    # out — which would make the whole call pointless here. Work emails only:
+    # this is B2B outbound.
+    payload["include"] = ["work_email", "phone"]
+
+    status, data = await contactout_call("POST", "/v1/people/enrich", body=payload)
+    if status != 200 or not isinstance(data, dict):
+        return {}
+    profile = data.get("profile")
+    if not isinstance(profile, dict):
+        return {}
+    return _contactout_contact(profile)
 
 
 # Their verdict vocabulary, mapped onto ours. accept_all is a catch-all domain:
@@ -6467,11 +6547,25 @@ async def reveal_lead(request: EnrichRequest):
     # arrives already graded, the way Fiber's does. Phones come from the same
     # call: this leg returns early on a hit, and a cheaper reveal that silently
     # drops the phone number the next leg would have found is not cheaper.
-    if "contactout" in chain and request.linkedin_url:
-        contact = await contactout_reveal(request.linkedin_url, want_phone=True)
+    #
+    # Two endpoints, cheapest first. A LinkedIn URL goes to their contact-info
+    # call, which costs an email credit. Everything else — a name and a
+    # company, which is how most reveals in this product actually arrive —
+    # goes to their people-enrich call, which costs a search credit on top.
+    # Gating the whole leg on a URL, as this did, meant the name-and-company
+    # reveals never reached ContactOut at all.
+    if "contactout" in chain and (
+        request.linkedin_url
+        or request.email
+        or (request.full_name and (request.company or request.company_domain))
+    ):
+        if request.linkedin_url:
+            contact = await contactout_reveal(request.linkedin_url, want_phone=True)
+        else:
+            contact = await contactout_enrich(request)
         if contact.get("email"):
             lead = await verify_revealed_lead({
-                "contact_name": request.full_name,
+                "contact_name": contact.get("name") or request.full_name,
                 "business_email": contact["email"],
                 "company_name": request.company,
                 "company_domain": request.company_domain,
