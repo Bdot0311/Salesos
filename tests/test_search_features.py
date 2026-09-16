@@ -5331,5 +5331,579 @@ class WizaProspectSearchTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("size", bodies[0])
 
 
+class ContactOutClient:
+    """Fake httpx client for ContactOut, which uses one `request` verb.
+
+    Answers per (method, path) and records the headers, query and body of
+    every call, because the interesting assertions here are what was sent as
+    much as what came back.
+    """
+    routes = {}
+    calls = []
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def request(self, method, url, headers=None, params=None, json=None):
+        path = url.replace(main.CONTACTOUT_BASE, "")
+        self.__class__.calls.append((method, path, params, json, headers))
+        key = (method, path)
+        status, payload = self.__class__.routes.get(key, (404, {"message": "no route"}))
+        if callable(payload):
+            payload = payload(len(self.__class__.calls), json or {})
+        return RoutedResponse(status, payload)
+
+    @classmethod
+    def reset(cls, routes=None):
+        cls.routes = routes or {}
+        cls.calls = []
+
+
+def _co(**env):
+    return patch.multiple(main.settings, contactout_api_key="co_key", **env)
+
+
+def _co_profile(vanity="ada", **over):
+    """One profile in their documented row shape."""
+    row = {
+        "li_vanity": vanity,
+        "full_name": "Ada Lovelace",
+        "title": "Founder",
+        "headline": "Founder at Acme",
+        "company": {"name": "Acme", "domain": "acme.com",
+                    "industry": "Computer Software", "size": 20},
+        "location": "London",
+        "country": "United Kingdom",
+        "seniority": "Owner",
+        "contact_availability": {"personal_email": True, "work_email": True,
+                                 "phone": False},
+    }
+    row.update(over)
+    return row
+
+
+def _co_page(vanities, total=None, page=1, page_size=25):
+    """Their hit envelope: profiles keyed by LinkedIn URL."""
+    return {
+        "status_code": 200,
+        "metadata": {"page": page, "page_size": page_size,
+                     "total_results": total if total is not None else len(vanities)},
+        "profiles": {f"https://linkedin.com/in/{v}": _co_profile(v) for v in vanities},
+    }
+
+
+class ContactOutFilterTests(unittest.TestCase):
+    def test_the_whole_icp_travels_in_one_body(self):
+        body = main.build_contactout_filters({
+            "job_title": "Account Executive",
+            "seniority": "director",
+            "industry": "computer software",
+            "company_size": "11-50",
+            "location": "United Kingdom",
+            "keywords": "AI SaaS",
+        })
+
+        self.assertEqual(body["job_title"], ["Account Executive"])
+        self.assertIs(body["current_titles_only"], True)
+        self.assertEqual(body["seniority"], ["director"])
+        self.assertEqual(body["industry"], ["Computer Software"])
+        self.assertEqual(body["company_size"], ["11_50"])
+        self.assertEqual(body["location"], ["United Kingdom"])
+        self.assertEqual(body["keyword"], "AI SaaS")
+
+    def test_a_title_that_states_its_own_level_drops_the_seniority(self):
+        # Same rule as everywhere else: "Founder" AND seniority=owner is one
+        # criterion sent as two, and it is what emptied the other providers.
+        body = main.build_contactout_filters(
+            {"job_title": "Founder", "seniority": "owner"})
+
+        self.assertNotIn("seniority", body)
+
+    def test_a_seniority_outside_their_vocabulary_steps_aside(self):
+        with self.assertRaises(main.ProviderUnsupported) as caught:
+            main.build_contactout_filters(
+                {"job_title": "Account Executive", "seniority": "shaman"})
+        self.assertEqual(caught.exception.field, "seniority")
+
+    def test_vp_is_spelled_their_way(self):
+        body = main.build_contactout_filters(
+            {"job_title": "Account Executive", "seniority": "vp"})
+        self.assertEqual(body["seniority"], ["vice president"])
+
+    def test_an_unmappable_industry_steps_aside_rather_than_matching_nobody(self):
+        with self.assertRaises(main.ProviderUnsupported) as caught:
+            main.build_contactout_filters({"industry": "Salon & Spa"})
+        self.assertEqual(caught.exception.field, "industry")
+
+    def test_an_off_band_headcount_steps_aside(self):
+        with self.assertRaises(main.ProviderUnsupported) as caught:
+            main.build_contactout_filters(
+                {"job_title": "Founder", "company_size": "37-94"})
+        self.assertEqual(caught.exception.field, "company_size")
+
+    def test_every_band_we_can_emit_has_one_of_theirs(self):
+        # The frontend's COMPANY_SIZE_MAP produces exactly these labels; a band
+        # missing here is a search this leg silently sits out.
+        for band in ("1-10", "11-50", "51-200", "201-500", "501-1000",
+                     "1001-5000", "5001-10000", "10001+"):
+            with self.subTest(band=band):
+                body = main.build_contactout_filters(
+                    {"job_title": "Founder", "company_size": band})
+                self.assertTrue(body["company_size"][0])
+
+    def test_a_region_is_refused_rather_than_sent_as_a_place(self):
+        with self.assertRaises(main.ProviderUnsupported) as caught:
+            main.build_contactout_filters({"job_title": "Founder",
+                                           "location": "Europe"})
+        self.assertEqual(caught.exception.field, "location")
+
+    def test_a_country_code_becomes_a_country_name(self):
+        # classify_location hands back ISO-2; their filter is free text.
+        body = main.build_contactout_filters({"job_title": "Founder",
+                                              "location": "US"})
+        self.assertEqual(body["location"], ["United States"])
+
+    def test_a_us_state_carries_its_country(self):
+        body = main.build_contactout_filters({"job_title": "Founder",
+                                              "location": "California"})
+        self.assertEqual(body["location"], ["California, United States"])
+
+    def test_a_city_goes_through_as_written(self):
+        body = main.build_contactout_filters({"job_title": "Founder",
+                                              "location": "San Francisco"})
+        self.assertEqual(body["location"], ["San Francisco"])
+
+    def test_a_named_company_is_expressible_here(self):
+        # Fiber has to refuse this — its company identifiers are all machine
+        # keys. ContactOut takes the name, so the search stays exact.
+        body = main.build_contactout_filters({"job_title": "Founder",
+                                              "company": "Acme Corp"})
+        self.assertEqual(body["company"], ["Acme Corp"])
+        self.assertIs(body["current_company_only"], True)
+
+    def test_a_domain_wins_over_a_name(self):
+        body = main.build_contactout_filters({"job_title": "Founder",
+                                              "company": "https://acme.com"})
+        self.assertEqual(body["domain"], ["acme.com"])
+        self.assertNotIn("company", body)
+
+    def test_it_refuses_the_filters_it_has_no_field_for(self):
+        for field, value in (("technologies", ["Salesforce"]),
+                             ("intent_topics", ["Funding"]),
+                             ("revenue_min", 1_000_000),
+                             ("departments", ["Engineering"])):
+            with self.subTest(field=field):
+                with self.assertRaises(main.ProviderUnsupported) as caught:
+                    main.build_contactout_filters(
+                        {"job_title": "Founder", field: value})
+                self.assertEqual(caught.exception.field, field)
+
+
+class ContactOutSearchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_it_reads_the_url_keyed_profiles_object(self):
+        ContactOutClient.reset({("POST", "/v1/people/search"):
+                                (200, _co_page(["ada", "grace"], total=2))})
+        with patch.object(main.httpx, "AsyncClient", ContactOutClient), _co():
+            data = await main.contactout_person_search({"job_title": "Founder"}, 6)
+
+        self.assertEqual(len(data["profiles"]), 2)
+        self.assertEqual(data["total"], 2)
+
+    async def test_the_url_is_copied_onto_the_row_it_keys(self):
+        # The URL is the object key, so it lives outside the profile. Without
+        # this the seen ledger cannot identify the person and the same row
+        # comes back as new on every search — the defect three legs already had.
+        ContactOutClient.reset({("POST", "/v1/people/search"):
+                                (200, _co_page(["ada"]))})
+        with patch.object(main.httpx, "AsyncClient", ContactOutClient), _co():
+            data = await main.contactout_person_search({"job_title": "Founder"}, 6)
+
+        row = data["profiles"][0]
+        self.assertEqual(row["linkedin_url"], "https://linkedin.com/in/ada")
+        self.assertTrue(main._profile_lead_key(row))
+
+    async def test_an_empty_result_is_an_array_not_an_object(self):
+        # Their miss shape. Reading it as a dict raises and takes the leg down.
+        ContactOutClient.reset({("POST", "/v1/people/search"): (200, {
+            "status_code": 200,
+            "metadata": {"page": 1, "page_size": 25, "total_results": 0},
+            "profiles": [],
+        })})
+        with patch.object(main.httpx, "AsyncClient", ContactOutClient), _co():
+            data = await main.contactout_person_search({"job_title": "Founder"}, 6)
+
+        self.assertEqual(data["profiles"], [])
+        self.assertIsNone(data["next_page"])
+
+    async def test_the_token_travels_in_the_header_not_the_query(self):
+        ContactOutClient.reset({("POST", "/v1/people/search"):
+                                (200, _co_page([]))})
+        with patch.object(main.httpx, "AsyncClient", ContactOutClient), _co():
+            await main.contactout_person_search({"job_title": "Founder"}, 6)
+
+        _, _, params, body, headers = ContactOutClient.calls[0]
+        self.assertEqual(headers["token"], "co_key")
+        self.assertIsNone(params)
+        self.assertNotIn("token", body)
+
+    async def test_search_never_spends_an_email_credit(self):
+        ContactOutClient.reset({("POST", "/v1/people/search"):
+                                (200, _co_page(["ada"]))})
+        with patch.object(main.httpx, "AsyncClient", ContactOutClient), _co():
+            await main.contactout_person_search({"job_title": "Founder"}, 6)
+
+        _, _, _, body, _ = ContactOutClient.calls[0]
+        self.assertIs(body["reveal_info"], False)
+
+    async def test_it_asks_for_exactly_the_shortfall(self):
+        # A search credit per profile returned, so an over-fetch is money.
+        ContactOutClient.reset({("POST", "/v1/people/search"):
+                                (200, _co_page(["ada"]))})
+        with patch.object(main.httpx, "AsyncClient", ContactOutClient), _co():
+            await main.contactout_person_search({"job_title": "Founder"}, 4)
+
+        self.assertEqual(ContactOutClient.calls[0][3]["page_size"], 4)
+
+    async def test_the_page_size_is_capped_at_their_ceiling(self):
+        ContactOutClient.reset({("POST", "/v1/people/search"):
+                                (200, _co_page([]))})
+        with patch.object(main.httpx, "AsyncClient", ContactOutClient), _co():
+            await main.contactout_person_search({"job_title": "Founder"}, 500)
+
+        self.assertEqual(ContactOutClient.calls[0][3]["page_size"],
+                         main.CONTACTOUT_MAX_PAGE)
+
+    async def test_there_is_a_next_page_while_the_total_says_so(self):
+        ContactOutClient.reset({("POST", "/v1/people/search"):
+                                (200, _co_page(["a", "b"], total=40,
+                                               page=1, page_size=2))})
+        with patch.object(main.httpx, "AsyncClient", ContactOutClient), _co():
+            data = await main.contactout_person_search({"job_title": "Founder"}, 2)
+
+        self.assertEqual(data["next_page"], 2)
+
+    async def test_the_last_page_has_no_next(self):
+        ContactOutClient.reset({("POST", "/v1/people/search"):
+                                (200, _co_page(["a", "b"], total=2,
+                                               page=1, page_size=2))})
+        with patch.object(main.httpx, "AsyncClient", ContactOutClient), _co():
+            data = await main.contactout_person_search({"job_title": "Founder"}, 2)
+
+        self.assertIsNone(data["next_page"])
+
+    async def test_out_of_credits_is_an_empty_page_not_an_exception(self):
+        ContactOutClient.reset({("POST", "/v1/people/search"):
+                                (403, {"message": "You're out of credits"})})
+        with patch.object(main.httpx, "AsyncClient", ContactOutClient), _co():
+            data = await main.contactout_person_search({"job_title": "Founder"}, 6)
+
+        self.assertEqual(data["profiles"], [])
+
+    async def test_a_rejected_filter_steps_aside_instead_of_failing_the_search(self):
+        # Their 400/401 pair is documented the other way round from the usual
+        # convention, so the message is what says which it was. When it names a
+        # filter we sent, this is "we cannot express that" — which is the
+        # chain's cue to move on, not an outage to report to the caller.
+        ContactOutClient.reset({("POST", "/v1/people/search"):
+                                (401, {"message": "Invalid seniority value"})})
+        with patch.object(main.httpx, "AsyncClient", ContactOutClient), _co():
+            with self.assertRaises(main.ProviderUnsupported) as caught:
+                await main.contactout_person_search(
+                    {"job_title": "Account Executive", "seniority": "director"}, 6)
+
+        self.assertEqual(caught.exception.field, "seniority")
+
+    async def test_bad_credentials_are_not_mistaken_for_a_bad_filter(self):
+        ContactOutClient.reset({("POST", "/v1/people/search"):
+                                (400, {"message": "Bad credentials"})})
+        with patch.object(main.httpx, "AsyncClient", ContactOutClient), _co():
+            data = await main.contactout_person_search({"job_title": "Founder"}, 6)
+
+        self.assertEqual(data["profiles"], [])
+
+
+class ContactOutTransformTests(unittest.TestCase):
+    def test_the_documented_row_shape_maps_across(self):
+        lead = main.transform_contactout_profile({
+            **_co_profile("ada-lovelace"),
+            "linkedin_url": "https://linkedin.com/in/ada-lovelace",
+        })
+
+        self.assertEqual(lead["contact_name"], "Ada Lovelace")
+        self.assertEqual(lead["first_name"], "Ada")
+        self.assertEqual(lead["last_name"], "Lovelace")
+        self.assertEqual(lead["job_title"], "Founder")
+        self.assertEqual(lead["company_name"], "Acme")
+        self.assertEqual(lead["company_domain"], "acme.com")
+        self.assertEqual(lead["industry"], "Computer Software")
+        self.assertEqual(lead["linkedin_url"], "https://linkedin.com/in/ada-lovelace")
+        self.assertEqual(lead["provider"], "contactout")
+
+    def test_search_rows_carry_no_contact_details(self):
+        lead = main.transform_contactout_profile(_co_profile())
+
+        self.assertIsNone(lead["business_email"])
+        self.assertIsNone(lead["phone"])
+        # What a reveal would find is still worth saying, and is not the same
+        # thing as having it.
+        self.assertIs(lead["email_available"], True)
+        self.assertIs(lead["phone_available"], False)
+
+    def test_a_row_that_already_carries_an_address_keeps_it(self):
+        # reveal_info is false on search, but the same transform reads a row
+        # from a reveal, and paying twice for one address is not a saving.
+        lead = main.transform_contactout_profile(_co_profile(contact_info={
+            "work_emails": ["ada@acme.com"],
+            "emails": ["ada@gmail.com", "ada@acme.com"],
+            "phones": ["+15551234"],
+        }))
+
+        self.assertEqual(lead["business_email"], "ada@acme.com")
+        self.assertEqual(lead["phone"], "+15551234")
+
+    def test_the_vanity_slug_rebuilds_a_missing_url(self):
+        lead = main.transform_contactout_profile(_co_profile("ada"))
+        self.assertEqual(lead["linkedin_url"], "https://www.linkedin.com/in/ada")
+
+
+class ContactOutRevealTests(unittest.IsolatedAsyncioTestCase):
+    async def test_it_asks_for_work_emails_by_name(self):
+        # Their docs: real-time work-email verification only runs when
+        # email_type is explicit, and without it personal addresses come back
+        # too — dearer, and worth less for B2B outbound.
+        ContactOutClient.reset({("GET", "/v1/people/linkedin"): (200, {
+            "status_code": 200,
+            "profile": {"url": "https://linkedin.com/in/ada",
+                        "work_email": ["ada@acme.com"],
+                        "work_email_status": {"ada@acme.com": "Verified"},
+                        "phone": ["+15551234"]},
+        })})
+        with patch.object(main.httpx, "AsyncClient", ContactOutClient), _co():
+            contact = await main.contactout_reveal(
+                "https://linkedin.com/in/ada", want_phone=True)
+
+        _, _, params, _, _ = ContactOutClient.calls[0]
+        self.assertEqual(params["email_type"], "work")
+        self.assertEqual(params["include_phone"], "true")
+        self.assertEqual(contact["email"], "ada@acme.com")
+        self.assertEqual(contact["email_status"], "verified")
+        self.assertEqual(contact["phone"], "+15551234")
+
+    async def test_a_phone_is_only_asked_for_when_wanted(self):
+        ContactOutClient.reset({("GET", "/v1/people/linkedin"):
+                                (200, {"profile": {"work_email": ["a@b.com"]}})})
+        with patch.object(main.httpx, "AsyncClient", ContactOutClient), _co():
+            await main.contactout_reveal("https://linkedin.com/in/ada")
+
+        self.assertNotIn("include_phone", ContactOutClient.calls[0][2])
+
+    async def test_their_404_is_nothing_found_not_a_failure(self):
+        ContactOutClient.reset({("GET", "/v1/people/linkedin"):
+                                (404, {"status_code": 404, "message": "Not Found"})})
+        with patch.object(main.httpx, "AsyncClient", ContactOutClient), _co():
+            self.assertEqual(
+                await main.contactout_reveal("https://linkedin.com/in/ada"), {})
+
+
+class ContactOutVerifyTests(unittest.IsolatedAsyncioTestCase):
+    async def run_verify(self, status, payload):
+        ContactOutClient.reset({("GET", "/v1/email/verify"): (status, payload)})
+        with patch.object(main.httpx, "AsyncClient", ContactOutClient), _co():
+            return await main.contactout_verify_email("ada@acme.com")
+
+    async def test_valid_is_sendable(self):
+        verdict = await self.run_verify(200, {"data": {"status": "valid"}})
+        self.assertEqual(verdict["status"], "deliverable")
+        self.assertIs(verdict["sendable"], True)
+
+    async def test_a_catch_all_is_a_real_answer_and_not_a_sendable_one(self):
+        verdict = await self.run_verify(200, {"data": {"status": "accept_all"}})
+        self.assertEqual(verdict["status"], "risky")
+        self.assertIs(verdict["sendable"], False)
+        self.assertIs(verdict["catch_all"], True)
+
+    async def test_out_of_credits_says_so_rather_than_guessing(self):
+        verdict = await self.run_verify(403, {"message": "out of credits"})
+        self.assertEqual(verdict["status"], "unknown")
+        self.assertIsNone(verdict["sendable"])
+        self.assertIn("credits", verdict["reason"])
+
+
+class ContactOutChainTests(unittest.TestCase):
+    def test_it_sits_in_the_per_profile_tier_behind_fiber(self):
+        order = list(main.PROVIDER_ORDER)
+
+        self.assertGreater(order.index("contactout"), order.index("fiber"))
+        self.assertLess(order.index("contactout"), order.index("coldiq"))
+        self.assertLess(order.index("contactout"), order.index("wiza"))
+
+    def test_no_key_removes_it_rather_than_breaking_the_chain(self):
+        with patch.object(main.settings, "bytemine_api_key", "b"), \
+             patch.object(main.settings, "contactout_api_key", None), \
+             patch.object(main.settings, "search_provider", "bytemine"):
+            self.assertNotIn("contactout", main.provider_chain())
+
+    def test_a_key_is_all_it_takes(self):
+        with patch.object(main.settings, "bytemine_api_key", "b"), \
+             patch.object(main.settings, "contactout_api_key", "co"), \
+             patch.object(main.settings, "search_provider", "bytemine"):
+            self.assertIn("contactout", main.provider_chain())
+
+    def test_a_pasted_key_with_a_trailing_space_still_builds_a_header(self):
+        stripped = main.Settings(database_url="postgresql://x",
+                                 contactout_api_key="co_key ")
+        self.assertEqual(stripped.contactout_api_key, "co_key")
+
+
+class ContactOutRepeatLeadTests(unittest.IsolatedAsyncioTestCase):
+    """The reason this leg is in the chain: it can go and look further in.
+
+    Every leg but GetLeads answers the same top rows for the same ICP, so once
+    the seen ledger has removed them the user is handed an empty page while the
+    provider still bills for what it returned. ContactOut pages by number, so a
+    fully-seen page is a reason to ask for the next one.
+    """
+
+    def _pages(self, pages):
+        """Stub contactout_person_search: a dict of page number -> rows."""
+        asked: list = []
+
+        async def search(params, limit, page=1):
+            asked.append(page)
+            rows = pages.get(page, [])
+            return {"profiles": rows,
+                    "total": sum(len(p) for p in pages.values()),
+                    "next_page": page + 1 if page + 1 in pages else None}
+
+        return search, asked
+
+    async def run_search(self, request, pages):
+        search, asked = self._pages(pages)
+
+        async def no_cache(_hash):
+            return None
+
+        async def no_store(*args, **kwargs):
+            return None
+
+        patches = [
+            patch.object(main.settings, "contactout_api_key", "co_key"),
+            patch.object(main, "provider_chain", lambda: ("contactout",)),
+            patch.object(main, "contactout_person_search", search),
+            patch.object(main, "cache_lookup", no_cache),
+            patch.object(main, "cache_store", no_store),
+        ]
+        for p in patches:
+            p.start()
+        try:
+            return await main.search_leads(request), asked
+        finally:
+            for p in patches:
+                p.stop()
+
+    def _row(self, slug):
+        return {**_co_profile(slug),
+                "linkedin_url": f"https://www.linkedin.com/in/{slug}"}
+
+    async def test_a_fully_seen_page_pages_forward_instead_of_returning_nothing(self):
+        response, asked = await self.run_search(
+            main.SearchRequest(
+                job_title="Founder", industry="computer software", limit=2,
+                exclude_profiles=["https://www.linkedin.com/in/ada",
+                                  "https://www.linkedin.com/in/bob"]),
+            {1: [self._row("ada"), self._row("bob")],
+             2: [self._row("cleo"), self._row("dev")]},
+        )
+
+        self.assertEqual(asked, [1, 2])
+        self.assertEqual([lead["linkedin_url"] for lead in response.leads],
+                         ["https://www.linkedin.com/in/cleo",
+                          "https://www.linkedin.com/in/dev"])
+
+    async def test_a_page_of_new_people_costs_exactly_one_call(self):
+        response, asked = await self.run_search(
+            main.SearchRequest(job_title="Founder", industry="computer software",
+                               limit=2),
+            {1: [self._row("ada"), self._row("bob")],
+             2: [self._row("cleo")]},
+        )
+
+        self.assertEqual(asked, [1])
+        self.assertEqual(len(response.leads), 2)
+
+    async def test_paging_is_bounded_rather_than_walking_their_index(self):
+        seen = [f"https://www.linkedin.com/in/p{i}" for i in range(20)]
+        pages = {i: [self._row(f"p{i}")] for i in range(1, 20)}
+
+        _, asked = await self.run_search(
+            main.SearchRequest(job_title="Founder", industry="computer software",
+                               limit=1, exclude_profiles=seen),
+            pages,
+        )
+
+        self.assertEqual(len(asked), main.CONTACTOUT_MAX_PAGES)
+
+    async def test_running_out_of_rows_stops_the_walk(self):
+        response, asked = await self.run_search(
+            main.SearchRequest(job_title="Founder", industry="computer software",
+                               limit=2,
+                               exclude_profiles=["https://www.linkedin.com/in/ada"]),
+            {1: [self._row("ada")]},
+        )
+
+        self.assertEqual(asked, [1])
+        self.assertEqual(response.leads, [])
+
+    async def test_the_next_page_number_comes_back_as_this_leg_s_cursor(self):
+        # So the following request resumes where this one stopped rather than
+        # paying for the same rows again.
+        response, _ = await self.run_search(
+            main.SearchRequest(job_title="Founder", industry="computer software",
+                               limit=2),
+            {1: [self._row("ada"), self._row("bob")],
+             2: [self._row("cleo")]},
+        )
+
+        self.assertEqual(main.decode_cursors(response.next_cursor, ["contactout"]),
+                         {"contactout": "2"})
+
+
+class ContactOutVerifierOrderTests(unittest.IsolatedAsyncioTestCase):
+    async def test_it_is_asked_after_fiber_and_before_findymail(self):
+        asked: list = []
+
+        async def unknown(email):
+            return {"status": "unknown", "sendable": None, "checked_by": "coldiq",
+                    "reason": "coldiq out of credits"}
+
+        def recorder(name, verdict):
+            async def check(email):
+                asked.append(name)
+                return verdict
+            return check
+
+        with patch.object(main, "coldiq_verify_email", unknown), \
+             patch.object(main, "fiber_verify_email", recorder("fiber", {
+                 "status": "unknown", "sendable": None, "checked_by": "fiber"})), \
+             patch.object(main, "contactout_verify_email", recorder("contactout", {
+                 "status": "deliverable", "sendable": True,
+                 "checked_by": "contactout"})), \
+             patch.object(main, "findymail_verify_email", recorder("findymail", {
+                 "status": "deliverable", "sendable": True,
+                 "checked_by": "findymail"})), \
+             patch.object(main, "provider_configured", lambda n: True):
+            lead = await main.verify_revealed_lead(
+                {"business_email": "ada@acme.com"}, "wiza")
+
+        self.assertEqual(asked, ["fiber", "contactout"])
+        self.assertEqual(lead["email_verification"]["checked_by"], "contactout")
+
+
 if __name__ == "__main__":
     unittest.main()
