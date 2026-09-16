@@ -55,6 +55,7 @@ class Settings(BaseSettings):
     # Keep this org-scoped token on the backend: it pays for every customer.
     findymail_api_key: Optional[str] = None
     fiber_api_key: Optional[str] = None
+    contactout_api_key: Optional[str] = None
     treg_token: Optional[str] = None
     treg_org_id: Optional[str] = None
     treg_base_url: str = "https://treg.to"
@@ -172,8 +173,14 @@ TREG_META_VALUE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 # LinkedIn's own vocabulary, and it pages by cursor rather than offset. It is
 # billed per profile returned, like getleads, so it goes after the cheaper
 # masked-search providers and ahead of the per-record reveal tools.
-PROVIDER_ORDER = ("bytemine", "crustdata", "getleads", "fiber", "treg",
-                  "coldiq", "findymail", "wiza")
+# contactout sits with fiber in that same per-profile tier and behind it,
+# because fiber is the leg already carrying these searches. It is here at all
+# for the one thing only getleads could do before: page forward. Every other
+# leg answers the same top rows for the same ICP, so once the seen ledger has
+# removed them there is nothing left to show; contactout can walk to the next
+# page and find people this searcher has not met.
+PROVIDER_ORDER = ("bytemine", "crustdata", "getleads", "fiber", "contactout",
+                  "treg", "coldiq", "findymail", "wiza")
 
 
 def provider_configured(name: str) -> bool:
@@ -192,6 +199,8 @@ def provider_configured(name: str) -> bool:
         return bool(settings.findymail_api_key)
     if name == "fiber":
         return bool(settings.fiber_api_key)
+    if name == "contactout":
+        return bool(settings.contactout_api_key)
     if name == "wiza":
         return bool(settings.wiza_api_key)
     return False
@@ -3746,6 +3755,490 @@ async def fiber_verify_email(email: str) -> dict:
 
 
 # =============================================================================
+# ContactOut  (https://api.contactout.com)
+# =============================================================================
+#
+# The broadest single filter set in the chain: title, seniority, industry,
+# headcount, location, named company or domain, and free-text keyword all in
+# one request — and, unlike most legs here, real numbered paging.
+#
+# That last part is why it is worth having. The repeat-lead defect this file
+# has been chasing for weeks has one shape: a provider with no offset answers
+# the same top rows for the same ICP, the seen ledger removes them, and the
+# user is handed nothing. Only GetLeads could walk past that. ContactOut can
+# too, one page of up to 25 at a time, so a search whose first page is entirely
+# people this searcher has met already can go and find the ones they have not.
+#
+# Cost: 1 search credit per profile *returned*, so page_size is always exactly
+# what is still missing from the page, never a speculative over-fetch. Contact
+# details are a separate, separately billed call — reveal_info stays false on
+# search, exactly as Bytemine, Crustdata and Fiber keep search and reveal
+# apart. Email and phone credits are only spent by contactout_reveal.
+
+CONTACTOUT_BASE = "https://api.contactout.com"
+
+# Their hard ceiling on page_size; the API rejects anything above it.
+CONTACTOUT_MAX_PAGE = 25
+
+# How far this leg will page looking for people this searcher has not been
+# shown. Bounded for the same reason GetLeads is: every page is a round trip
+# and every returned profile is a credit, so a fully-seen page depth is a real
+# "nothing new here" answer rather than a reason to walk their whole index.
+CONTACTOUT_MAX_PAGES = 3
+
+# Their seniority vocabulary, keyed by our canonical levels rather than by the
+# raw words a parser might emit — _canonical_seniority already folds "cxo",
+# "c-suite", "chief" and "executive" onto one key, and doing that fold twice in
+# two places is how the spellings drift apart.
+#
+# "vice president" rather than "vp" is from their own documented example; the
+# rest follow LinkedIn's seniority tiers, which is the vocabulary their filter
+# is built on. A level with no entry here is refused rather than guessed at: an
+# enum value they do not recognise either 400s the whole leg or matches nobody,
+# and both read from the outside as "ContactOut has no such people".
+_CO_SENIORITY = {
+    "owner": "owner",
+    "partner": "partner",
+    "c_suite": "c-level",
+    "vp": "vice president",
+    "director": "director",
+    "manager": "manager",
+    "senior": "senior",
+    "junior": "entry",
+}
+
+# Their headcount bands, which are LinkedIn's, spelled with underscores.
+# Exact-match only: our labels come from one fixed list (see COMPANY_SIZE_MAP
+# in the frontend's icp-vocab), and a band that is not one of theirs cannot be
+# expressed without widening the ICP the user stated.
+_CO_COMPANY_SIZE = {
+    "1-10": "1_10", "11-50": "11_50", "51-200": "51_200",
+    "201-500": "201_500", "501-1000": "501_1000",
+    "1001-5000": "1001_5000", "5001-10000": "5001_10000",
+    "10001+": "10001",
+}
+
+
+def contactout_seniority(value: str) -> Optional[str]:
+    """ContactOut's spelling of a seniority level, or None when it has no tier."""
+    return _CO_SENIORITY.get(_canonical_seniority(value))
+
+
+def contactout_industry(value: str) -> Optional[str]:
+    """ContactOut's spelling of an industry, or None when it is not one of theirs.
+
+    Their documented examples — "Computer Software", "Computer Networking" —
+    are classic LinkedIn industry names, the same vocabulary Bytemine and
+    Crustdata use, not the current one Fiber and GetLeads are on.
+    """
+    return linkedin_industry(value)
+
+
+async def contactout_call(method: str, path: str, *, params: dict = None,
+                          body: dict = None) -> tuple:
+    """Call ContactOut. Returns (status_code, parsed body or None).
+
+    The token travels in the `token` header, never in a query string: this
+    file logs every request it makes, and a credential in a URL is a
+    credential in the Railway logs.
+
+    Returns rather than raises on 403 and 429 — out of credits and rate
+    limited are states of the account, not failures of this request, and a leg
+    that raises on them takes the whole search down with it.
+    """
+    headers = {
+        "token": settings.contactout_api_key or "",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    printable = json.dumps(body)[:400] if body is not None else json.dumps(params or {})
+    print(f"ContactOut {method} {path}: {printable}")
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.request(method, f"{CONTACTOUT_BASE}{path}",
+                                        headers=headers, params=params, json=body)
+    except httpx.HTTPError as exc:
+        print(f"ContactOut {path} unreachable: {exc}")
+        return 0, None
+
+    if resp.status_code != 200:
+        print(f"ContactOut {path} status: {resp.status_code} {resp.text[:300]}")
+    try:
+        return resp.status_code, resp.json()
+    except ValueError:
+        return resp.status_code, None
+
+
+def build_contactout_filters(p: dict) -> dict:
+    """Translate internal search params into a ContactOut /people/search body.
+
+    Raises ProviderUnsupported for a filter their people index has no field
+    for, so the chain reaches a provider that does rather than searching
+    without it.
+    """
+    body: dict = {}
+
+    # No technology, intent-signal or revenue filters on their people index.
+    # `departments` looks like it should map onto job_function, but their
+    # accepted values are a fixed enum we have not been given, and sending a
+    # function they do not recognise is the silent-empty-search failure this
+    # whole file is built to avoid.
+    refuse_unexpressible(p, "technologies", "intent_topics",
+                         "revenue_min", "revenue_max", "departments")
+
+    if p.get("job_title"):
+        body["job_title"] = [p["job_title"]]
+        # Their default is current roles only, which is what an ICP means.
+        body["current_titles_only"] = True
+
+    # See title_supersedes_seniority: a title that already states a level makes
+    # the seniority filter an AND against the same criterion, which is what
+    # emptied Bytemine and Crustdata searches for "Founder" + Owner.
+    if p.get("seniority") and not title_supersedes_seniority(
+            p.get("job_title"), p["seniority"]):
+        level = contactout_seniority(p["seniority"])
+        if not level:
+            raise ProviderUnsupported("seniority", p["seniority"])
+        body["seniority"] = [level]
+
+    if p.get("industry"):
+        mapped = contactout_industry(p["industry"])
+        if not mapped:
+            raise ProviderUnsupported("industry", p["industry"])
+        body["industry"] = [mapped]
+
+    if p.get("company_size"):
+        band = _CO_COMPANY_SIZE.get(str(p["company_size"]).strip())
+        if not band:
+            raise ProviderUnsupported("company_size", p["company_size"])
+        body["company_size"] = [band]
+
+    # A domain is the exact constraint; a name is the fuzzy one. Unlike Fiber,
+    # ContactOut takes both, so a company we only know by name is still
+    # expressible here rather than refused.
+    company = p.get("company")
+    domain = p.get("company_domain")
+    if company and not domain and looks_like_domain(company):
+        domain, company = company, None
+    if domain:
+        body["domain"] = [domain_host(domain) or domain]
+    elif company:
+        body["company"] = [company]
+        body["current_company_only"] = True
+
+    location = p.get("location") or p.get("company_location")
+    if location:
+        kind, value = classify_location(str(location))
+        if kind == "country":
+            name = _GL_COUNTRY_NAME.get(value)
+            if not name:
+                raise ProviderUnsupported("location", location)
+            body["location"] = [name]
+        elif kind == "state":
+            body["location"] = [
+                f"{_US_STATE_CODE_TO_NAME.get(value, value)}, United States"]
+        elif kind == "city":
+            body["location"] = [str(location)]
+        else:
+            # A continent or a two-letter token that is neither a state nor a
+            # country. Their location filter is a place, not a bloc.
+            raise ProviderUnsupported("location", location)
+
+    # Their keyword field searches the whole profile, which is where a segment
+    # phrase like "AI SaaS" is actually written — no industry taxonomy has it.
+    segment = p.get("keywords") or p.get("semantic_keywords")
+    if segment:
+        body["keyword"] = str(segment)
+
+    if not body:
+        raise HTTPException(status_code=400, detail="At least one search parameter required")
+    return body
+
+
+def contactout_profile_rows(payload: dict) -> list:
+    """Flatten their profiles envelope into a list of rows.
+
+    Two shapes from the same endpoint: on a hit `profiles` is an *object keyed
+    by LinkedIn URL*, and on a miss it is an empty *array*. Reading the hit
+    shape as a list yields the URLs and none of the people; reading the miss
+    shape as a dict raises. Both are handled here, once.
+
+    The URL is the key, so it lives outside the profile object — and a row that
+    does not carry its own LinkedIn URL is a row the seen ledger cannot
+    identify and the merge cannot dedupe. It is copied in as `linkedin_url`,
+    which is also what `_profile_url` reads.
+    """
+    profiles = (payload or {}).get("profiles")
+    if isinstance(profiles, dict):
+        rows = []
+        for url, row in profiles.items():
+            if not isinstance(row, dict):
+                continue
+            rows.append({**row, "linkedin_url": row.get("linkedin_url") or url})
+        return rows
+    if isinstance(profiles, list):
+        return [r for r in profiles if isinstance(r, dict)]
+    return []
+
+
+async def contactout_person_search(params: dict, limit: int, page: int = 1) -> dict:
+    """Search ContactOut for people. Billed per profile returned.
+
+    `page_size` is exactly what the caller still needs, capped at their
+    ceiling of 25 — every profile that comes back is a search credit, so there
+    is no such thing as a harmless over-fetch here.
+    """
+    body = build_contactout_filters(params)
+    body["page"] = max(int(page or 1), 1)
+    body["page_size"] = max(min(int(limit or 10), CONTACTOUT_MAX_PAGE), 1)
+    # Explicit rather than relying on their default: contact details are a
+    # separate call with a separate credit pool, and a default that flips
+    # spends the customer's email credits on every search.
+    body["reveal_info"] = False
+
+    status, data = await contactout_call("POST", "/v1/people/search", body=body)
+
+    if status != 200 or not isinstance(data, dict):
+        # Their 400/401 pair is documented the other way round from the usual
+        # convention, so neither status alone says whether this was the
+        # credentials or the request. The message does: when it names a filter
+        # we actually sent, this leg cannot express that filter and should step
+        # aside rather than take its bad request to the caller as an outage.
+        message = str((data or {}).get("message") or "").lower() if isinstance(data, dict) else ""
+        if status in (400, 401) and message:
+            for field in ("seniority", "industry", "company_size", "job_title",
+                          "location", "keyword", "domain", "company"):
+                if field in message and field in body:
+                    raise ProviderUnsupported(field, body[field])
+        if status == 403:
+            print("ContactOut is out of credits or the endpoint is not enabled "
+                  "for this token — skipping this leg")
+        return {"profiles": [], "total": 0, "next_page": None}
+
+    rows = contactout_profile_rows(data)
+    metadata = data.get("metadata") or {}
+    total = int(metadata.get("total_results") or len(rows))
+    page_now = int(metadata.get("page") or body["page"])
+    # They report no page count, so "is there another page" is arithmetic on
+    # what has been walked so far rather than a flag to trust.
+    next_page = page_now + 1 if rows and page_now * body["page_size"] < total else None
+    print(f"ContactOut returned {len(rows)} profile(s) on page {page_now} of ~{total}")
+    return {"profiles": rows, "total": total, "next_page": next_page}
+
+
+def transform_contactout_profile(row: dict, search_params: dict = None) -> dict:
+    """Map one ContactOut profile onto our lead shape.
+
+    Search runs with reveal_info false, so there is no email or phone here —
+    `contact_availability` says whether a reveal would find one, which is worth
+    surfacing and is not the same thing as having it.
+    """
+    del search_params  # their ranking orders the page; we do not re-score it
+    company = row.get("company") or {}
+    available = row.get("contact_availability") or {}
+    # reveal_info=false on search, but the same transform reads a row that came
+    # back from a reveal path, and dropping an address that is already paid for
+    # would mean paying for it twice.
+    contact = row.get("contact_info") or {}
+    work = contact.get("work_emails") or []
+    emails = work or contact.get("emails") or []
+    phones = contact.get("phones") or []
+
+    name = row.get("full_name")
+    first, last = None, None
+    if name:
+        parts = name.split()
+        if len(parts) >= 2:
+            first, last = parts[0], " ".join(parts[1:])
+        elif parts:
+            first = parts[0]
+
+    vanity = row.get("li_vanity")
+    linkedin_url = row.get("linkedin_url") or (
+        f"https://www.linkedin.com/in/{vanity}" if vanity else None)
+
+    return {
+        "contact_name": name,
+        "first_name": first,
+        "last_name": last,
+        "job_title": row.get("title") or row.get("headline"),
+        "seniority": row.get("seniority"),
+        "company_name": company.get("name"),
+        "company_domain": domain_host(company.get("domain") or "") or None,
+        "industry": company.get("industry") or row.get("industry"),
+        "location": row.get("location") or row.get("country"),
+        "linkedin_url": linkedin_url,
+        "contact_linkedin_url": linkedin_url,
+        "headline": row.get("headline"),
+        "business_email": emails[0] if emails else None,
+        "email": emails[0] if emails else None,
+        "email_available": (available.get("work_email")
+                            if "work_email" in available else None),
+        "phone": phones[0] if phones else None,
+        "phone_type": None,
+        "phone_available": (available.get("phone")
+                            if "phone" in available else None),
+        "score": None,
+        "provider": "contactout",
+    }
+
+
+async def contactout_reveal(linkedin_url: str, want_phone: bool = False) -> dict:
+    """Reveal a work email (and optionally a phone) from a LinkedIn URL.
+
+    `email_type=work` is sent deliberately: their docs say real-time work-email
+    verification only runs when it is explicitly asked for, and without it the
+    call also returns personal addresses — dearer, and worth less for B2B
+    outbound.
+    """
+    if not linkedin_url:
+        return {}
+
+    params = {"profile": linkedin_url, "email_type": "work"}
+    if want_phone:
+        params["include_phone"] = "true"
+    status, data = await contactout_call("GET", "/v1/people/linkedin", params=params)
+    # 404 is their "we have nothing for this person", not an error.
+    if status != 200 or not isinstance(data, dict):
+        return {}
+
+    # Their empty shape for the profile endpoints is `"profile": []` — an
+    # array where the hit is an object, the same trap the search envelope sets.
+    profile = data.get("profile")
+    if not isinstance(profile, dict):
+        return {}
+    return _contactout_contact(profile)
+
+
+def _contactout_contact(profile: dict) -> dict:
+    """Pull our reveal shape out of one of their profile objects.
+
+    Shared because their profile endpoints disagree with themselves about
+    casing: the People Enrich example is snake_case and array-valued
+    (`work_email: [...]`), while that same endpoint's response *table*
+    describes camelCase scalars (`workEmail`), which is what the email-enrich
+    endpoint actually returns. Reading only one spelling means a reveal that
+    was paid for and then discarded, so both are read here, once.
+    """
+    def first(*keys):
+        for key in keys:
+            value = profile.get(key)
+            if isinstance(value, list):
+                if value:
+                    return value[0]
+            elif value:
+                return value
+        return None
+
+    email = first("work_email", "workEmail", "email")
+    phone = first("phone")
+
+    # Verification status arrives either as a dict keyed by address or as a
+    # bare word, depending on which endpoint answered.
+    statuses = profile.get("work_email_status")
+    verified = profile.get("workEmailStatus")
+    if email and isinstance(statuses, dict):
+        verified = statuses.get(email)
+    verified = str(verified or "").strip().lower() or None
+
+    return {
+        "name": first("full_name", "fullName"),
+        "email": email,
+        "email_status": verified,
+        "phone": phone,
+        "phone_type": None,
+    }
+
+
+async def contactout_enrich(request) -> dict:
+    """Reveal from whatever identifiers the caller has, not just a URL.
+
+    Most reveals in this product do not arrive with a LinkedIn URL — they
+    arrive as a name and a company, which is the shape ColdIQ and Wiza catch.
+    Their contact-info endpoint cannot answer that; this one can.
+
+    Kept behind the URL path rather than replacing it: a reveal keyed on a URL
+    costs an email credit here and an email credit *plus a search credit*
+    there, so the cheaper call goes first and this one picks up what it cannot
+    take.
+    """
+    payload: dict = {}
+    if request.linkedin_url:
+        payload["linkedin_url"] = request.linkedin_url
+    if request.email:
+        payload["email"] = request.email
+    if request.full_name:
+        payload["full_name"] = request.full_name
+    if request.company:
+        payload["company"] = [request.company]
+    if request.company_domain:
+        payload["company_domain"] = [domain_host(request.company_domain)
+                                     or request.company_domain]
+
+    # Their documented matching rule: one primary identifier, or a name plus at
+    # least one secondary. Checked before the call rather than after, because a
+    # request that cannot match is a round trip that can only return 404 —
+    # and while this endpoint bills on a hit, the latency is spent either way.
+    primary = any(payload.get(k) for k in ("linkedin_url", "email", "phone"))
+    secondary = any(payload.get(k) for k in ("company", "company_domain",
+                                             "location", "education"))
+    if not primary and not (payload.get("full_name") and secondary):
+        return {}
+
+    # Contact details are opt-in on this endpoint and cost nothing when left
+    # out — which would make the whole call pointless here. Work emails only:
+    # this is B2B outbound.
+    payload["include"] = ["work_email", "phone"]
+
+    status, data = await contactout_call("POST", "/v1/people/enrich", body=payload)
+    if status != 200 or not isinstance(data, dict):
+        return {}
+    profile = data.get("profile")
+    if not isinstance(profile, dict):
+        return {}
+    return _contactout_contact(profile)
+
+
+# Their verdict vocabulary, mapped onto ours. accept_all is a catch-all domain:
+# a real answer, and not a sendable one, so it stays distinct from "we could
+# not tell" for the same reason Fiber's "risky" does.
+_CONTACTOUT_VERDICT = {
+    "valid": ("deliverable", True),
+    "invalid": ("undeliverable", False),
+    "accept_all": ("risky", False),
+    "disposable": ("undeliverable", False),
+    "unknown": ("unknown", None),
+}
+
+
+async def contactout_verify_email(email: str) -> dict:
+    """Verify one address through ContactOut, in our shared verdict shape."""
+    status, body = await contactout_call("GET", "/v1/email/verify",
+                                         params={"email": email})
+    verdict = ((body or {}).get("data") or {}).get("status") if isinstance(body, dict) else None
+    if status != 200 or not verdict:
+        reason = ("contactout out of credits" if status == 403
+                  else "contactout rate limited" if status == 429
+                  else "contactout returned no verdict")
+        return {"status": "unknown", "sendable": None,
+                "checked_by": "contactout", "reason": reason}
+
+    mapped, sendable = _CONTACTOUT_VERDICT.get(str(verdict).lower(), ("unknown", None))
+    return {
+        "status": mapped,
+        "sendable": sendable,
+        "checked_by": "contactout",
+        "raw_status": verdict,
+        "catch_all": str(verdict).lower() == "accept_all",
+        "role_based": None,
+        "disposable": str(verdict).lower() == "disposable",
+        "free_provider": None,
+        "vendor": None,
+        "score": None,
+    }
+
+
+# =============================================================================
 # ColdIQ  (https://api.coldiq.com)
 # =============================================================================
 #
@@ -4392,7 +4885,11 @@ async def verify_revealed_lead(lead: dict, provider: str = None) -> dict:
     # ColdIQ's detail — catch-all, role-based, disposable — where Findymail
     # returns a bare boolean. Both are only reached when ColdIQ could not
     # answer; a verdict ColdIQ actually reached is never second-guessed.
+    # ContactOut sits between them: it separates a catch-all domain from a
+    # genuine mailbox, which Findymail's bare boolean cannot, but it does not
+    # report role-based or disposable the way Fiber does.
     for name, check in (("fiber", fiber_verify_email),
+                        ("contactout", contactout_verify_email),
                         ("findymail", findymail_verify_email)):
         if not (email and verdict.get("sendable") is None
                 and verdict.get("status") in ("unknown", "unverified")):
@@ -6045,6 +6542,46 @@ async def reveal_lead(request: EnrichRequest):
                 "lead": lead,
             }
 
+    # ContactOut reveals from a LinkedIn URL and, when work emails are asked
+    # for by name, runs its own real-time verification first — so the address
+    # arrives already graded, the way Fiber's does. Phones come from the same
+    # call: this leg returns early on a hit, and a cheaper reveal that silently
+    # drops the phone number the next leg would have found is not cheaper.
+    #
+    # Two endpoints, cheapest first. A LinkedIn URL goes to their contact-info
+    # call, which costs an email credit. Everything else — a name and a
+    # company, which is how most reveals in this product actually arrive —
+    # goes to their people-enrich call, which costs a search credit on top.
+    # Gating the whole leg on a URL, as this did, meant the name-and-company
+    # reveals never reached ContactOut at all.
+    if "contactout" in chain and (
+        request.linkedin_url
+        or request.email
+        or (request.full_name and (request.company or request.company_domain))
+    ):
+        if request.linkedin_url:
+            contact = await contactout_reveal(request.linkedin_url, want_phone=True)
+        else:
+            contact = await contactout_enrich(request)
+        if contact.get("email"):
+            lead = await verify_revealed_lead({
+                "contact_name": contact.get("name") or request.full_name,
+                "business_email": contact["email"],
+                "company_name": request.company,
+                "company_domain": request.company_domain,
+                "phone": contact.get("phone"),
+                "phone_type": classify_phone_type(contact.get("phone_type")),
+                "linkedin_url": request.linkedin_url,
+                "provider": "contactout",
+            }, "contactout")
+            return {
+                "success": True,
+                "provider": "contactout",
+                "enrichment_status": "complete",
+                "email_verification": lead["email_verification"],
+                "lead": lead,
+            }
+
     # Findymail last before Wiza, and worth reaching even when everything above
     # failed: it is charged only on a found email, so a miss here costs nothing.
     # It is also the natural partner to a ColdIQ lead, which can arrive as
@@ -6561,6 +7098,8 @@ async def walk_search(request: SearchRequest):
             return lambda row: transform_findymail_row(row, params)
         if name == "fiber":
             return lambda row: transform_fiber_profile(row, params)
+        if name == "contactout":
+            return lambda row: transform_contactout_profile(row, params)
         if name == "getleads":
             return lambda record: transform_getleads_contact(record)
         if name == "treg":
@@ -6849,6 +7388,82 @@ async def walk_search(request: SearchRequest):
                 found = await record_new_campaign_profiles(seen_scope, found)
 
             return found, data["total"], data.get("next_cursor")
+
+        if name == "contactout":
+            # Numbered paging, so this leg can do what only GetLeads could:
+            # keep walking until it finds people this searcher has not been
+            # shown, instead of handing back the same first page and letting
+            # the ledger empty it.
+            #
+            # Bounded at CONTACTOUT_MAX_PAGES, and each page asks for exactly
+            # the shortfall — they charge a search credit per profile returned,
+            # so the cost of looking is real and a fully-seen depth is an
+            # honest "nothing new here" rather than a reason to keep paying.
+            wanted = params.get("limit", 10)
+            page = 1
+            if provider_cursor:
+                try:
+                    page = max(int(provider_cursor), 1)
+                except (TypeError, ValueError):
+                    print(f"ContactOut: unreadable cursor {provider_cursor!r} "
+                          "— starting from the first page")
+            elif request.start_offset:
+                # No cursor yet, but the caller asked for a numbered page. Their
+                # pages are page_size wide, so the offset resolves to one.
+                page = (request.start_offset // max(min(
+                    wanted, CONTACTOUT_MAX_PAGE), 1)) + 1
+
+            seen = {i for i in (linkedin_identity(u) for u in (exclusions or [])) if i}
+            found: list = []
+            total = 0
+            next_page = None
+
+            for _ in range(CONTACTOUT_MAX_PAGES):
+                page_started = time.monotonic()
+                data = await contactout_person_search(
+                    params, max(wanted - len(found), 1), page=page)
+                page_seconds = time.monotonic() - page_started
+                rows = data["profiles"]
+                total = data["total"]
+                next_page = data.get("next_page")
+
+                fresh = rows
+                if seen:
+                    fresh = [r for r in fresh
+                             if linkedin_identity(_profile_url(r)) not in seen]
+                if campaign_keys:
+                    fresh = drop_already_seen(fresh, campaign_keys, suppressed)
+                found.extend(fresh)
+
+                if len(found) >= wanted or not rows or next_page is None:
+                    break
+
+                # Same reasoning as the GetLeads loop: the budget is checked
+                # between legs and this loop sits inside one, so a slow page
+                # here is time the legs behind it never get back.
+                left = search_seconds_left()
+                if left is not None and left < page_seconds + CHAIN_RESERVE_SECONDS:
+                    print(f"ContactOut: {int(left)}s of the search budget left "
+                          f"and a page costs about {int(page_seconds)}s — "
+                          "stopping here so the rest of the chain still runs")
+                    break
+                print(f"ContactOut: {len(rows) - len(fresh)} of {len(rows)} row(s) "
+                      f"on page {page} already seen, {len(found)}/{wanted} "
+                      f"collected — paging to {next_page}")
+                page = next_page
+
+            exhausted = not found
+            found = found[:wanted]
+            if seen_scope:
+                found = await record_new_campaign_profiles(seen_scope, found)
+            if exhausted:
+                print(f"ContactOut has no one left for this search that "
+                      f"{seen_scope or 'this searcher'} has not already been shown")
+
+            # The next page number is this leg's cursor, so the following
+            # request resumes where this one stopped rather than paying for the
+            # same rows again.
+            return found, total, (str(next_page) if next_page else None)
 
         if name == "treg":
             # Treg's routed endpoint chooses among its lead-gen providers. It
