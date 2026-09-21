@@ -56,6 +56,7 @@ class Settings(BaseSettings):
     findymail_api_key: Optional[str] = None
     fiber_api_key: Optional[str] = None
     contactout_api_key: Optional[str] = None
+    moltsets_api_key: Optional[str] = None
     treg_token: Optional[str] = None
     treg_org_id: Optional[str] = None
     treg_base_url: str = "https://treg.to"
@@ -179,8 +180,15 @@ TREG_META_VALUE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 # leg answers the same top rows for the same ICP, so once the seen ledger has
 # removed them there is nothing left to show; contactout can walk to the next
 # page and find people this searcher has not met.
-PROVIDER_ORDER = ("bytemine", "crustdata", "getleads", "fiber", "contactout",
-                  "treg", "coldiq", "findymail", "wiza")
+# moltsets sits ahead of getleads, high in the chain, on three counts that no
+# other leg has together. It is billed per *call* rather than per profile, so
+# a page of 25 costs what a page of 1 does and a miss costs nothing at all.
+# Its search rows arrive with a graded work email already on them, so a hit
+# here needs no reveal — where a Bytemine or Fiber row is a masked profile
+# that costs a second, dearer call to open. And it pages by offset, so it can
+# walk past people this searcher has already seen.
+PROVIDER_ORDER = ("bytemine", "crustdata", "moltsets", "getleads", "fiber",
+                  "contactout", "treg", "coldiq", "findymail", "wiza")
 
 
 def provider_configured(name: str) -> bool:
@@ -201,6 +209,8 @@ def provider_configured(name: str) -> bool:
         return bool(settings.fiber_api_key)
     if name == "contactout":
         return bool(settings.contactout_api_key)
+    if name == "moltsets":
+        return bool(settings.moltsets_api_key)
     if name == "wiza":
         return bool(settings.wiza_api_key)
     return False
@@ -4239,6 +4249,508 @@ async def contactout_verify_email(email: str) -> dict:
 
 
 # =============================================================================
+# MoltSets  (https://api.moltsets.com)
+# =============================================================================
+#
+# Three things make this leg different from everything else in the chain.
+#
+# It is billed **per call**, not per profile: one token for a search of up to
+# 25 people, and nothing at all for a search that matches nobody. Every other
+# leg here charges for each row it hands back, which is why they are all
+# wrapped in over-fetch arithmetic. This one is not.
+#
+# Its search rows **already carry a work email**, graded A-F for send safety.
+# A hit here is a lead that needs no reveal at all, where a Bytemine or Fiber
+# row is a masked profile that costs a second, dearer call to open.
+#
+# And it has a real `offset`, so — like GetLeads and ContactOut — it can walk
+# past the people this searcher has already been shown rather than returning
+# the same top rows and letting the ledger empty the page.
+#
+# Against that: a Fair Use policy with rolling 5-hour and 1-week *record*
+# windows, so the thing to conserve here is rows returned, not money.
+
+MOLTSETS_BASE = "https://api.moltsets.com/api/v1/tools"
+
+# Their hard ceiling on `limit`.
+MOLTSETS_MAX_PAGE = 25
+
+# How far this leg will page looking for someone new. Same bound and the same
+# reasoning as GetLeads and ContactOut: every page is a round trip, and rows
+# returned come out of a Fair Use window.
+MOLTSETS_MAX_PAGES = 3
+
+# Required on every request. Without it they answer 403 `forbidden` *before*
+# authentication is even checked, so a missing User-Agent looks exactly like a
+# bad key. httpx sets one by default, but the default is the httpx version,
+# which would put this integration's identity at the mercy of a dependency
+# bump — and this file has already been bitten once by a header that silently
+# stopped being what it looked like.
+MOLTSETS_USER_AGENT = "SalesOS/1.0"
+
+# Their seniority enum, keyed by our canonical levels. Note "C Suite" — a
+# space, not a hyphen, and their docs call that out specifically.
+#
+# Unlike most provider vocabularies this one has a tier for every level we can
+# emit, so there is nothing here to refuse.
+_MS_SENIORITY = {
+    "owner": "Owner",
+    "partner": "Partner",
+    "c_suite": "C Suite",
+    "vp": "VP",
+    "director": "Director",
+    "manager": "Manager",
+    "senior": "Senior",
+    "junior": "Entry",
+}
+
+# Their headcount bands, which are *not* ours. They split our 11-50 into two
+# bands and collapse everything above 5000 into one, so three of our eight
+# labels have no exact expression here:
+#
+#   11-50        spans their 11-20 and 21-50, and the field takes one string
+#   5001-10000   only reachable as 5001+, which also holds 10001 and up
+#   10001+       likewise
+#
+# Those three are refused rather than widened. Sending 5001+ for an ICP that
+# said 5001-10000 returns companies the user excluded while reporting a
+# successful search, which is the failure this file exists to prevent — and
+# refusing routes the search to Fiber or GetLeads, which express it exactly.
+_MS_EMPLOYEE_RANGE = {
+    "1-10": "1-10",
+    "51-200": "51-200",
+    "201-500": "201-500",
+    "501-1000": "501-1000",
+    "1001-5000": "1001-5000",
+}
+
+# Their 22 industry buckets, from our lowercase vocabulary. Only the fallback:
+# `linkedin_industry` is tried first because it takes LinkedIn's own labels —
+# the same modern taxonomy Fiber and GetLeads are on — and is far finer than
+# these. A bucket is better than nothing when the modern name has no match,
+# but "Information Technology" for an ICP that said "computer software" is a
+# much wider net, so it is second choice rather than first.
+_MS_INDUSTRY = {
+    "computer software": "Information Technology",
+    "information technology and services": "Information Technology",
+    "internet": "Information Technology",
+    "computer & network security": "Information Technology",
+    "financial services": "Finance and Banking",
+    "banking": "Finance and Banking",
+    "insurance": "Finance and Banking",
+    "accounting": "Finance and Banking",
+    "hospital & health care": "Health and Pharmaceuticals",
+    "pharmaceuticals": "Health and Pharmaceuticals",
+    "medical devices": "Health and Pharmaceuticals",
+    "marketing and advertising": "Marketing & Advertising",
+    "real estate": "Real Estate",
+    "commercial real estate": "Real Estate",
+    "education management": "Education",
+    "higher education": "Education",
+    "e-learning": "Education",
+    "staffing and recruiting": "Professional and Business Services",
+    "management consulting": "Professional and Business Services",
+    "legal services": "Professional and Business Services",
+    "law practice": "Professional and Business Services",
+    "construction": "Construction",
+    "automotive": "Automotive",
+    "food & beverages": "Food and Beverage",
+    "food production": "Food and Beverage",
+    "restaurants": "Food and Beverage",
+    "media production": "Media and Publishing",
+    "publishing": "Media and Publishing",
+    "entertainment": "Creative Arts and Entertainment",
+    "motion pictures and film": "Creative Arts and Entertainment",
+    "design": "Creative Arts and Entertainment",
+    "telecommunications": "Telecommunications",
+    "wireless": "Telecommunications",
+    "logistics and supply chain": "Transportation and Logistics",
+    "transportation/trucking/railroad": "Transportation and Logistics",
+    "manufacturing": "Manufacturing",
+    "machinery": "Manufacturing",
+    "retail": "Retail",
+    "supermarkets": "Retail",
+    "oil & energy": "Energy",
+    "renewables & environment": "Energy",
+    "utilities": "Utilities",
+    "government administration": "Government and Public Administration",
+    "nonprofit organization management": "Non-Profit and Social Services",
+    "non-profit organization management": "Non-Profit and Social Services",
+    "hospitality": "Tourism and Hospitality",
+    "leisure, travel & tourism": "Tourism and Hospitality",
+    "farming": "Agriculture",
+    "agriculture": "Agriculture",
+}
+
+# Their department enum, which doubles as functional_area — the docs say the
+# two share their underlying data and to send one or the other, never both.
+_MS_DEPARTMENT = {
+    "operations": "Operations",
+    "sales": "Sales",
+    "information technology": "Information Technology",
+    "it": "Information Technology",
+    "engineering": "Engineering",
+    "education": "Education",
+    "finance": "Finance",
+    "medical & health": "Medical & Health",
+    "health": "Medical & Health",
+    "medical": "Medical & Health",
+    "marketing": "Marketing",
+    "human resources": "Human Resources",
+    "hr": "Human Resources",
+    "people": "Human Resources",
+    "design": "Design",
+    "consulting": "Consulting",
+    "legal": "Legal",
+}
+
+# Their A-F send-safety grade, mapped onto our verdict shape.
+#
+# It grades the *mailbox*, not whether the address belongs to the person we
+# looked up — their docs are emphatic about that, and it is the difference
+# between "safe to send" and "this is the right person". We only ever ask them
+# about an address they themselves returned, so the identity half is already
+# their answer and this reads purely as deliverability.
+#
+# F and D are opposite ends rather than neighbouring tiers: F is *no evidence*
+# and D is *negative evidence*. A missing grade reads as F, per their docs.
+_MS_RISK = {
+    "A": ("deliverable", True),
+    "B": ("deliverable", True),
+    "C": ("risky", False),
+    "D": ("undeliverable", False),
+    "F": ("unknown", None),
+}
+
+
+def moltsets_risk_verdict(grade) -> dict:
+    """One MoltSets risk grade in our shared verdict shape."""
+    key = str(grade or "").strip().upper()
+    mapped, sendable = _MS_RISK.get(key, ("unknown", None))
+    return {
+        "status": mapped,
+        "sendable": sendable,
+        "checked_by": "moltsets",
+        "raw_status": key or None,
+        "catch_all": key == "C",
+        "role_based": None,
+        "disposable": None,
+        "free_provider": None,
+        "vendor": None,
+        "score": None,
+        "reason": None if key else "moltsets returned no grade",
+    }
+
+
+async def moltsets_call(tool: str, body: dict) -> tuple:
+    """Call one MoltSets tool. Returns (status_code, parsed body or None).
+
+    Returns rather than raises on 402 and 429 — out of tokens and Fair Use
+    window exhausted are states of the account, not failures of this request,
+    and a leg that raises on them takes the whole search down with it.
+    """
+    headers = {
+        "Authorization": f"Bearer {settings.moltsets_api_key or ''}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": MOLTSETS_USER_AGENT,
+    }
+    print(f"MoltSets {tool}: {json.dumps(body)[:400]}")
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(f"{MOLTSETS_BASE}/{tool}", headers=headers, json=body)
+    except httpx.HTTPError as exc:
+        print(f"MoltSets {tool} unreachable: {exc}")
+        return 0, None
+
+    if resp.status_code != 200:
+        print(f"MoltSets {tool} status: {resp.status_code} {resp.text[:300]}")
+    try:
+        return resp.status_code, resp.json()
+    except ValueError:
+        return resp.status_code, None
+
+
+def moltsets_results(payload):
+    """The `results` of a MoltSets call, or None when it found nothing.
+
+    Their miss is **HTTP 200** with `status: "not_found"` — the docs say to
+    read `status`, not the status code, and the only 404 they issue is for an
+    unknown tool name. Treating 200 as a hit would hand the rest of the
+    pipeline a payload full of nulls and call it a person.
+    """
+    if not isinstance(payload, dict):
+        return None
+    if str(payload.get("status") or "").strip().lower() != "ok":
+        return None
+    return payload.get("results")
+
+
+def moltsets_search_rows(payload) -> tuple:
+    """Return (rows, total) from a search envelope.
+
+    `results` is itself an object holding `results` and `total`, so the rows
+    are two levels down. Reading one level gets you the wrapper, whose
+    truthiness is not the question anyone meant to ask.
+    """
+    results = moltsets_results(payload)
+    if not isinstance(results, dict):
+        return [], 0
+    rows = results.get("results")
+    rows = [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+    return rows, int(results.get("total") or len(rows))
+
+
+def moltsets_industry(value: str) -> Optional[str]:
+    """(field, value) is decided by the caller; this is the bucket fallback."""
+    return _MS_INDUSTRY.get(str(value or "").strip().lower())
+
+
+def build_moltsets_filters(p: dict) -> dict:
+    """Translate internal search params into a /search_people body.
+
+    Raises ProviderUnsupported for a filter their index has no field for, or
+    has only a wider one for, so the chain reaches a provider that can express
+    it exactly rather than answering a different question.
+    """
+    body: dict = {}
+
+    # No technology or intent-signal fields on their people index. Revenue is
+    # a seven-band enum where ours is a raw currency range, and picking the
+    # band an arbitrary min/max falls into is a widening, not a translation.
+    refuse_unexpressible(p, "technologies", "intent_topics",
+                         "revenue_min", "revenue_max")
+
+    if p.get("job_title"):
+        # Their `title` matches the title field alone. The docs are explicit
+        # that a role in `query` is diluted across names and company names and
+        # only needs most of its terms — "Account Executive" there also
+        # returns Account Managers.
+        body["title"] = p["job_title"]
+
+    # See title_supersedes_seniority: a title that already states a level and
+    # a seniority filter are one criterion sent as two.
+    if p.get("seniority") and not title_supersedes_seniority(
+            p.get("job_title"), p["seniority"]):
+        level = _MS_SENIORITY.get(_canonical_seniority(p["seniority"]))
+        if not level:
+            raise ProviderUnsupported("seniority", p["seniority"])
+        body["seniority"] = level
+
+    if p.get("industry"):
+        # linkedin_industry first: it takes LinkedIn's own labels, the same
+        # modern vocabulary Fiber and GetLeads use, and is far finer than the
+        # 22 buckets. The buckets are the fallback, not the default.
+        modern = modern_linkedin_industry(p["industry"])
+        bucket = moltsets_industry(p["industry"])
+        if modern:
+            body["linkedin_industry"] = modern
+        elif bucket:
+            body["industry"] = bucket
+        else:
+            raise ProviderUnsupported("industry", p["industry"])
+
+    if p.get("company_size"):
+        band = _MS_EMPLOYEE_RANGE.get(str(p["company_size"]).strip())
+        if not band:
+            raise ProviderUnsupported("company_size", p["company_size"])
+        body["employee_range"] = band
+
+    if p.get("departments"):
+        first = next((d for d in p["departments"] if d), None)
+        mapped = _MS_DEPARTMENT.get(str(first or "").strip().lower())
+        if not mapped:
+            raise ProviderUnsupported("departments", p["departments"])
+        # department and functional_area share their underlying data — their
+        # docs say to send one or the other, never both.
+        body["department"] = mapped
+
+    company = p.get("company")
+    domain = p.get("company_domain")
+    if company and not domain and looks_like_domain(company):
+        domain, company = company, None
+    if domain:
+        # They normalise a full URL to a bare host themselves, but this file
+        # already holds one definition of that and two would drift.
+        body["company_domain"] = domain_host(domain) or domain
+    elif company:
+        body["company"] = company
+
+    location = p.get("location") or p.get("company_location")
+    if location:
+        kind, value = classify_location(str(location))
+        if kind == "country":
+            name = _GL_COUNTRY_NAME.get(value)
+            if not name:
+                raise ProviderUnsupported("location", location)
+            body["country"] = name
+        elif kind == "state":
+            # Their state filter wants the full name, never an abbreviation,
+            # and pairs with a country for precision.
+            body["state"] = _US_STATE_CODE_TO_NAME.get(value, value)
+            body["country"] = "United States"
+        elif kind == "city":
+            # Exact stored city only — it does not reach the suburbs, which
+            # their docs flag as the reason to prefer state or country for a
+            # metro-area search. Sent as given; a miss here is a miss, and the
+            # chain still has legs with radius search.
+            body["city"] = str(location)
+        else:
+            raise ProviderUnsupported("location", location)
+
+    # A segment phrase has no taxonomy anywhere, and `query` is their
+    # free-text field. It is deliberately not used for the role: see `title`.
+    segment = p.get("keywords") or p.get("semantic_keywords")
+    if segment:
+        body["query"] = str(segment)
+
+    if not body:
+        raise HTTPException(status_code=400, detail="At least one search parameter required")
+    return body
+
+
+async def moltsets_person_search(params: dict, limit: int, offset: int = 0,
+                                 exclude_domains: list = None) -> dict:
+    """Search MoltSets for people.
+
+    Billed one token per call rather than per row, so unlike every other leg
+    here there is no over-fetch to economise on — but rows returned come out
+    of a Fair Use record window, so the page asked for is still the page
+    needed.
+    """
+    body = build_moltsets_filters(params)
+    body["limit"] = max(min(int(limit or 10), MOLTSETS_MAX_PAGE), 1)
+    body["offset"] = max(int(offset or 0), 0)
+    if exclude_domains:
+        # Their docs: excluded records consume no tokens and no Fair Use
+        # records, so suppressing server-side is strictly cheaper than
+        # filtering the rows after they arrive.
+        body["exclude_company_domain"] = exclude_domains[:50]
+
+    status, data = await moltsets_call("search_people", body)
+
+    if status != 200 or not isinstance(data, dict):
+        if status == 402:
+            print("MoltSets is out of tokens — skipping this leg")
+        elif status == 429:
+            retry = ((data or {}).get("metadata") or {}).get("retry_after")
+            print(f"MoltSets Fair Use window exhausted"
+                  f"{f' — retry in {retry}s' if retry else ''}")
+        elif status == 403:
+            print("MoltSets refused the request: check the User-Agent header, "
+                  "the plan, and that the account is active")
+        elif status == 422:
+            # A value outside an enum. Their message names it, and this leg
+            # cannot express whatever it named, so step aside rather than
+            # report an outage to the caller.
+            message = str(((data or {}).get("error") or {}).get("message") or "").lower()
+            for field in ("seniority", "industry", "employee_range",
+                          "revenue_range", "department", "country", "state"):
+                if field in message and field in body:
+                    raise ProviderUnsupported(field, body[field])
+        return {"profiles": [], "total": 0}
+
+    rows, total = moltsets_search_rows(data)
+    print(f"MoltSets returned {len(rows)} profile(s) at offset {body['offset']} "
+          f"of ~{total}")
+    return {"profiles": rows, "total": total}
+
+
+def transform_moltsets_profile(row: dict, search_params: dict = None) -> dict:
+    """Map one MoltSets search row onto our lead shape.
+
+    Unlike the masked-search providers, a row here arrives with a work email
+    already on it and already graded — so this transform carries it through
+    rather than leaving the contact fields for a separate reveal to fill.
+    """
+    del search_params  # their _score ordered the page; we do not re-score it
+    company = row.get("company") or {}
+
+    # functional_area comes back as a list on a search row and as a plain
+    # string on the reverse lookups, for the same underlying field.
+    area = row.get("functional_area")
+    if isinstance(area, list):
+        area = next((a for a in area if a), None)
+
+    location = ", ".join(str(part) for part in
+                         (row.get("city"), row.get("state"), row.get("country"))
+                         if part) or None
+
+    email = row.get("business_email")
+    grade = row.get("business_email_risk_score")
+
+    return {
+        "contact_name": row.get("full_name"),
+        "first_name": row.get("first_name"),
+        "last_name": row.get("last_name"),
+        "job_title": row.get("title") or row.get("headline"),
+        "seniority": row.get("seniority"),
+        "department": area,
+        "company_name": company.get("name"),
+        "company_domain": domain_host(company.get("domain") or "") or None,
+        "industry": row.get("current_industry") or company.get("industry"),
+        "location": location,
+        "linkedin_url": row.get("linkedin_url"),
+        "contact_linkedin_url": row.get("linkedin_url"),
+        "headline": row.get("headline"),
+        "business_email": email,
+        "email": email,
+        "email_available": bool(email) or None,
+        "email_status": grade,
+        "phone": None,
+        "phone_type": None,
+        # Their phone data is a separate, much scarcer allowance — see
+        # moltsets_reveal — so a search row never claims to know.
+        "phone_available": None,
+        "score": row.get("_score"),
+        "provider": "moltsets",
+    }
+
+
+async def moltsets_reveal(linkedin_url: str = None, name: str = None,
+                          domain: str = None) -> dict:
+    """Reveal a graded work email, from a LinkedIn URL or a name plus a domain.
+
+    Two tools, because they take different inputs and the richer one needs a
+    URL. Phones are deliberately not asked for: `linkedin_to_mobile_phone`
+    spends a *phone token*, an allowance of 10 to 250 a month depending on
+    plan, where an email costs one ordinary token. Spending the month's phones
+    on routine reveals would empty it in a day, and the other legs in this
+    chain already return phone numbers.
+    """
+    if linkedin_url:
+        status, data = await moltsets_call("reverse_linkedin_lookup",
+                                           {"linkedin_url": linkedin_url})
+        results = moltsets_results(data) if status == 200 else None
+        if isinstance(results, dict):
+            company = results.get("company") or {}
+            return {
+                "name": results.get("full_name"),
+                "email": results.get("business_email"),
+                "email_status": results.get("business_email_risk_score"),
+                "job_title": results.get("title"),
+                "company_name": company.get("name"),
+                "company_domain": domain_host(company.get("website_url") or "") or None,
+                "linkedin_url": results.get("linkedin_url") or linkedin_url,
+            }
+        return {}
+
+    if name and domain:
+        status, data = await moltsets_call(
+            "search_business_email_by_name",
+            {"name": name, "company": domain_host(domain) or domain})
+        results = moltsets_results(data) if status == 200 else None
+        if isinstance(results, dict) and results.get("email"):
+            return {
+                "name": name,
+                "email": results.get("email"),
+                "email_status": results.get("risk_score"),
+                "linkedin_url": results.get("linkedin_url"),
+            }
+    return {}
+
+
+# =============================================================================
 # ColdIQ  (https://api.coldiq.com)
 # =============================================================================
 #
@@ -6512,6 +7024,45 @@ async def reveal_lead(request: EnrichRequest):
                 "lead": lead,
             }
 
+    # MoltSets first among the direct reveals: one token, nothing on a miss,
+    # and the address comes back already graded A-F for send safety. It takes
+    # either a LinkedIn URL or a name plus a domain, so it covers both shapes
+    # a reveal arrives in.
+    #
+    # Phones are not asked for here. Their mobile lookup spends a *phone
+    # token* — 10 to 250 a month depending on plan, against effectively
+    # unlimited email tokens — so routine reveals would drain the month's
+    # allowance in a day. The legs below still return phone numbers, and a
+    # reveal that found only an email falls through to them.
+    moltsets_domain = request.company_domain or (
+        request.company if request.company and looks_like_domain(request.company)
+        else None)
+    if "moltsets" in chain and (
+        request.linkedin_url or (request.full_name and moltsets_domain)
+    ):
+        contact = await moltsets_reveal(
+            linkedin_url=request.linkedin_url,
+            name=request.full_name,
+            domain=moltsets_domain)
+        if contact.get("email"):
+            lead = await verify_revealed_lead({
+                "contact_name": contact.get("name") or request.full_name,
+                "business_email": contact["email"],
+                "job_title": contact.get("job_title"),
+                "company_name": contact.get("company_name") or request.company,
+                "company_domain": (contact.get("company_domain")
+                                   or request.company_domain),
+                "linkedin_url": contact.get("linkedin_url") or request.linkedin_url,
+                "provider": "moltsets",
+            }, "moltsets")
+            return {
+                "success": True,
+                "provider": "moltsets",
+                "enrichment_status": "complete",
+                "email_verification": lead["email_verification"],
+                "lead": lead,
+            }
+
     # Fiber reveals from a LinkedIn URL and grades the address while it is at
     # it: an email that comes back `valid` has already passed deliverability
     # verification upstream, which is the check ColdIQ cannot currently run.
@@ -7100,6 +7651,8 @@ async def walk_search(request: SearchRequest):
             return lambda row: transform_fiber_profile(row, params)
         if name == "contactout":
             return lambda row: transform_contactout_profile(row, params)
+        if name == "moltsets":
+            return lambda row: transform_moltsets_profile(row, params)
         if name == "getleads":
             return lambda record: transform_getleads_contact(record)
         if name == "treg":
@@ -7284,6 +7837,61 @@ async def walk_search(request: SearchRequest):
             if seen_scope:
                 found = await record_new_campaign_profiles(seen_scope, found)
             return found, result["total"], result.get("next_cursor")
+
+        if name == "moltsets":
+            # Billed per call, not per row, so this loop is the one place in
+            # the chain where paging for someone new is close to free: a page
+            # of 25 costs what a page of 1 does, and a page that matches
+            # nobody costs nothing at all. Still bounded — rows returned come
+            # out of a rolling Fair Use record window, and each page is a
+            # round trip the legs behind this one have to wait for.
+            wanted = params.get("limit", 10)
+            offset = request.start_offset
+            seen = {i for i in (linkedin_identity(u) for u in (exclusions or [])) if i}
+            found: list = []
+            total = 0
+
+            for _ in range(MOLTSETS_MAX_PAGES):
+                page_started = time.monotonic()
+                data = await moltsets_person_search(
+                    params, max(wanted - len(found), 1), offset=offset)
+                page_seconds = time.monotonic() - page_started
+                rows = data["profiles"]
+                total = data["total"]
+
+                fresh = rows
+                if seen:
+                    fresh = [r for r in fresh
+                             if linkedin_identity(_profile_url(r)) not in seen]
+                if campaign_keys:
+                    fresh = drop_already_seen(fresh, campaign_keys, suppressed)
+                found.extend(fresh)
+
+                offset += len(rows)
+                if len(found) >= wanted or not rows or offset >= total:
+                    break
+
+                # The budget is checked between legs and this loop sits inside
+                # one — the GetLeads lesson, which cost a whole search.
+                left = search_seconds_left()
+                if left is not None and left < page_seconds + CHAIN_RESERVE_SECONDS:
+                    print(f"MoltSets: {int(left)}s of the search budget left and "
+                          f"a page costs about {int(page_seconds)}s — stopping "
+                          "here so the rest of the chain still runs")
+                    break
+                print(f"MoltSets: {len(rows) - len(fresh)} of {len(rows)} row(s) "
+                      f"already seen, {len(found)}/{wanted} collected — "
+                      f"paging to offset {offset}")
+
+            exhausted = not found
+            found = found[:wanted]
+            if seen_scope:
+                found = await record_new_campaign_profiles(seen_scope, found)
+            if exhausted:
+                print(f"MoltSets has no one left for this search that "
+                      f"{seen_scope or 'this searcher'} has not already been shown")
+
+            return found, total, None
 
         if name == "getleads":
             # The one leg with a real offset, so it is the one leg that can go

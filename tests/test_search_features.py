@@ -6045,5 +6045,571 @@ class ContactOutVerifierOrderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(lead["email_verification"]["checked_by"], "contactout")
 
 
+class MoltSetsClient:
+    """Fake httpx client for MoltSets: one POST verb, answers per tool name."""
+    routes = {}
+    calls = []
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def post(self, url, headers=None, json=None):
+        tool = url.replace(main.MOLTSETS_BASE + "/", "")
+        self.__class__.calls.append((tool, json, headers))
+        status, payload = self.__class__.routes.get(
+            tool, (404, {"error": {"code": "not_found", "message": "no route"}}))
+        if callable(payload):
+            payload = payload(len(self.__class__.calls), json or {})
+        return RoutedResponse(status, payload)
+
+    @classmethod
+    def reset(cls, routes=None):
+        cls.routes = routes or {}
+        cls.calls = []
+
+
+def _ms(**env):
+    return patch.multiple(main.settings, moltsets_api_key="ms_key", **env)
+
+
+def _ms_row(slug="morganhebb", **over):
+    """One person in their documented search-row shape."""
+    row = {
+        "full_name": "Morgan Hebb",
+        "first_name": "Morgan",
+        "last_name": "Hebb",
+        "title": "Account Executive",
+        "headline": "EdTech | Account Executive",
+        "seniority": "Senior",
+        "city": "Chicago",
+        "state": "Illinois",
+        "country": "United States",
+        "current_industry": "Information Technology",
+        "functional_area": ["Sales"],
+        "linkedin_url": f"https://linkedin.com/in/{slug}",
+        "business_email": "morgan.hebb@packback.co",
+        "business_email_risk_score": "A",
+        "company": {"name": "Packback", "size": "101", "domain": "packback.co",
+                    "industry": "Information Technology",
+                    "website_url": "https://www.packback.co/"},
+        "_id": slug,
+        "_score": 9.1714,
+    }
+    row.update(over)
+    return row
+
+
+def _ms_page(slugs, total=None):
+    """Their search envelope: results.results, two levels down."""
+    return {
+        "results": {"results": [_ms_row(s) for s in slugs],
+                    "total": total if total is not None else len(slugs)},
+        "status": "ok",
+        "metadata": {"fair_use": {"records_remaining_5h": 7000}},
+    }
+
+
+class MoltSetsFilterTests(unittest.TestCase):
+    def test_the_whole_icp_travels_in_one_body(self):
+        body = main.build_moltsets_filters({
+            "job_title": "Account Executive",
+            "seniority": "director",
+            "industry": "computer software",
+            "company_size": "51-200",
+            "location": "United States",
+            "keywords": "AI SaaS",
+        })
+
+        self.assertEqual(body["title"], "Account Executive")
+        self.assertEqual(body["seniority"], "Director")
+        self.assertEqual(body["employee_range"], "51-200")
+        self.assertEqual(body["country"], "United States")
+        self.assertEqual(body["query"], "AI SaaS")
+
+    def test_the_role_goes_in_title_not_query(self):
+        # Their docs: a role in `query` is diluted across names and company
+        # names and only needs most of its terms, so "Account Executive"
+        # there also returns Account Managers.
+        body = main.build_moltsets_filters({"job_title": "Account Executive"})
+
+        self.assertEqual(body["title"], "Account Executive")
+        self.assertNotIn("query", body)
+
+    def test_c_suite_is_spelled_with_a_space(self):
+        # Their docs call this out specifically: a space, not a hyphen.
+        body = main.build_moltsets_filters(
+            {"job_title": "Account Executive", "seniority": "cxo"})
+        self.assertEqual(body["seniority"], "C Suite")
+
+    def test_every_level_we_can_emit_has_one_of_theirs(self):
+        # Unlike most provider vocabularies, theirs has a tier for all of
+        # ours — so a refusal here would be a mapping gap, not a real limit.
+        for level in ("owner", "founder", "partner", "cxo", "c-suite", "vp",
+                      "director", "manager", "senior", "junior", "entry"):
+            with self.subTest(level=level):
+                body = main.build_moltsets_filters(
+                    {"job_title": "Account Executive", "seniority": level})
+                self.assertIn("seniority", body)
+
+    def test_a_title_that_states_its_own_level_drops_the_seniority(self):
+        body = main.build_moltsets_filters(
+            {"job_title": "Founder", "seniority": "owner"})
+        self.assertNotIn("seniority", body)
+
+    def test_the_modern_linkedin_label_is_preferred_over_the_bucket(self):
+        # linkedin_industry takes LinkedIn's own labels and is far finer than
+        # the 22 buckets, so it is first choice.
+        body = main.build_moltsets_filters({"industry": "computer software"})
+
+        self.assertEqual(body["linkedin_industry"], "Computer Software")
+        self.assertNotIn("industry", body)
+
+    def test_the_bucket_catches_what_the_modern_label_cannot(self):
+        # "law practice" has no modern LinkedIn label in our map but does
+        # belong to one of their 22 buckets.
+        self.assertIsNone(main.modern_linkedin_industry("law practice"))
+        body = main.build_moltsets_filters({"industry": "law practice"})
+
+        self.assertEqual(body["industry"], "Professional and Business Services")
+        self.assertNotIn("linkedin_industry", body)
+
+    def test_an_industry_neither_can_express_steps_aside(self):
+        with self.assertRaises(main.ProviderUnsupported) as caught:
+            main.build_moltsets_filters({"industry": "Salon & Spa"})
+        self.assertEqual(caught.exception.field, "industry")
+
+    def test_a_band_that_would_have_to_be_widened_is_refused(self):
+        # They split our 11-50 across two bands and collapse everything over
+        # 5000 into one. Sending 5001+ for an ICP that said 5001-10000
+        # returns companies the user excluded while reporting success.
+        for band in ("11-50", "5001-10000", "10001+"):
+            with self.subTest(band=band):
+                with self.assertRaises(main.ProviderUnsupported) as caught:
+                    main.build_moltsets_filters(
+                        {"job_title": "Founder", "company_size": band})
+                self.assertEqual(caught.exception.field, "company_size")
+
+    def test_the_bands_that_match_exactly_go_through(self):
+        for band in ("1-10", "51-200", "201-500", "501-1000", "1001-5000"):
+            with self.subTest(band=band):
+                body = main.build_moltsets_filters(
+                    {"job_title": "Founder", "company_size": band})
+                self.assertEqual(body["employee_range"], band)
+
+    def test_a_country_code_becomes_the_full_english_name(self):
+        body = main.build_moltsets_filters({"job_title": "Founder",
+                                            "location": "US"})
+        self.assertEqual(body["country"], "United States")
+
+    def test_a_state_travels_with_its_country_and_never_abbreviated(self):
+        body = main.build_moltsets_filters({"job_title": "Founder",
+                                            "location": "Texas"})
+        self.assertEqual(body["state"], "Texas")
+        self.assertEqual(body["country"], "United States")
+
+    def test_a_region_is_refused_rather_than_sent_as_a_city(self):
+        with self.assertRaises(main.ProviderUnsupported) as caught:
+            main.build_moltsets_filters({"job_title": "Founder",
+                                         "location": "Europe"})
+        self.assertEqual(caught.exception.field, "location")
+
+    def test_a_domain_wins_over_a_name_and_arrives_bare(self):
+        body = main.build_moltsets_filters({"job_title": "Founder",
+                                            "company": "https://acme.com/about"})
+        self.assertEqual(body["company_domain"], "acme.com")
+        self.assertNotIn("company", body)
+
+    def test_a_department_maps_onto_their_enum(self):
+        body = main.build_moltsets_filters({"job_title": "Founder",
+                                            "departments": ["Engineering"]})
+        self.assertEqual(body["department"], "Engineering")
+        # department and functional_area share their data — one or the other.
+        self.assertNotIn("functional_area", body)
+
+    def test_a_department_outside_their_enum_steps_aside(self):
+        with self.assertRaises(main.ProviderUnsupported) as caught:
+            main.build_moltsets_filters({"job_title": "Founder",
+                                         "departments": ["Astrology"]})
+        self.assertEqual(caught.exception.field, "departments")
+
+    def test_it_refuses_the_filters_it_has_no_field_for(self):
+        for field, value in (("technologies", ["Salesforce"]),
+                             ("intent_topics", ["Funding"]),
+                             ("revenue_min", 1_000_000)):
+            with self.subTest(field=field):
+                with self.assertRaises(main.ProviderUnsupported) as caught:
+                    main.build_moltsets_filters(
+                        {"job_title": "Founder", field: value})
+                self.assertEqual(caught.exception.field, field)
+
+
+class MoltSetsSearchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_it_reads_the_doubly_nested_results(self):
+        # `results` is an object holding `results` and `total`, so the rows
+        # are two levels down. One level gets you the wrapper.
+        MoltSetsClient.reset({"search_people": (200, _ms_page(["a", "b"], total=278))})
+        with patch.object(main.httpx, "AsyncClient", MoltSetsClient), _ms():
+            data = await main.moltsets_person_search({"job_title": "Founder"}, 6)
+
+        self.assertEqual(len(data["profiles"]), 2)
+        self.assertEqual(data["total"], 278)
+
+    async def test_a_miss_is_http_200_with_a_not_found_status(self):
+        # Their docs: read `status`, not the status code. Treating 200 as a
+        # hit hands the pipeline a payload of nulls and calls it a person.
+        MoltSetsClient.reset({"search_people": (200, {
+            "results": {"results": [], "total": 0},
+            "status": "not_found",
+            "metadata": {"fair_use": {}},
+        })})
+        with patch.object(main.httpx, "AsyncClient", MoltSetsClient), _ms():
+            data = await main.moltsets_person_search({"job_title": "Founder"}, 6)
+
+        self.assertEqual(data["profiles"], [])
+        self.assertEqual(data["total"], 0)
+
+    async def test_a_not_found_status_is_a_miss_even_with_rows_present(self):
+        # The status is the authority, not the shape of the payload.
+        MoltSetsClient.reset({"search_people": (200, {
+            "results": {"results": [_ms_row()], "total": 1},
+            "status": "not_found",
+        })})
+        with patch.object(main.httpx, "AsyncClient", MoltSetsClient), _ms():
+            data = await main.moltsets_person_search({"job_title": "Founder"}, 6)
+
+        self.assertEqual(data["profiles"], [])
+
+    async def test_the_user_agent_is_sent_explicitly(self):
+        # Without it they answer 403 before authentication is even checked,
+        # so a missing header looks exactly like a bad key.
+        MoltSetsClient.reset({"search_people": (200, _ms_page([]))})
+        with patch.object(main.httpx, "AsyncClient", MoltSetsClient), _ms():
+            await main.moltsets_person_search({"job_title": "Founder"}, 6)
+
+        _, _, headers = MoltSetsClient.calls[0]
+        self.assertTrue(headers["User-Agent"])
+        self.assertEqual(headers["Authorization"], "Bearer ms_key")
+
+    async def test_the_key_never_travels_in_the_body(self):
+        MoltSetsClient.reset({"search_people": (200, _ms_page([]))})
+        with patch.object(main.httpx, "AsyncClient", MoltSetsClient), _ms():
+            await main.moltsets_person_search({"job_title": "Founder"}, 6)
+
+        self.assertNotIn("ms_key", json.dumps(MoltSetsClient.calls[0][1]))
+
+    async def test_the_page_is_capped_at_their_ceiling(self):
+        MoltSetsClient.reset({"search_people": (200, _ms_page([]))})
+        with patch.object(main.httpx, "AsyncClient", MoltSetsClient), _ms():
+            await main.moltsets_person_search({"job_title": "Founder"}, 500)
+
+        self.assertEqual(MoltSetsClient.calls[0][1]["limit"], main.MOLTSETS_MAX_PAGE)
+
+    async def test_the_offset_is_sent(self):
+        MoltSetsClient.reset({"search_people": (200, _ms_page([]))})
+        with patch.object(main.httpx, "AsyncClient", MoltSetsClient), _ms():
+            await main.moltsets_person_search({"job_title": "Founder"}, 10, offset=30)
+
+        self.assertEqual(MoltSetsClient.calls[0][1]["offset"], 30)
+
+    async def test_out_of_tokens_is_an_empty_page_not_an_exception(self):
+        MoltSetsClient.reset({"search_people": (402, {
+            "error": {"code": "insufficient_tokens",
+                      "message": "You have 0 tokens remaining."}})})
+        with patch.object(main.httpx, "AsyncClient", MoltSetsClient), _ms():
+            data = await main.moltsets_person_search({"job_title": "Founder"}, 6)
+
+        self.assertEqual(data["profiles"], [])
+
+    async def test_a_fair_use_window_is_an_empty_page_not_an_exception(self):
+        MoltSetsClient.reset({"search_people": (429, {
+            "error": {"code": "fair_use_limit_exceeded", "message": "reached"},
+            "metadata": {"retry_after": 7200}})})
+        with patch.object(main.httpx, "AsyncClient", MoltSetsClient), _ms():
+            data = await main.moltsets_person_search({"job_title": "Founder"}, 6)
+
+        self.assertEqual(data["profiles"], [])
+
+    async def test_a_rejected_enum_value_steps_aside(self):
+        # 422 names the offending parameter; this leg cannot express whatever
+        # it named, so the chain should move on rather than see an outage.
+        MoltSetsClient.reset({"search_people": (422, {
+            "error": {"code": "invalid_input",
+                      "message": "The seniority value is not allowed."}})})
+        with patch.object(main.httpx, "AsyncClient", MoltSetsClient), _ms():
+            with self.assertRaises(main.ProviderUnsupported) as caught:
+                await main.moltsets_person_search(
+                    {"job_title": "Account Executive", "seniority": "director"}, 6)
+
+        self.assertEqual(caught.exception.field, "seniority")
+
+
+class MoltSetsTransformTests(unittest.TestCase):
+    def test_the_documented_row_shape_maps_across(self):
+        lead = main.transform_moltsets_profile(_ms_row())
+
+        self.assertEqual(lead["contact_name"], "Morgan Hebb")
+        self.assertEqual(lead["job_title"], "Account Executive")
+        self.assertEqual(lead["company_name"], "Packback")
+        self.assertEqual(lead["company_domain"], "packback.co")
+        self.assertEqual(lead["location"], "Chicago, Illinois, United States")
+        self.assertEqual(lead["provider"], "moltsets")
+
+    def test_the_search_row_already_carries_a_graded_email(self):
+        # The thing that makes this leg different: no reveal needed.
+        lead = main.transform_moltsets_profile(_ms_row())
+
+        self.assertEqual(lead["business_email"], "morgan.hebb@packback.co")
+        self.assertEqual(lead["email_status"], "A")
+
+    def test_functional_area_is_a_list_on_a_search_row(self):
+        # Same underlying field is a plain string on the reverse lookups.
+        self.assertEqual(main.transform_moltsets_profile(_ms_row())["department"],
+                         "Sales")
+        self.assertEqual(
+            main.transform_moltsets_profile(
+                _ms_row(functional_area="Marketing"))["department"], "Marketing")
+
+    def test_a_row_is_identifiable_to_the_seen_ledger(self):
+        row = _ms_row("ada")
+        self.assertTrue(main._profile_lead_key(row))
+
+    def test_a_search_row_never_claims_to_know_a_phone(self):
+        # Phones are a separate, far scarcer allowance — see moltsets_reveal.
+        lead = main.transform_moltsets_profile(_ms_row())
+        self.assertIsNone(lead["phone"])
+        self.assertIsNone(lead["phone_available"])
+
+
+class MoltSetsRiskScoreTests(unittest.TestCase):
+    """A-F grades send safety, not whether the address is the right person."""
+
+    def test_a_and_b_are_sendable(self):
+        for grade in ("A", "B"):
+            with self.subTest(grade=grade):
+                self.assertIs(main.moltsets_risk_verdict(grade)["sendable"], True)
+
+    def test_c_is_a_catch_all_and_not_sendable(self):
+        verdict = main.moltsets_risk_verdict("C")
+        self.assertEqual(verdict["status"], "risky")
+        self.assertIs(verdict["sendable"], False)
+        self.assertIs(verdict["catch_all"], True)
+
+    def test_d_is_negative_evidence_and_f_is_none(self):
+        # Opposite ends of what is known, not neighbouring tiers.
+        self.assertIs(main.moltsets_risk_verdict("D")["sendable"], False)
+        self.assertEqual(main.moltsets_risk_verdict("D")["status"], "undeliverable")
+        self.assertIsNone(main.moltsets_risk_verdict("F")["sendable"])
+        self.assertEqual(main.moltsets_risk_verdict("F")["status"], "unknown")
+
+    def test_a_missing_grade_reads_as_f(self):
+        # Their docs: scoring is best-effort and the field is simply absent
+        # when degraded. Treat it as unknown, not safe.
+        verdict = main.moltsets_risk_verdict(None)
+        self.assertEqual(verdict["status"], "unknown")
+        self.assertIsNone(verdict["sendable"])
+
+
+class MoltSetsRevealTests(unittest.IsolatedAsyncioTestCase):
+    async def test_a_linkedin_url_uses_the_full_reverse_lookup(self):
+        MoltSetsClient.reset({"reverse_linkedin_lookup": (200, {
+            "results": {"full_name": "John Smith", "title": "VP of Engineering",
+                        "business_email": "john@acme.com",
+                        "business_email_risk_score": "A",
+                        "linkedin_url": "https://linkedin.com/in/john",
+                        "company": {"name": "Acme",
+                                    "website_url": "https://acme.com"}},
+            "status": "ok"})})
+        with patch.object(main.httpx, "AsyncClient", MoltSetsClient), _ms():
+            contact = await main.moltsets_reveal(
+                linkedin_url="https://linkedin.com/in/john")
+
+        self.assertEqual(MoltSetsClient.calls[0][0], "reverse_linkedin_lookup")
+        self.assertEqual(contact["email"], "john@acme.com")
+        self.assertEqual(contact["email_status"], "A")
+        self.assertEqual(contact["company_domain"], "acme.com")
+
+    async def test_a_name_and_domain_use_the_email_finder(self):
+        MoltSetsClient.reset({"search_business_email_by_name": (200, {
+            "results": {"email": "john.smith@acme.com", "risk_score": "B",
+                        "linkedin_url": "https://linkedin.com/in/john-smith"},
+            "status": "ok"})})
+        with patch.object(main.httpx, "AsyncClient", MoltSetsClient), _ms():
+            contact = await main.moltsets_reveal(
+                name="John Smith", domain="https://acme.com")
+
+        tool, body, _ = MoltSetsClient.calls[0]
+        self.assertEqual(tool, "search_business_email_by_name")
+        self.assertEqual(body["company"], "acme.com")
+        self.assertEqual(contact["email"], "john.smith@acme.com")
+
+    async def test_a_reveal_never_spends_a_phone_token(self):
+        # Their phone allowance is 10-250 a month against effectively
+        # unlimited email tokens; routine reveals would drain it in a day.
+        MoltSetsClient.reset({"reverse_linkedin_lookup": (200, {
+            "results": {"business_email": "a@b.com"}, "status": "ok"})})
+        with patch.object(main.httpx, "AsyncClient", MoltSetsClient), _ms():
+            await main.moltsets_reveal(linkedin_url="https://linkedin.com/in/x")
+
+        self.assertNotIn("linkedin_to_mobile_phone",
+                         [c[0] for c in MoltSetsClient.calls])
+
+    async def test_a_not_found_reveal_is_empty_rather_than_nulls(self):
+        MoltSetsClient.reset({"reverse_linkedin_lookup": (200, {
+            "results": {"full_name": None, "business_email": None},
+            "status": "not_found"})})
+        with patch.object(main.httpx, "AsyncClient", MoltSetsClient), _ms():
+            contact = await main.moltsets_reveal(
+                linkedin_url="https://linkedin.com/in/nobody")
+
+        self.assertEqual(contact, {})
+
+    async def test_the_reveal_leg_runs_for_a_name_and_company(self):
+        MoltSetsClient.reset({"search_business_email_by_name": (200, {
+            "results": {"email": "ada@acme.com", "risk_score": "A"},
+            "status": "ok"})})
+        request = main.EnrichRequest(full_name="Ada Lovelace",
+                                     company_domain="acme.com")
+        with patch.object(main.httpx, "AsyncClient", MoltSetsClient), \
+             patch.object(main, "provider_chain", lambda: ("moltsets",)), \
+             patch.object(main, "verify_revealed_lead",
+                          AsyncMock(side_effect=lambda lead, p=None: {
+                              **lead, "email_verification": {}, "email_verified": True})), \
+             _ms():
+            result = await main.enrich_lead(request)
+
+        self.assertEqual(result["provider"], "moltsets")
+        self.assertEqual(result["lead"]["business_email"], "ada@acme.com")
+
+
+class MoltSetsChainTests(unittest.TestCase):
+    def test_it_sits_high_and_ahead_of_the_per_profile_legs(self):
+        order = list(main.PROVIDER_ORDER)
+
+        self.assertLess(order.index("moltsets"), order.index("getleads"))
+        self.assertLess(order.index("moltsets"), order.index("fiber"))
+        self.assertLess(order.index("moltsets"), order.index("wiza"))
+
+    def test_no_key_removes_it_rather_than_breaking_the_chain(self):
+        with patch.object(main.settings, "bytemine_api_key", "b"), \
+             patch.object(main.settings, "moltsets_api_key", None), \
+             patch.object(main.settings, "search_provider", "bytemine"):
+            self.assertNotIn("moltsets", main.provider_chain())
+
+    def test_a_key_is_all_it_takes(self):
+        with patch.object(main.settings, "bytemine_api_key", "b"), \
+             patch.object(main.settings, "moltsets_api_key", "ms"), \
+             patch.object(main.settings, "search_provider", "bytemine"):
+            self.assertIn("moltsets", main.provider_chain())
+
+    def test_a_pasted_key_with_a_trailing_space_still_builds_a_header(self):
+        stripped = main.Settings(database_url="postgresql://x",
+                                 moltsets_api_key="ms_key ")
+        self.assertEqual(stripped.moltsets_api_key, "ms_key")
+
+
+class MoltSetsRepeatLeadTests(unittest.IsolatedAsyncioTestCase):
+    """Billed per call, so paging for someone new is close to free here."""
+
+    def _pages(self, pages):
+        """Stub moltsets_person_search: a dict of offset -> rows."""
+        asked: list = []
+
+        async def search(params, limit, offset=0, exclude_domains=None):
+            asked.append(offset)
+            return {"profiles": pages.get(offset, []),
+                    "total": sum(len(p) for p in pages.values())}
+
+        return search, asked
+
+    async def run_search(self, request, pages):
+        search, asked = self._pages(pages)
+
+        async def no_cache(_hash):
+            return None
+
+        async def no_store(*args, **kwargs):
+            return None
+
+        patches = [
+            patch.object(main.settings, "moltsets_api_key", "ms_key"),
+            patch.object(main, "provider_chain", lambda: ("moltsets",)),
+            patch.object(main, "moltsets_person_search", search),
+            patch.object(main, "cache_lookup", no_cache),
+            patch.object(main, "cache_store", no_store),
+        ]
+        for p in patches:
+            p.start()
+        try:
+            return await main.search_leads(request), asked
+        finally:
+            for p in patches:
+                p.stop()
+
+    async def test_a_fully_seen_page_pages_forward(self):
+        response, asked = await self.run_search(
+            main.SearchRequest(
+                job_title="Founder", industry="computer software", limit=2,
+                exclude_profiles=["https://linkedin.com/in/ada",
+                                  "https://linkedin.com/in/bob"]),
+            {0: [_ms_row("ada"), _ms_row("bob")],
+             2: [_ms_row("cleo"), _ms_row("dev")]},
+        )
+
+        self.assertEqual(asked, [0, 2])
+        self.assertEqual([lead["linkedin_url"] for lead in response.leads],
+                         ["https://linkedin.com/in/cleo",
+                          "https://linkedin.com/in/dev"])
+
+    async def test_a_page_of_new_people_costs_exactly_one_call(self):
+        response, asked = await self.run_search(
+            main.SearchRequest(job_title="Founder", industry="computer software",
+                               limit=2),
+            {0: [_ms_row("ada"), _ms_row("bob")], 2: [_ms_row("cleo")]},
+        )
+
+        self.assertEqual(asked, [0])
+        self.assertEqual(len(response.leads), 2)
+
+    async def test_paging_is_bounded_rather_than_walking_their_index(self):
+        seen = [f"https://linkedin.com/in/p{i}" for i in range(20)]
+        pages = {i: [_ms_row(f"p{i}")] for i in range(0, 20)}
+
+        _, asked = await self.run_search(
+            main.SearchRequest(job_title="Founder", industry="computer software",
+                               limit=1, exclude_profiles=seen),
+            pages,
+        )
+
+        self.assertEqual(len(asked), main.MOLTSETS_MAX_PAGES)
+
+    async def test_running_out_of_rows_stops_the_walk(self):
+        response, asked = await self.run_search(
+            main.SearchRequest(job_title="Founder", industry="computer software",
+                               limit=2,
+                               exclude_profiles=["https://linkedin.com/in/ada"]),
+            {0: [_ms_row("ada")]},
+        )
+
+        self.assertEqual(asked, [0])
+        self.assertEqual(response.leads, [])
+
+    async def test_the_page_arrives_with_emails_already_on_it(self):
+        # The whole point of the leg: a hit needs no reveal.
+        response, _ = await self.run_search(
+            main.SearchRequest(job_title="Founder", industry="computer software",
+                               limit=1),
+            {0: [_ms_row("ada")]},
+        )
+
+        self.assertEqual(response.leads[0]["business_email"],
+                         "morgan.hebb@packback.co")
+
+
 if __name__ == "__main__":
     unittest.main()
