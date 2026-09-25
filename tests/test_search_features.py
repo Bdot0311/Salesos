@@ -793,20 +793,18 @@ class ProviderFallbackTests(unittest.IsolatedAsyncioTestCase):
         outcomes = {a["provider"]: a["outcome"] for a in response.provider_attempts}
         self.assertEqual(outcomes["bytemine"], "no_results")
 
-    async def test_a_filter_bytemine_cannot_express_moves_to_crustdata(self):
-        # A country location has no field on /contacts/search. Falling through
-        # keeps the ICP whole; dropping the country would not.
+    async def test_a_filter_the_rows_cannot_evidence_keeps_refusing(self):
+        # Bytemine builds its location from city and state only, so a row cannot
+        # prove which country it is in. Running the leg anyway would spend a
+        # search and discard every row — worse than sitting out. ICP_CHECKABLE
+        # is what keeps that honest.
         response, calls = await self.run_search(
             main.SearchRequest(job_title="Founder", location="US"),
-            # Bytemine is deliberately not stubbed: the real
-            # build_bytemine_filters must be the thing that refuses.
             {"crustdata": {"profiles": [{"crustdata_person_id": 9}],
                            "total": 1, "next_cursor": None}},
         )
 
-        # Bytemine sits this one out; the providers that can express it answer.
         self.assertNotIn("bytemine", calls)
-        self.assertEqual(response.provider, "crustdata")
         outcomes = {a["provider"]: a["outcome"] for a in response.provider_attempts}
         self.assertEqual(outcomes["bytemine"], "unsupported_filter")
 
@@ -815,9 +813,11 @@ class ProviderFallbackTests(unittest.IsolatedAsyncioTestCase):
         # no configured provider can express the filter. An empty success here
         # reads as "no such people exist" and tells the user nothing to change.
         #
-        # Bytemine refuses the country before spending a company-search credit;
-        # Wiza refuses the keyword. Neither is stubbed, so both refusals are the
-        # real ones, and bytemine_call must never be reached.
+        # Bytemine refuses the country — its rows carry city and state only, so
+        # nothing about them could prove a country and the local check cannot
+        # stand in for the missing field. Wiza refuses the keyword, which no
+        # lead shape carries at all. Neither is stubbed, so both refusals are
+        # the real ones, and bytemine_call must never be reached.
         with patch.object(main, "bytemine_call", self._fail("must not be called")):
             with self.assertRaises(HTTPException) as caught:
                 await self.run_search(
@@ -5082,6 +5082,24 @@ class ExhaustedPoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(missing, [],
                          f"these legs are invisible to the seen ledger: {missing}")
 
+        # The same sweep for the ICP check, for the same reason. A leg that
+        # skips it answers a search it was asked without part of the ICP and
+        # shows the rows anyway — the silent broadening the check exists to
+        # prevent — and it has to run *before* the ledger write, or people
+        # dropped for the ICP would be recorded as already shown and burnt out
+        # of the pool for good.
+        unchecked = [leg for leg, chunk in legs.items()
+                     if "keep_on_icp" not in chunk]
+
+        self.assertEqual(unchecked, [],
+                         f"these legs never check the ICP they skipped: {unchecked}")
+
+        for leg, chunk in legs.items():
+            with self.subTest(leg=leg):
+                self.assertLess(chunk.index("keep_on_icp"),
+                                chunk.index("record_new_campaign_profiles"),
+                                f"{leg} records the ledger before checking the ICP")
+
     def test_the_audit_covers_every_provider_in_the_chain(self):
         # The sweep above only proves something if it actually reaches every
         # leg. A provider added to PROVIDER_ORDER without a branch in
@@ -6341,6 +6359,193 @@ class MoltSetsFilterTests(unittest.TestCase):
                     main.build_moltsets_filters(
                         {"job_title": "Founder", field: value})
                 self.assertEqual(caught.exception.field, field)
+
+
+class IcpEnforcementTests(unittest.TestCase):
+    """Searching with what a provider can filter, checking the rest locally.
+
+    Four legs of ten sat out one production search — bytemine on company_size,
+    crustdata on industry, coldiq on location, wiza on keywords — so the ICP
+    stayed whole and almost nobody answered it. Each refusal was correct about
+    filtering and wrong about honouring: Crustdata's own note says "the field
+    reads back fine in a response ... returnable and filterable are not the
+    same thing here".
+    """
+
+    def test_the_bucket_spans_the_three_taxonomies_in_this_file(self):
+        # Ours, classic LinkedIn (what Bytemine and Crustdata return) and
+        # current LinkedIn (what Fiber, GetLeads and MoltSets return). Five
+        # spellings of one answer; a comparison that misses that drops every
+        # good row.
+        same = ("computer software", "Computer Software", "Software Development",
+                "IT Services and IT Consulting", "Information Technology")
+        buckets = {main.industry_bucket(v) for v in same}
+        self.assertEqual(len(buckets), 1, buckets)
+        self.assertNotIn(None, buckets)
+
+    def test_different_sectors_do_not_share_a_bucket(self):
+        self.assertNotEqual(main.industry_bucket("computer software"),
+                            main.industry_bucket("construction"))
+        self.assertNotEqual(main.industry_bucket("legal services"),
+                            main.industry_bucket("retail"))
+
+    def test_an_unrecognised_industry_cannot_decide_anything(self):
+        # None means "cannot tell", which leaves the leg refusing rather than
+        # guessing per row.
+        self.assertIsNone(main.industry_bucket("Salon & Spa"))
+        self.assertIsNone(main.lead_satisfies({"industry": "Computer Software"},
+                                              "industry", "Salon & Spa"))
+
+    def test_a_matching_industry_is_kept_and_a_wrong_one_dropped(self):
+        self.assertIs(main.lead_satisfies({"industry": "Software Development"},
+                                          "industry", "computer software"), True)
+        self.assertIs(main.lead_satisfies({"industry": "Construction"},
+                                          "industry", "computer software"), False)
+
+    def test_a_silent_row_is_unknown_rather_than_a_match(self):
+        self.assertIsNone(main.lead_satisfies({}, "industry", "computer software"))
+        self.assertIsNone(main.lead_satisfies({"industry": None},
+                                              "industry", "computer software"))
+
+    def test_a_headcount_inside_the_band_is_kept(self):
+        self.assertIs(main.lead_satisfies({"company_headcount": 7},
+                                          "company_size", "1-10"), True)
+        self.assertIs(main.lead_satisfies({"company_headcount": "1,200"},
+                                          "company_size", "1-10"), False)
+
+    def test_a_band_has_to_sit_inside_the_one_asked_for(self):
+        # Overlapping is not matching: 11-50 is not 1-10.
+        self.assertIs(main.lead_satisfies({"company_size": "1-10"},
+                                          "company_size", "1-10"), True)
+        self.assertIs(main.lead_satisfies({"company_size": "11-50"},
+                                          "company_size", "1-10"), False)
+        self.assertIs(main.lead_satisfies({"company_size": "5001-10000"},
+                                          "company_size", "1-10"), False)
+
+    def test_a_country_is_matched_by_name_or_code(self):
+        self.assertIs(main.lead_satisfies({"location": "Austin, Texas, United States"},
+                                          "location", "US"), True)
+        self.assertIs(main.lead_satisfies({"country": "United States"},
+                                          "location", "US"), True)
+        self.assertIs(main.lead_satisfies({"location": "Berlin, Germany"},
+                                          "location", "US"), False)
+
+    def test_the_lithuania_case_now_resolves_as_a_country(self):
+        self.assertIs(main.lead_satisfies({"location": "Vilnius, Lithuania"},
+                                          "location", "Lithuania"), True)
+        self.assertIs(main.lead_satisfies({"location": "Warsaw, Poland"},
+                                          "location", "Lithuania"), False)
+
+    def test_a_region_cannot_be_checked(self):
+        self.assertIsNone(main.lead_satisfies({"location": "Berlin, Germany"},
+                                              "location", "Europe"))
+
+    def test_a_row_with_no_location_is_unknown(self):
+        self.assertIsNone(main.lead_satisfies({}, "location", "US"))
+
+    def test_enforce_keeps_only_rows_that_can_be_shown_to_match(self):
+        rows = [{"n": "match"}, {"n": "wrong"}, {"n": "silent"}]
+        leads = {"match": {"industry": "Software Development"},
+                 "wrong": {"industry": "Construction"},
+                 "silent": {}}
+        dropped: list = []
+
+        kept = main.enforce_icp(rows, {"industry": "computer software"},
+                               {"industry"}, lambda r: leads[r["n"]], dropped)
+
+        self.assertEqual([r["n"] for r in kept], ["match"])
+        self.assertEqual(dropped, [2])
+
+    def test_enforce_requires_every_skipped_filter_to_pass(self):
+        rows = [{"n": "both"}, {"n": "half"}]
+        leads = {"both": {"industry": "Software Development",
+                          "company_headcount": 5},
+                 "half": {"industry": "Software Development",
+                          "company_headcount": 900}}
+
+        kept = main.enforce_icp(
+            rows, {"industry": "computer software", "company_size": "1-10"},
+            {"industry", "company_size"}, lambda r: leads[r["n"]], [])
+
+        self.assertEqual([r["n"] for r in kept], ["both"])
+
+    def test_enforce_with_nothing_to_check_is_a_passthrough(self):
+        rows = [{"n": 1}, {"n": 2}]
+        self.assertIs(main.enforce_icp(rows, {}, set(), lambda r: {}, []), rows)
+
+    def test_an_unreadable_row_is_dropped_rather_than_crashing_the_leg(self):
+        def boom(_row):
+            raise KeyError("shape")
+
+        kept = main.enforce_icp([{"n": 1}], {"industry": "computer software"},
+                                {"industry"}, boom, [])
+        self.assertEqual(kept, [])
+
+    def test_the_four_production_refusals_now_split_correctly(self):
+        """The log line that started this, leg by leg.
+
+        Three of the four can be measured on the rows that come back; the
+        fourth cannot, because no lead shape carries a keyword.
+        """
+        self.assertEqual(main.icp_checkable("bytemine", {"company_size"}),
+                         {"company_size"})
+        self.assertEqual(main.icp_checkable("crustdata", {"industry"}),
+                         {"industry"})
+        self.assertEqual(main.icp_checkable("coldiq", {"location"}),
+                         {"location"})
+        self.assertEqual(main.icp_checkable("wiza", {"keywords"}), set())
+
+    def test_bytemine_still_cannot_be_checked_on_a_country(self):
+        # city + state only, so a row cannot prove a country.
+        self.assertEqual(main.icp_checkable("bytemine", {"location"}), set())
+
+    def test_an_unknown_provider_is_never_assumed_checkable(self):
+        self.assertEqual(main.icp_checkable("nobody", {"industry"}), set())
+
+    def test_every_provider_in_the_chain_has_a_capability_entry(self):
+        # A leg missing here silently keeps refusing, which is safe but is a
+        # contributor lost by omission rather than by decision.
+        self.assertEqual(set(main.PROVIDER_ORDER) - set(main.ICP_CHECKABLE), set())
+
+    def test_the_check_is_bound_to_the_row_not_the_search(self):
+        """The subtlest trap in this change, and it cannot fail loudly.
+
+        transform_bytemine_profile and transform_crustdata_profile fall back to
+        `search_params.get("industry")` and `search_params.get("company_size")`
+        when the row is silent. That is right for display — a lead from a
+        software search is a software company — and fatal for checking: bound to
+        the search, every silent row reports the requested value back and passes
+        a test it was never measured against, so the enforcement would quietly
+        become a no-op while looking like it worked.
+
+        Asserted on the source because there is no output that differs: a
+        no-op check and a working one both return rows.
+        """
+        import inspect, re
+        body = inspect.getsource(main.walk_search)
+        call = re.search(r"enforce_icp\(\s*rows,.*?\)", body, re.S)
+        self.assertIsNotNone(call, "enforce_icp is no longer called in walk_search")
+        self.assertIn("transform_for(name, {})", call.group(0),
+                      "the ICP check must bind the transform to {} — bound to "
+                      "the search it silently passes every row")
+
+    def test_the_echoing_transforms_are_still_the_reason_for_that(self):
+        # If the fallbacks ever go away the rule above can relax, so tie the
+        # rule to the thing that makes it necessary rather than to a comment.
+        for fn in (main.transform_bytemine_profile, main.transform_crustdata_profile):
+            with self.subTest(transform=fn.__name__):
+                lead = fn({}, {"industry": "computer software",
+                               "company_size": "1-10"})
+                self.assertEqual(lead["industry"], "computer software")
+                self.assertEqual(lead["company_size"], "1-10")
+                alone = fn({}, {})
+                self.assertIsNone(alone["industry"])
+                self.assertIsNone(alone["company_size"])
+
+    def test_no_capability_claims_a_filter_that_cannot_be_checked_at_all(self):
+        for provider, fields in main.ICP_CHECKABLE.items():
+            with self.subTest(provider=provider):
+                self.assertEqual(fields - main.ICP_ENFORCEABLE, frozenset())
 
 
 class EmptyLegLogTests(unittest.TestCase):

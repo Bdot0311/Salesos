@@ -6551,6 +6551,292 @@ def drop_already_seen(rows: list, seen_keys: set, suppressed: list) -> list:
     return kept
 
 
+# =============================================================================
+# Enforcing an ICP a provider could not filter on
+# =============================================================================
+#
+# ProviderUnsupported was built to mean "I have no field for this, so I will
+# sit this search out rather than answer a different question". That is the
+# right instinct and it is also why production searches were being answered by
+# one or two legs out of ten:
+#
+#   bytemine cannot express company_size='1-10' — it contributes nothing here
+#   crustdata cannot express industry='computer software' — it contributes nothing
+#   coldiq cannot express location='Lithuania' — it contributes nothing here
+#   wiza cannot express keywords='...' — it contributes nothing here
+#
+# Four legs out on one search. The refusals are each correct — someone probed
+# those endpoints and found the fields genuinely do not filter — but "cannot
+# filter on it" and "cannot honour it" are not the same thing, and Crustdata's
+# own note says so out loud: "the field reads back fine in a response ...
+# returnable and filterable are not the same thing here".
+#
+# So: search with what the provider can filter, then check the filter it could
+# not against the rows it sends back. A leg that could contribute nothing now
+# contributes whatever genuinely matches.
+#
+# The rule is strict on purpose. A row is kept only when it can be *shown* to
+# satisfy the filter; a row that cannot be checked is dropped, not waved
+# through. Waving it through is the silent broadening this file refuses
+# everywhere else, and it is strictly worse than the refusal it replaces —
+# whereas being too strict only costs rows from a leg that was contributing
+# zero of them a moment ago.
+
+# Filters that can be checked against a transformed lead. Every transform emits
+# industry and job_title; most emit a location or a country; several carry a
+# headcount. `keywords`, `technologies`, `intent_topics` and the revenue bounds
+# are absent from every lead shape, so a leg that cannot filter on one of those
+# still has to sit the search out.
+ICP_ENFORCEABLE = frozenset({"industry", "company_size", "location",
+                             "company_location"})
+
+# And which of those each provider's *rows* can actually evidence. Read off the
+# transforms rather than assumed, because the difference matters: asking a leg
+# to run without a filter it cannot then be checked on spends a search and
+# discards every row, which is worse than the refusal it replaced. A leg with
+# no entry here keeps refusing, exactly as before.
+#
+# Two absences worth naming:
+#   bytemine — its location is built from city and state only, so a row cannot
+#              prove which country it is in. A country refusal therefore stands.
+#   most legs — company_size is simply not on their row shape.
+#
+# The request is never a substitute for the row: transform_bytemine_profile and
+# transform_crustdata_profile fall back to search_params for industry and size,
+# which is why the check binds the transform to {} (see transform_for).
+_ICP_LOC = ("location", "company_location")
+ICP_CHECKABLE = {
+    "bytemine":   frozenset({"industry", "company_size"}),
+    "crustdata":  frozenset({"industry", "company_size", *_ICP_LOC}),
+    "moltsets":   frozenset({"industry", *_ICP_LOC}),
+    "getleads":   frozenset({"industry", *_ICP_LOC}),
+    "fiber":      frozenset({"industry"}),
+    "contactout": frozenset({"industry", *_ICP_LOC}),
+    "treg":       frozenset({"industry", "company_size", *_ICP_LOC}),
+    "coldiq":     frozenset({"industry", *_ICP_LOC}),
+    "findymail":  frozenset({"industry", "company_size", *_ICP_LOC}),
+    "wiza":       frozenset({"industry", "company_size", *_ICP_LOC}),
+}
+
+
+def icp_checkable(provider: str, fields) -> set:
+    """The filters this provider's rows can be measured against."""
+    allowed = ICP_CHECKABLE.get(provider, frozenset())
+    return {f for f in fields if f in ICP_ENFORCEABLE and f in allowed}
+
+# Coarse buckets for comparing one industry string against another, across
+# taxonomies that disagree about names. Never sent to a provider — this is only
+# ever asked "are these two talking about the same sector?".
+#
+# It has to span three vocabularies at once: ours (lowercase PDL), classic
+# LinkedIn (what Bytemine and Crustdata return), and current LinkedIn (what
+# Fiber, GetLeads and MoltSets return). "computer software", "Computer
+# Software", "Software Development", "IT Services and IT Consulting" and
+# "Information Technology" are five spellings of one answer, and a comparison
+# that misses that drops every good row.
+_ICP_INDUSTRY_SYNONYMS = {
+    "software": ("computer software", "software development", "software",
+                 "information technology", "information technology and services",
+                 "it services and it consulting", "internet", "technology",
+                 "computer networking", "computer & network security",
+                 "computer and network security", "saas",
+                 "technology, information and internet"),
+    "finance": ("financial services", "finance and banking", "banking",
+                "insurance", "accounting", "capital markets",
+                "investment banking", "investment management",
+                "venture capital & private equity", "fintech"),
+    "health": ("hospital & health care", "hospitals and health care",
+               "health and pharmaceuticals", "health care", "pharmaceuticals",
+               "pharmaceutical manufacturing", "medical devices",
+               "medical practice", "mental health care", "biotechnology",
+               "biotechnology research", "wellness and fitness services",
+               "health, wellness and fitness"),
+    "marketing": ("marketing and advertising", "marketing & advertising",
+                  "advertising services", "public relations and communications",
+                  "market research"),
+    "education": ("education management", "education",
+                  "education administration programs", "higher education",
+                  "e-learning", "e-learning providers",
+                  "primary/secondary education"),
+    "legal": ("legal services", "law practice", "law", "judiciary"),
+    "consulting": ("management consulting", "business consulting and services",
+                   "professional and business services", "outsourcing/offshoring"),
+    "staffing": ("staffing and recruiting", "human resources"),
+    "realestate": ("real estate", "commercial real estate"),
+    "construction": ("construction", "building materials", "civil engineering",
+                     "architecture & planning"),
+    "retail": ("retail", "supermarkets", "consumer goods", "consumer services",
+               "apparel & fashion", "luxury goods & jewelry"),
+    "manufacturing": ("manufacturing", "machinery", "industrial automation",
+                      "electrical/electronic manufacturing",
+                      "mechanical or industrial engineering", "plastics",
+                      "packaging and containers", "chemicals"),
+    "automotive": ("automotive", "motor vehicle manufacturing"),
+    "media": ("media production", "media and publishing", "publishing",
+              "broadcast media", "online media", "newspapers",
+              "entertainment", "creative arts and entertainment",
+              "motion pictures and film", "music", "design", "graphic design"),
+    "telecom": ("telecommunications", "wireless"),
+    "logistics": ("logistics and supply chain", "transportation and logistics",
+                  "transportation/trucking/railroad", "package/freight delivery",
+                  "warehousing", "maritime", "airlines/aviation"),
+    "energy": ("oil & energy", "energy", "oil and gas",
+               "renewables & environment", "utilities", "mining & metals"),
+    "government": ("government administration",
+                   "government and public administration", "public policy",
+                   "military", "law enforcement", "public safety"),
+    "nonprofit": ("nonprofit organization management",
+                  "non-profit organization management",
+                  "non-profit organizations", "non-profit and social services",
+                  "philanthropy", "civic & social organization"),
+    "hospitality": ("hospitality", "tourism and hospitality", "restaurants",
+                    "food & beverages", "food and beverage",
+                    "food and beverage services", "food production",
+                    "leisure, travel & tourism"),
+    "agriculture": ("farming", "agriculture", "ranching", "dairy", "fishery"),
+}
+
+_ICP_INDUSTRY_BUCKET = {
+    _spelling: _bucket
+    for _bucket, _spellings in _ICP_INDUSTRY_SYNONYMS.items()
+    for _spelling in _spellings
+}
+
+
+def industry_bucket(value) -> Optional[str]:
+    """The sector two industry strings have to share to count as the same.
+
+    None when the string is not one this file recognises — which makes the
+    comparison "cannot tell" rather than "does not match", so an unrecognised
+    industry never silently decides anything.
+    """
+    key = str(value or "").strip().lower()
+    if not key:
+        return None
+    if key in _ICP_INDUSTRY_BUCKET:
+        return _ICP_INDUSTRY_BUCKET[key]
+    # A provider may hand back a longer label than the bucket names ("Software
+    # Development, Cloud Computing"). Take the first spelling it contains.
+    for spelling, bucket in _ICP_INDUSTRY_BUCKET.items():
+        if spelling in key:
+            return bucket
+    return None
+
+
+def lead_satisfies(lead: dict, field: str, value) -> Optional[bool]:
+    """Does this lead demonstrably match one stated filter?
+
+    True  — it matches, keep it.
+    False — it contradicts the filter, drop it.
+    None  — the lead does not say, so nothing can be concluded from it.
+
+    Only the caller decides what None means. enforce_icp drops on it, because a
+    lead that cannot be shown to match the ICP is not a lead the user asked
+    for; but that is a policy about *this* use, not a fact about the row.
+    """
+    if not value:
+        return True
+
+    if field == "industry":
+        wanted = industry_bucket(value)
+        if wanted is None:
+            # We cannot bucket what was asked for, so we cannot judge any row
+            # against it. Saying None here means the leg is left refusing,
+            # which is the honest outcome rather than a coin flip per row.
+            return None
+        got = industry_bucket(lead.get("industry"))
+        return None if got is None else got == wanted
+
+    if field == "company_size":
+        lo, hi = _size_bounds(str(value))
+        if lo is None and hi is None:
+            return None
+        headcount = lead.get("company_headcount")
+        if headcount in (None, ""):
+            headcount = None
+        else:
+            try:
+                headcount = int(str(headcount).replace(",", "").strip())
+            except (TypeError, ValueError):
+                headcount = None
+        if headcount is not None:
+            if lo is not None and headcount < lo:
+                return False
+            if hi is not None and headcount > hi:
+                return False
+            return True
+        # No headcount, but the band may have come back as a band.
+        band = str(lead.get("company_size") or "").strip()
+        if band:
+            blo, bhi = _size_bounds(band)
+            if blo is not None or bhi is not None:
+                # Their band has to sit inside the one that was asked for;
+                # overlapping is not matching.
+                if lo is not None and (blo is None or blo < lo):
+                    return False
+                if hi is not None and (bhi is None or bhi > hi):
+                    return False
+                return True
+        return None
+
+    if field in ("location", "company_location"):
+        kind, resolved = classify_location(str(value))
+        if kind == "region":
+            return None
+        if kind == "country":
+            expected = _GL_COUNTRY_NAME.get(resolved)
+        elif kind == "state":
+            expected = _US_STATE_CODE_TO_NAME.get(resolved, resolved)
+        else:
+            expected = str(value)
+        if not expected:
+            return None
+        haystack = " ".join(
+            str(lead.get(key) or "") for key in ("location", "country", "state", "city")
+        ).lower()
+        if not haystack.strip():
+            return None
+        if expected.lower() in haystack:
+            return True
+        # A country can also be named by its code, and a US state by a lead
+        # whose country is the United States.
+        if kind == "country" and resolved and re.search(
+                rf"(?<![a-z]){re.escape(resolved.lower())}(?![a-z])", haystack):
+            return True
+        return False
+
+    return None
+
+
+def enforce_icp(rows: list, params: dict, fields, transform, dropped: list) -> list:
+    """Keep only the rows that can be shown to match filters this leg skipped.
+
+    `fields` are the filters the provider had no way to search on, so the rows
+    it sent back were never narrowed by them. Each row is read through the
+    provider's own transform — the one uniform shape in this file — and kept
+    only on a positive match.
+    """
+    if not rows or not fields:
+        return rows
+
+    kept = []
+    for row in rows:
+        try:
+            lead = transform(row)
+        except Exception as exc:
+            # A transform that cannot read its own row tells us nothing about
+            # the ICP, and guessing is what this whole function exists to stop.
+            print(f"ICP check: unreadable row ({type(exc).__name__}: {exc}) — dropped")
+            continue
+        verdicts = {field: lead_satisfies(lead, field, params.get(field))
+                    for field in fields}
+        if all(verdicts.get(field) is True for field in fields):
+            kept.append(row)
+
+    dropped.append(len(rows) - len(kept))
+    return kept
+
+
 def log_empty_leg(provider: str, rows_seen: int, scope) -> None:
     """Say which kind of empty a paging leg ended on.
 
@@ -7771,30 +8057,40 @@ async def walk_search(request: SearchRequest):
     search_hash = generate_search_hash(cache_params)
     print(f"Search hash: {search_hash} (chain={'+'.join(chain)})")
 
-    def transform_for(name: str):
+    def transform_for(name: str, bound: dict = None):
         """The transform that reads one provider's row shape.
 
         Bound to `params` so a merged result can transform each row with its own
         provider's reader — the rows are not interchangeable.
+
+        `bound` overrides those params, and passing {} is how the ICP check gets
+        a view of the row *alone*. It has to: transform_bytemine_profile and
+        transform_crustdata_profile both fall back to
+        `search_params.get("industry")` and `search_params.get("company_size")`
+        when the row is silent, which is right for display — a lead from a
+        search for software companies is a software company — and exactly wrong
+        for checking, because the lead would echo the filter back and every row
+        would pass a test it was never actually measured against.
         """
+        bound = params if bound is None else bound
         if name == "bytemine":
-            return lambda profile: transform_bytemine_profile(profile, params)
+            return lambda profile: transform_bytemine_profile(profile, bound)
         if name == "coldiq":
-            return lambda profile: transform_coldiq_profile(profile, params)
+            return lambda profile: transform_coldiq_profile(profile, bound)
         if name == "findymail":
-            return lambda row: transform_findymail_row(row, params)
+            return lambda row: transform_findymail_row(row, bound)
         if name == "fiber":
-            return lambda row: transform_fiber_profile(row, params)
+            return lambda row: transform_fiber_profile(row, bound)
         if name == "contactout":
-            return lambda row: transform_contactout_profile(row, params)
+            return lambda row: transform_contactout_profile(row, bound)
         if name == "moltsets":
-            return lambda row: transform_moltsets_profile(row, params)
+            return lambda row: transform_moltsets_profile(row, bound)
         if name == "getleads":
             return lambda record: transform_getleads_contact(record)
         if name == "treg":
-            return lambda record: transform_treg_person(record, params)
+            return lambda record: transform_treg_person(record, bound)
         if name == "crustdata":
-            return lambda profile: transform_crustdata_profile(profile, params)
+            return lambda profile: transform_crustdata_profile(profile, bound)
         if degraded:
             return lambda profile: transform_preview_profile(profile)
         return lambda profile: transform_wiza_contact(profile, params)
@@ -7829,6 +8125,12 @@ async def walk_search(request: SearchRequest):
     # shown them. A list rather than an int so the legs can append without
     # rebinding a name they do not own.
     suppressed: list[int] = []
+
+    # How many rows were dropped because a leg could not search on part of the
+    # ICP and the row turned out not to match it. Counted separately from
+    # `suppressed` because they answer different questions: one says the pool is
+    # spent, the other says this provider was a poor fit for the filters.
+    off_icp: list[int] = []
 
     # Campaign membership changes after every response, so campaign searches
     # must never reuse a shared cached page. Explicit refresh also bypasses it.
@@ -7900,7 +8202,7 @@ async def walk_search(request: SearchRequest):
     # of the page, so it needs a stable name for the search's own params.
     outer_params = params
 
-    async def run_provider(name: str, want: int = None):
+    async def run_provider(name: str, want: int = None, skip_fields=frozenset()):
         """One provider's search. Returns (raw_results, total, next_cursor).
 
         `want` is how many rows this leg is being asked for, which is the page
@@ -7908,12 +8210,29 @@ async def walk_search(request: SearchRequest):
         legs top up a partial page rather than re-requesting the whole thing:
         several of these bill per record returned, so asking for six when two
         are missing is four rows of waste on every partially-filled search.
+
+        `skip_fields` are filters this provider has no field for. They are left
+        out of the request so the leg can run at all, and then checked against
+        the rows it returns — see enforce_icp. Every leg applies that check in
+        the same place, immediately before the seen-ledger filter, so a row
+        dropped for the ICP is never recorded as shown.
         """
         provider_cursor = cursor_by_provider.get(name)
+        params = dict(outer_params)
         if want is not None:
-            params = {**outer_params, "limit": max(want, 1)}
-        else:
-            params = outer_params
+            params["limit"] = max(want, 1)
+        for field in skip_fields:
+            params.pop(field, None)
+
+        def keep_on_icp(rows: list) -> list:
+            """The ICP filters this leg could not search on, checked locally.
+
+            The transform is bound to {} rather than to the search: see
+            transform_for. A row-only view is the whole point — a lead that
+            echoes the filter back cannot be measured against it.
+            """
+            return enforce_icp(rows, outer_params, skip_fields,
+                               transform_for(name, {}), off_icp)
         if name == "bytemine":
             result = await bytemine_person_search(
                 params, max(min(params.get("limit", 10), 100), 1),
@@ -7924,7 +8243,7 @@ async def walk_search(request: SearchRequest):
             # no repeat protection at all — and the one leg whose people were
             # never written to the ledger, so the legs behind it could not
             # filter them either.
-            found = result["profiles"]
+            found = keep_on_icp(result["profiles"])
             if exclusions:
                 seen = {i for i in (linkedin_identity(u) for u in exclusions) if i}
                 found = [r for r in found
@@ -7963,7 +8282,7 @@ async def walk_search(request: SearchRequest):
                 cursor=provider_cursor,
                 exclude_profiles=exclusions,
             )
-            found = dedupe_crustdata_profiles(result["profiles"])
+            found = keep_on_icp(dedupe_crustdata_profiles(result["profiles"]))
             if skip:
                 found = found[skip:]
             # Provider exclusions require profile URLs; this catches previously
@@ -7993,7 +8312,7 @@ async def walk_search(request: SearchRequest):
                 data = await moltsets_person_search(
                     params, max(wanted - len(found), 1), offset=offset)
                 page_seconds = time.monotonic() - page_started
-                rows = data["profiles"]
+                rows = keep_on_icp(data["profiles"])
                 rows_seen += len(rows)
                 total = data["total"]
 
@@ -8060,7 +8379,7 @@ async def walk_search(request: SearchRequest):
                 page_started = time.monotonic()
                 data = await getleads_person_search(params, wanted, offset=offset)
                 page_seconds = time.monotonic() - page_started
-                page = data["profiles"]
+                page = keep_on_icp(data["profiles"])
                 rows_seen += len(page)
                 total = data["total"]
 
@@ -8123,7 +8442,7 @@ async def walk_search(request: SearchRequest):
             # resumes exactly where the last page stopped.
             data = await fiber_person_search(
                 params, params.get("limit", 10), cursor=provider_cursor)
-            found = data["profiles"]
+            found = keep_on_icp(data["profiles"])
 
             if exclusions:
                 seen = {i for i in (linkedin_identity(u) for u in exclusions) if i}
@@ -8171,7 +8490,7 @@ async def walk_search(request: SearchRequest):
                 data = await contactout_person_search(
                     params, max(wanted - len(found), 1), page=page)
                 page_seconds = time.monotonic() - page_started
-                rows = data["profiles"]
+                rows = keep_on_icp(data["profiles"])
                 rows_seen += len(rows)
                 total = data["total"]
                 next_page = data.get("next_page")
@@ -8221,7 +8540,7 @@ async def walk_search(request: SearchRequest):
             data = await treg_person_search(
                 params, max(min(params.get("limit", 10) + skip, 100), 1),
                 cursor=provider_cursor)
-            found = data["profiles"]
+            found = keep_on_icp(data["profiles"])
             if exclusions:
                 seen = {i for i in (linkedin_identity(u) for u in exclusions) if i}
                 found = [p for p in found
@@ -8244,7 +8563,7 @@ async def walk_search(request: SearchRequest):
             skip = request.start_offset
             data = await findymail_person_search(
                 params, max(min(params.get("limit", 10) + skip, 500), 1))
-            found = data["profiles"]
+            found = keep_on_icp(data["profiles"])
             if exclusions:
                 seen = {i for i in (linkedin_identity(u) for u in exclusions) if i}
                 found = [r for r in found
@@ -8278,7 +8597,7 @@ async def walk_search(request: SearchRequest):
             data = await coldiq_person_search(
                 params, max(min(wanted * COLDIQ_OVERFETCH, 100), 1))
             before = len(data["profiles"])
-            found = data["profiles"]
+            found = keep_on_icp(data["profiles"])
 
             if exclusions:
                 seen = {i for i in (linkedin_identity(u) for u in exclusions) if i}
@@ -8300,6 +8619,7 @@ async def walk_search(request: SearchRequest):
         # account was topped up and Wiza became the leg actually returning
         # people, that was the whole page repeating.
         async def wiza_page(found: list) -> list:
+            found = keep_on_icp(found)
             if exclusions:
                 seen = {i for i in (linkedin_identity(u) for u in exclusions) if i}
                 found = [p for p in found
@@ -8364,11 +8684,36 @@ async def walk_search(request: SearchRequest):
                   f"(not asked: {skipped})")
             break
 
+        # Filters this leg turned out to have no field for. It is asked again
+        # without them and the rows it returns are checked against them here —
+        # see enforce_icp. Bounded by the number of enforceable filters, so the
+        # loop cannot spin.
+        skip_fields: set[str] = set()
         try:
-            outcome = await run_provider(name, wanted - collected)
+            for _ in range(len(ICP_ENFORCEABLE) + 1):
+                try:
+                    outcome = await run_provider(name, wanted - collected,
+                                                 frozenset(skip_fields))
+                    break
+                except ProviderUnsupported as unsupported:
+                    # `field` can name several at once, comma-joined.
+                    named = {f.strip() for f in str(unsupported.field).split(",")
+                             if f.strip()}
+                    local = {f for f in icp_checkable(name, named)
+                             if outer_params.get(f)}
+                    if not local or local <= skip_fields:
+                        raise
+                    skip_fields |= local
+                    print(f"{name} cannot filter on "
+                          f"{', '.join(sorted(local))} — searching without it "
+                          "and checking the rows it returns instead")
+            else:
+                raise ProviderUnsupported(", ".join(sorted(skip_fields)),
+                                          "still unexpressible")
         except ProviderUnsupported as outcome:
-            # This provider cannot express one of the requested filters. It sits
-            # this search out; the others still answer it.
+            # Nothing left to try: the filter cannot be searched on *and*
+            # cannot be checked against a returned lead, so this leg really
+            # would be answering a different question.
             print(f"{name} cannot express {outcome} — it contributes nothing here")
             refused[name] = outcome.field
             attempts.append({"provider": name, "outcome": "unsupported_filter",
@@ -8452,6 +8797,16 @@ async def walk_search(request: SearchRequest):
                      "built_for": seen_scope}
     if not request.campaign_id:
         await cache_store(search_hash, cache_params, cache_payload)
+
+    # Rows a leg returned that turned out not to match a filter it could not
+    # search on. Worth its own line: these were paid for on the legs billed per
+    # row, and a leg that keeps dropping most of its page is one whose
+    # capability entry, or whose place in the chain, is wrong.
+    off = sum(off_icp)
+    if off:
+        print(f"{off} row(s) came back outside the requested ICP from legs that "
+              "could not filter on part of it, and were dropped rather than "
+              "shown — see ICP_CHECKABLE")
 
     hidden = sum(suppressed)
     if hidden and not leads:
