@@ -118,6 +118,15 @@ settings = Settings()
 # budget, with room for the legs that run before it.
 WIZA_REVEAL_BUDGET_SECONDS = 35.0
 
+# Reveals that were bought and had not finished when the budget ran out, by the
+# identity that asked for them. Wiza charges on start, so abandoning one is
+# abandoning a purchase: production shows the same people revealed again at
+# 01:50, 01:56, 16:35 and 17:06, buying a fresh reveal each time a user retried.
+# Capped because it is a process-local courtesy, not a store — a lost entry costs
+# one duplicate reveal, which is what happened on every one of them before.
+_wiza_pending_reveals: dict = {}
+WIZA_PENDING_REVEAL_CAP = 500
+
 # How long a whole /search may spend walking the chain before the legs it has
 # not reached yet are skipped.
 #
@@ -2963,9 +2972,19 @@ async def getleads_call(path: str, body: dict) -> dict:
             status_code=resp.status_code if resp.status_code < 500 else 502,
             detail=f"GetLeads error: {resp.text[:300]}")
     try:
-        return resp.json()
+        payload = resp.json()
     except ValueError:
         raise HTTPException(status_code=502, detail="GetLeads returned a non-JSON body")
+
+    # GetLeads does not answer 402 when the account is spent. It answers a
+    # cheerful 200 with `credits_exhausted: true`, zero contacts and a discount
+    # code — which reads to the chain as "no such people", and read that way for
+    # a whole production log. Latched like any other empty account, so the walk
+    # stops paying a round trip to hear it.
+    if isinstance(payload, dict):
+        provider_note_exhausted("getleads", bool(payload.get("credits_exhausted")),
+                                "GetLeads")
+    return payload
 
 
 def _getleads_timed_out(failure: HTTPException) -> bool:
@@ -2989,6 +3008,8 @@ async def getleads_person_search(params: dict, limit: int, offset: int = 0) -> d
     }
     print(f"GetLeads search body: {json.dumps(body)[:400]}")
     try:
+        if provider_out_of_credits("getleads"):
+            return {"profiles": [], "total": 0, "next_offset": None}
         data = await getleads_call("/api/v1/contacts/search", body)
     except HTTPException as failure:
         # "Search timed out after 50s. Narrow the query (add filters such as
@@ -3072,6 +3093,13 @@ async def findymail_call(method: str, path: str, *, json_body: dict = None,
     failures of this request, and a leg that raises on them takes the whole
     search down with it.
     """
+    # Same latch as ColdIQ and Fiber: 402 is a state of the account, and an
+    # account that has been empty since yesterday will be empty in a minute.
+    # 423 is a paused subscription, which is even less likely to fix itself
+    # between two searches.
+    if provider_out_of_credits("findymail"):
+        return 402, None
+
     headers = {
         "Authorization": f"Bearer {settings.findymail_api_key or ''}",
         "Content-Type": "application/json",
@@ -3086,6 +3114,7 @@ async def findymail_call(method: str, path: str, *, json_body: dict = None,
         print(f"Findymail {path} unreachable: {exc}")
         return 0, None
 
+    provider_note_exhausted("findymail", resp.status_code in (402, 423), "Findymail")
     if resp.status_code != 200:
         print(f"Findymail {path} status: {resp.status_code} {resp.text[:200]}")
     try:
@@ -3529,6 +3558,13 @@ async def fiber_call(path: str, body: dict) -> tuple:
     not failures of this request, and a leg that raises on them takes the whole
     search down with it.
     """
+    # A recent 402 means the account is empty, and an empty account stays empty
+    # for a while. Production answered 402 to every Fiber search *and* every
+    # Fiber email validation, all day — two doomed round trips on each user's
+    # request before the chain reached anyone with something to sell.
+    if provider_out_of_credits("fiber"):
+        return 402, None
+
     headers = {
         "x-api-key": settings.fiber_api_key or "",
         "Content-Type": "application/json",
@@ -3541,6 +3577,7 @@ async def fiber_call(path: str, body: dict) -> tuple:
         print(f"Fiber {path} unreachable: {exc}")
         return 0, None
 
+    provider_note_exhausted("fiber", resp.status_code == 402, "Fiber")
     if resp.status_code != 200:
         print(f"Fiber {path} status: {resp.status_code} {resp.text[:300]}")
     try:
@@ -5318,30 +5355,56 @@ async def coldiq_reveal(request: "EnrichRequest") -> dict:
 # probed on the user's time all day.
 COLDIQ_EXHAUSTED_SECONDS = 900.0
 COLDIQ_EXHAUSTED_MAX_SECONDS = 3600.0
-_coldiq_exhausted_until = 0.0
-_coldiq_exhausted_streak = 0
+
+# One latch per provider, because ColdIQ was never the only one out of credit.
+# A production log has Fiber answering 402 to every search *and* every email
+# validation, Findymail 402 to every lookup, and GetLeads returning
+# `credits_exhausted: true` — none of them latched, so each user's search paid
+# for three doomed round trips before reaching a provider with something to
+# sell. The reasoning that justified the ColdIQ latch was never specific to
+# ColdIQ; only the state was.
+_exhausted_until: dict = {}
+_exhausted_streak: dict = {}
+
+
+def provider_note_exhausted(provider: str, exhausted: bool, label: str = None) -> None:
+    """Latch or clear a provider's out-of-credit state.
+
+    `exhausted` rather than a status code, because they do not all say it the
+    same way: ColdIQ, Fiber and Findymail answer 402, while GetLeads answers a
+    cheerful 200 carrying `credits_exhausted: true`.
+
+    Each consecutive exhausted answer doubles the wait; any other answer resets
+    it, so a top-up is noticed within the hour, without a deploy, and without
+    the provider being probed on a user's time all day.
+    """
+    if not exhausted:
+        _exhausted_streak[provider] = 0
+        return
+
+    streak = _exhausted_streak.get(provider, 0) + 1
+    _exhausted_streak[provider] = streak
+    wait = min(COLDIQ_EXHAUSTED_SECONDS * (2 ** (streak - 1)),
+               COLDIQ_EXHAUSTED_MAX_SECONDS)
+    _exhausted_until[provider] = time.monotonic() + wait
+    print(f"{label or provider} is out of credits — skipping it for "
+          f"{int(wait // 60)} minutes"
+          + (f" (empty for {streak} checks running)" if streak > 1 else ""))
+
+
+def provider_out_of_credits(provider: str) -> bool:
+    """True while a recent exhausted answer says there is nothing to spend."""
+    return time.monotonic() < _exhausted_until.get(provider, 0.0)
 
 
 def coldiq_note_status(status: int) -> None:
     """Record a 402 so the next few calls can skip the round trip."""
-    global _coldiq_exhausted_until, _coldiq_exhausted_streak
-    if status != 402:
-        # Any real answer means there is something to spend again.
-        _coldiq_exhausted_streak = 0
-        return
-
-    _coldiq_exhausted_streak += 1
-    wait = min(COLDIQ_EXHAUSTED_SECONDS * (2 ** (_coldiq_exhausted_streak - 1)),
-               COLDIQ_EXHAUSTED_MAX_SECONDS)
-    _coldiq_exhausted_until = time.monotonic() + wait
-    print(f"ColdIQ is out of credits — skipping it for {int(wait // 60)} minutes"
-          + (f" (empty for {_coldiq_exhausted_streak} checks running)"
-             if _coldiq_exhausted_streak > 1 else ""))
+    provider_note_exhausted("coldiq", status == 402, "ColdIQ")
 
 
 def coldiq_out_of_credits() -> bool:
     """True while a recent 402 says there is nothing to spend."""
-    return time.monotonic() < _coldiq_exhausted_until
+    return provider_out_of_credits("coldiq")
 
 
 async def coldiq_verb(path: str, identity: dict) -> Optional[dict]:
@@ -6926,16 +6989,36 @@ async def record_new_campaign_profiles(campaign_id: str, profiles: list[dict]) -
         print(f"WARNING: campaign seen store failed ({e})")
         return profiles
 
-async def cache_lookup(search_hash: str):
+# How long a revealed contact is remembered. Not the search TTL, which is an
+# hour, because the two are not the same kind of thing: a page of search results
+# should go stale so the next search finds new people, while a revealed email is
+# a fact about a person and does not stop being true at 4pm.
+#
+# Sharing the search TTL meant production paid for the same reveals four times
+# over one day — "Cache EXPIRED for hash: …" and then the identical Wiza and
+# ContactOut calls for Ash Metry, Guy Arama, Isaac Harmon and the rest, at
+# 01:50, 01:56, 16:35 and 17:06. The reveal ledger exists precisely to stop
+# that, and an hour-long memory is not a ledger.
+REVEAL_CACHE_TTL_SECONDS = 30 * 24 * 3600
+
+
+async def cache_lookup(search_hash: str, ttl_seconds: int = None):
     """Return the CachedSearch row for a hash, or None. Never raises: a DB outage
-    degrades to a live (uncached) fetch instead of failing the whole request."""
+    degrades to a live (uncached) fetch instead of failing the whole request.
+
+    `ttl_seconds` overrides the search TTL for callers whose rows are not search
+    results — the reveal ledger passes REVEAL_CACHE_TTL_SECONDS. It also bypasses
+    SEARCH_CACHE_TTL_SECONDS=0, which is a switch for turning off *search*
+    caching and must not quietly turn a paid reveal into a repeat purchase.
+    """
     try:
         async with async_session() as session:
             stmt = select(CachedSearch).where(CachedSearch.search_hash == search_hash)
             cached = (await session.execute(stmt)).scalar_one_or_none()
             if not cached:
                 return None
-            ttl = max(settings.search_cache_ttl_seconds, 0)
+            ttl = (max(settings.search_cache_ttl_seconds, 0)
+                   if ttl_seconds is None else max(ttl_seconds, 0))
             if ttl == 0:
                 return None
             cached_at = cached.updated_at or cached.created_at
@@ -7280,7 +7363,7 @@ async def enrich_lead(request: EnrichRequest):
     """
     key = enrich_identity_key(request)
 
-    stored = await cache_lookup(key)
+    stored = await cache_lookup(key, REVEAL_CACHE_TTL_SECONDS)
     if stored:
         try:
             remembered = json.loads(stored.results)
@@ -7617,28 +7700,48 @@ async def reveal_lead(request: EnrichRequest):
         "enrichment_level": "partial",
     }
 
-    print(f"Wiza individual reveal request: {json.dumps(body)}")
+    # A reveal this request already paid for and could not wait out. Wiza
+    # charges on *start*, so the 504 below used to throw away a purchase: the
+    # user retried, a second reveal was bought for the same person, and
+    # production shows the same names revealed again and again. Resuming costs
+    # nothing and is usually already finished by now.
+    pending_key = enrich_identity_key(request)
+    resumed = _wiza_pending_reveals.get(pending_key)
+
+    print(f"Wiza individual reveal request: {json.dumps(body)}"
+          if not resumed else
+          f"Wiza reveal {resumed} was already bought for this lead — resuming it "
+          "rather than paying for another")
 
     async with httpx.AsyncClient(timeout=60.0) as client:
-        # Start the reveal
-        start_resp = await client.post(
-            f"{WIZA_BASE}/individual_reveals",
-            headers=headers,
-            json=body,
-        )
-        print(f"Wiza reveal start status: {start_resp.status_code} {start_resp.text[:200]}")
-
-        if start_resp.status_code == 429:
-            raise HTTPException(status_code=429, detail="Wiza rate limit — try again in a moment")
-        if start_resp.status_code not in (200, 201):
-            raise HTTPException(
-                status_code=start_resp.status_code,
-                detail=f"Wiza enrich error: {start_resp.text}",
+        if resumed:
+            reveal_id = resumed
+        else:
+            # Start the reveal
+            start_resp = await client.post(
+                f"{WIZA_BASE}/individual_reveals",
+                headers=headers,
+                json=body,
             )
+            print(f"Wiza reveal start status: {start_resp.status_code} {start_resp.text[:200]}")
 
-        reveal_id = start_resp.json().get("data", {}).get("id")
-        if not reveal_id:
-            raise HTTPException(status_code=500, detail="Wiza returned no reveal ID")
+            if start_resp.status_code == 429:
+                raise HTTPException(status_code=429, detail="Wiza rate limit — try again in a moment")
+            if start_resp.status_code not in (200, 201):
+                raise HTTPException(
+                    status_code=start_resp.status_code,
+                    detail=f"Wiza enrich error: {start_resp.text}",
+                )
+
+            reveal_id = start_resp.json().get("data", {}).get("id")
+            if not reveal_id:
+                raise HTTPException(status_code=500, detail="Wiza returned no reveal ID")
+            # Remembered before polling, not after. If this request runs out of
+            # budget the reveal is already bought and still finishing, and the
+            # next attempt has to resume it rather than buy another.
+            _wiza_pending_reveals[pending_key] = reveal_id
+            while len(_wiza_pending_reveals) > WIZA_PENDING_REVEAL_CAP:
+                _wiza_pending_reveals.pop(next(iter(_wiza_pending_reveals)))
 
         # Poll to a wall-clock deadline, not a poll count.
         #
@@ -7668,6 +7771,8 @@ async def reveal_lead(request: EnrichRequest):
                 contact = {k: v for k, v in data.items()
                            if k not in ("id", "status", "is_complete", "enrichment_level",
                                         "email_credits", "phone_credits", "export_credits", "api_credits")}
+                # Finished, so it is no longer owed to anyone.
+                _wiza_pending_reveals.pop(pending_key, None)
                 lead = await verify_revealed_lead(transform_reveal_contact(contact), "wiza")
                 return {
                     "success": True,
@@ -7677,12 +7782,15 @@ async def reveal_lead(request: EnrichRequest):
                     "lead": lead,
                 }
 
-        # The reveal was paid for and will finish; naming it makes the credit
-        # traceable instead of vanishing behind a gateway timeout.
+        # The reveal is bought and will finish. It stays in
+        # _wiza_pending_reveals, so asking for this lead again resumes this
+        # reveal instead of buying a second one — which is what production was
+        # doing every time a user retried.
         raise HTTPException(
             status_code=504,
             detail=f"Wiza reveal {reveal_id} did not finish within "
-                   f"{int(WIZA_REVEAL_BUDGET_SECONDS)}s — it is still resolving")
+                   f"{int(WIZA_REVEAL_BUDGET_SECONDS)}s — it is still resolving "
+                   "and asking again will pick it up rather than re-charge")
 
 
 async def _llm_parse_icp(text: str) -> dict:

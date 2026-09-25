@@ -668,7 +668,7 @@ class ProviderFallbackTests(unittest.IsolatedAsyncioTestCase):
                 return r
             return run
 
-        async def no_cache(_hash):
+        async def no_cache(_hash, ttl_seconds=None):
             return None
 
         async def no_store(*args, **kwargs):
@@ -2346,7 +2346,7 @@ class GetleadsRepeatLeadTests(unittest.IsolatedAsyncioTestCase):
     async def run_search(self, request, pages):
         search, offsets = self._pages(pages)
 
-        async def no_cache(_hash):
+        async def no_cache(_hash, ttl_seconds=None):
             return None
 
         async def no_store(*args, **kwargs):
@@ -2721,7 +2721,162 @@ class LinkedInIndustryTests(unittest.TestCase):
                 main.build_crustdata_filters({"job_title": "F", "industry": value})
 
 
-class FindymailVerifyTests(unittest.IsolatedAsyncioTestCase):
+class SharedCreditLatchTests(unittest.IsolatedAsyncioTestCase):
+    """ColdIQ was never the only provider out of credit.
+
+    One production log has Fiber answering 402 to every search *and* every email
+    validation, Findymail 402 to every lookup, and GetLeads a cheerful 200
+    carrying `credits_exhausted: true`. None latched, so each user's search paid
+    for three doomed round trips before reaching a provider with something to
+    sell. The reasoning behind the ColdIQ latch was never specific to ColdIQ.
+    """
+
+    def setUp(self):
+        main._exhausted_until.clear()
+        main._exhausted_streak.clear()
+
+    def test_each_provider_latches_on_its_own(self):
+        main.provider_note_exhausted("fiber", True)
+
+        self.assertTrue(main.provider_out_of_credits("fiber"))
+        self.assertFalse(main.provider_out_of_credits("findymail"))
+        self.assertFalse(main.coldiq_out_of_credits())
+
+    def test_a_still_empty_account_is_asked_less_and_less_often(self):
+        waits = []
+        for _ in range(4):
+            before = main.time.monotonic()
+            main.provider_note_exhausted("fiber", True)
+            waits.append(round(main._exhausted_until["fiber"] - before))
+
+        self.assertEqual(waits, [900, 1800, 3600, 3600])
+
+    def test_one_real_answer_clears_the_backoff(self):
+        main.provider_note_exhausted("fiber", True)
+        main.provider_note_exhausted("fiber", True)
+        main.provider_note_exhausted("fiber", False)
+
+        before = main.time.monotonic()
+        main.provider_note_exhausted("fiber", True)
+        self.assertEqual(round(main._exhausted_until["fiber"] - before), 900)
+
+    def test_getleads_exhaustion_is_a_body_field_not_a_status(self):
+        # It answers 200 with zero contacts and a discount code, which reads to
+        # the chain as "no such people" — and read that way for a whole log.
+        main.provider_note_exhausted("getleads", True, "GetLeads")
+        self.assertTrue(main.provider_out_of_credits("getleads"))
+
+    async def test_a_latched_fiber_is_not_called_again(self):
+        FiberClient.reset({"/v1/people-search": (402, {"error": "no credits"})})
+        with patch.object(main.httpx, "AsyncClient", FiberClient), _fb():
+            first = await main.fiber_person_search({"job_title": "Founder"}, 6)
+            calls_after_first = len(FiberClient.calls)
+            second = await main.fiber_person_search({"job_title": "Founder"}, 6)
+
+        self.assertEqual(first["profiles"], [])
+        self.assertEqual(second["profiles"], [])
+        # The second search never left the process.
+        self.assertEqual(len(FiberClient.calls), calls_after_first)
+
+    async def test_a_latched_fiber_still_reports_out_of_credits_to_the_verifier(self):
+        # fiber_verify_email reads the 402 to explain itself, so the short
+        # circuit has to keep saying 402 rather than inventing a new code.
+        FiberClient.reset({"/v1/validate-email/single": (402, {"error": "x"})})
+        with patch.object(main.httpx, "AsyncClient", FiberClient), _fb():
+            await main.fiber_verify_email("a@b.com")
+            verdict = await main.fiber_verify_email("c@d.com")
+
+        self.assertEqual(verdict["status"], "unknown")
+        self.assertIn("credits", verdict["reason"])
+
+
+class RevealTtlTests(unittest.TestCase):
+    """A revealed email is a fact about a person, not a page of results.
+
+    Sharing the one-hour search TTL meant production bought the same reveals
+    four times in a day: "Cache EXPIRED for hash: …" and then the identical Wiza
+    and ContactOut calls for the same names at 01:50, 01:56, 16:35 and 17:06.
+    """
+
+    def test_a_reveal_outlives_a_search_by_a_long_way(self):
+        self.assertGreater(main.REVEAL_CACHE_TTL_SECONDS,
+                           main.settings.search_cache_ttl_seconds * 24)
+
+    def test_the_enrich_path_asks_for_the_reveal_ttl(self):
+        # Asserted on the source: passing the wrong TTL here does not fail, it
+        # just silently starts charging twice a day again.
+        import inspect
+        body = inspect.getsource(main.enrich_lead)
+        self.assertIn("cache_lookup(key, REVEAL_CACHE_TTL_SECONDS)", body)
+
+    def test_turning_off_search_caching_does_not_turn_off_the_reveal_ledger(self):
+        # SEARCH_CACHE_TTL_SECONDS=0 is a switch for search caching. Letting it
+        # reach the reveal ledger would restore double-charging on every reveal.
+        import inspect
+        body = inspect.getsource(main.cache_lookup)
+        self.assertIn("if ttl_seconds is None", body)
+
+
+class WizaPendingRevealTests(unittest.TestCase):
+    """Wiza charges on start, so abandoning a slow reveal abandons a purchase.
+
+    The 504 used to throw the reveal away: the user retried, a second reveal was
+    bought for the same person, and the log shows exactly that happening over
+    and over.
+    """
+
+    def setUp(self):
+        main._wiza_pending_reveals.clear()
+
+    def test_a_pending_reveal_is_remembered_before_it_is_polled(self):
+        # Remembered after polling would lose precisely the ones that time out,
+        # which are the only ones this exists for.
+        import inspect
+        body = inspect.getsource(main.reveal_lead)
+        remembered = body.index("_wiza_pending_reveals[pending_key] = reveal_id")
+        polled = body.index("Poll to a wall-clock deadline")
+        self.assertLess(remembered, polled)
+
+    def test_a_finished_reveal_stops_being_owed(self):
+        import inspect
+        body = inspect.getsource(main.reveal_lead)
+        self.assertIn("_wiza_pending_reveals.pop(pending_key, None)", body)
+
+    def test_the_resume_happens_before_a_new_reveal_is_started(self):
+        import inspect
+        body = inspect.getsource(main.reveal_lead)
+        self.assertLess(body.index("resumed = _wiza_pending_reveals.get(pending_key)"),
+                        body.index("individual_reveals"))
+        self.assertIn("if resumed:", body)
+
+    def test_the_memory_is_capped(self):
+        for i in range(main.WIZA_PENDING_REVEAL_CAP + 50):
+            main._wiza_pending_reveals[f"k{i}"] = i
+            while len(main._wiza_pending_reveals) > main.WIZA_PENDING_REVEAL_CAP:
+                main._wiza_pending_reveals.pop(next(iter(main._wiza_pending_reveals)))
+
+        self.assertEqual(len(main._wiza_pending_reveals),
+                         main.WIZA_PENDING_REVEAL_CAP)
+
+
+class CreditLatchIsolation(unittest.IsolatedAsyncioTestCase):
+    """Clears the shared out-of-credit latch between tests.
+
+    provider_note_exhausted latches on a module-level dict on purpose: that is
+    how an empty account stops costing every search a doomed round trip. Inside
+    one test run it also means a 402 stubbed by one test silently short-circuits
+    the next test's call, which surfaces as an unrelated failure further down
+    the file. Any class whose stubs answer 402, 423 or `credits_exhausted`
+    belongs here.
+    """
+
+    def setUp(self):
+        super().setUp()
+        main._exhausted_until.clear()
+        main._exhausted_streak.clear()
+
+
+class FindymailVerifyTests(CreditLatchIsolation):
     async def test_a_verified_address_is_deliverable_and_sendable(self):
         FindymailClient.reset({
             ("POST", "/api/verify"):
@@ -2757,7 +2912,7 @@ class FindymailVerifyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("credits", verdict["reason"])
 
 
-class FindymailVerifierFallbackTests(unittest.IsolatedAsyncioTestCase):
+class FindymailVerifierFallbackTests(CreditLatchIsolation):
     """ColdIQ is the primary checker and the one that runs out of credits.
 
     Production spent weeks answering "unknown" for every address because of it.
@@ -2800,7 +2955,7 @@ class FindymailVerifierFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(FindymailClient.calls, [])
 
 
-class FindymailSearchTests(unittest.IsolatedAsyncioTestCase):
+class FindymailSearchTests(CreditLatchIsolation):
     async def test_submit_poll_then_page(self):
         FindymailClient.reset({
             ("POST", "/api/intellimatch/search"): (200, {"hash": "abc123"}),
@@ -3049,7 +3204,7 @@ class FiberIndustryTests(unittest.TestCase):
                 {"job_title": "F", "industry": "vertical ai agents"})
 
 
-class FiberSearchTests(unittest.IsolatedAsyncioTestCase):
+class FiberSearchTests(CreditLatchIsolation):
     def _row(self):
         return {"name": "Ada Lovelace", "first_name": "Ada", "last_name": "Lovelace",
                 "headline": "Founder at Acme", "primary_slug": "ada",
@@ -3170,7 +3325,7 @@ class FiberRevealTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(FiberClient.calls, [])
 
 
-class FiberVerifyTests(unittest.IsolatedAsyncioTestCase):
+class FiberVerifyTests(CreditLatchIsolation):
     async def _verdict(self, payload, status=200):
         FiberClient.reset({"/v1/validate-email/single": (status, payload)})
         with patch.object(main.httpx, "AsyncClient", FiberClient), _fb():
@@ -3416,7 +3571,7 @@ class RevealLedgerTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.01)
             return answer if answer is not None else self._answer()
 
-        async def lookup(key):
+        async def lookup(key, ttl_seconds=None):
             if stored is not None and key not in store:
                 return Row(stored)
             return store.get(key)
@@ -3756,7 +3911,7 @@ class DuplicateSearchTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self, payload):
                 self.results = json.dumps(payload)
 
-        async def lookup(h):
+        async def lookup(h, ttl_seconds=None):
             return stored.get(h) if cache_enabled else None
 
         async def store(h, params, payload):
@@ -4045,7 +4200,7 @@ class CustomerIdentitySourceTests(unittest.TestCase):
                                                "next_cursor": None}],
                                   "total": 1, "provider": "bytemine"})
 
-        async def lookup(_h):
+        async def lookup(_h, ttl_seconds=None):
             return Row()
 
         async def store(*a, **k):
@@ -4095,7 +4250,7 @@ class CustomerIdentitySourceTests(unittest.TestCase):
                                                "next_cursor": None}],
                                   "total": 1, "provider": "bytemine"})
 
-        async def lookup(_h):
+        async def lookup(_h, ttl_seconds=None):
             return Row()
 
         async def seen(scope, limit=None):
@@ -4176,12 +4331,12 @@ class ColdiqCreditLatchTests(unittest.IsolatedAsyncioTestCase):
     """A 402 is a fact about the balance — there is no reason to keep asking."""
 
     def setUp(self):
-        main._coldiq_exhausted_until = 0.0
-        main._coldiq_exhausted_streak = 0
+        main._exhausted_until.clear()
+        main._exhausted_streak.clear()
 
     def tearDown(self):
-        main._coldiq_exhausted_until = 0.0
-        main._coldiq_exhausted_streak = 0
+        main._exhausted_until.clear()
+        main._exhausted_streak.clear()
 
     def test_a_still_empty_account_is_asked_less_and_less_often(self):
         # Production re-asked the same balance of 0.1102 four times an hour all
@@ -4190,7 +4345,7 @@ class ColdiqCreditLatchTests(unittest.IsolatedAsyncioTestCase):
         for _ in range(6):
             before = main.time.monotonic()
             main.coldiq_note_status(402)
-            waits.append(round(main._coldiq_exhausted_until - before))
+            waits.append(round(main._exhausted_until["coldiq"] - before))
 
         self.assertEqual(waits[:3], [900, 1800, 3600])
         # Capped, so a top-up is still noticed within the hour.
@@ -4203,7 +4358,7 @@ class ColdiqCreditLatchTests(unittest.IsolatedAsyncioTestCase):
 
         before = main.time.monotonic()
         main.coldiq_note_status(402)
-        self.assertEqual(round(main._coldiq_exhausted_until - before), 900)
+        self.assertEqual(round(main._exhausted_until["coldiq"] - before), 900)
 
     def test_a_non_payment_error_does_not_latch(self):
         main.coldiq_note_status(429)
@@ -4238,7 +4393,7 @@ class ColdiqCreditLatchTests(unittest.IsolatedAsyncioTestCase):
         main.coldiq_note_status(402)
         self.assertTrue(main.coldiq_out_of_credits())
 
-        main._coldiq_exhausted_until = 0.0
+        main._exhausted_until.clear()
         RoutedClient.reset({"/v1/email/find": (200, {"data": {"email": "a@b.com"}})})
         with patch.object(main.httpx, "AsyncClient", RoutedClient), \
              patch.object(main.settings, "coldiq_api_key", "key"):
@@ -4625,7 +4780,7 @@ class CacheReplayTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self, payload):
                 self.results = json.dumps(payload)
 
-        async def lookup(h):
+        async def lookup(h, ttl_seconds=None):
             return stored.get(h)
 
         async def store(h, params, payload):
@@ -5985,7 +6140,7 @@ class ContactOutRepeatLeadTests(unittest.IsolatedAsyncioTestCase):
     async def run_search(self, request, pages):
         search, asked = self._pages(pages)
 
-        async def no_cache(_hash):
+        async def no_cache(_hash, ttl_seconds=None):
             return None
 
         async def no_store(*args, **kwargs):
@@ -6864,7 +7019,7 @@ class MoltSetsRepeatLeadTests(unittest.IsolatedAsyncioTestCase):
     async def run_search(self, request, pages):
         search, asked = self._pages(pages)
 
-        async def no_cache(_hash):
+        async def no_cache(_hash, ttl_seconds=None):
             return None
 
         async def no_store(*args, **kwargs):
