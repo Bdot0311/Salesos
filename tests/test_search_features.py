@@ -668,7 +668,7 @@ class ProviderFallbackTests(unittest.IsolatedAsyncioTestCase):
                 return r
             return run
 
-        async def no_cache(_hash):
+        async def no_cache(_hash, ttl_seconds=None):
             return None
 
         async def no_store(*args, **kwargs):
@@ -793,20 +793,18 @@ class ProviderFallbackTests(unittest.IsolatedAsyncioTestCase):
         outcomes = {a["provider"]: a["outcome"] for a in response.provider_attempts}
         self.assertEqual(outcomes["bytemine"], "no_results")
 
-    async def test_a_filter_bytemine_cannot_express_moves_to_crustdata(self):
-        # A country location has no field on /contacts/search. Falling through
-        # keeps the ICP whole; dropping the country would not.
+    async def test_a_filter_the_rows_cannot_evidence_keeps_refusing(self):
+        # Bytemine builds its location from city and state only, so a row cannot
+        # prove which country it is in. Running the leg anyway would spend a
+        # search and discard every row — worse than sitting out. ICP_CHECKABLE
+        # is what keeps that honest.
         response, calls = await self.run_search(
             main.SearchRequest(job_title="Founder", location="US"),
-            # Bytemine is deliberately not stubbed: the real
-            # build_bytemine_filters must be the thing that refuses.
             {"crustdata": {"profiles": [{"crustdata_person_id": 9}],
                            "total": 1, "next_cursor": None}},
         )
 
-        # Bytemine sits this one out; the providers that can express it answer.
         self.assertNotIn("bytemine", calls)
-        self.assertEqual(response.provider, "crustdata")
         outcomes = {a["provider"]: a["outcome"] for a in response.provider_attempts}
         self.assertEqual(outcomes["bytemine"], "unsupported_filter")
 
@@ -815,9 +813,11 @@ class ProviderFallbackTests(unittest.IsolatedAsyncioTestCase):
         # no configured provider can express the filter. An empty success here
         # reads as "no such people exist" and tells the user nothing to change.
         #
-        # Bytemine refuses the country before spending a company-search credit;
-        # Wiza refuses the keyword. Neither is stubbed, so both refusals are the
-        # real ones, and bytemine_call must never be reached.
+        # Bytemine refuses the country — its rows carry city and state only, so
+        # nothing about them could prove a country and the local check cannot
+        # stand in for the missing field. Wiza refuses the keyword, which no
+        # lead shape carries at all. Neither is stubbed, so both refusals are
+        # the real ones, and bytemine_call must never be reached.
         with patch.object(main, "bytemine_call", self._fail("must not be called")):
             with self.assertRaises(HTTPException) as caught:
                 await self.run_search(
@@ -2346,7 +2346,7 @@ class GetleadsRepeatLeadTests(unittest.IsolatedAsyncioTestCase):
     async def run_search(self, request, pages):
         search, offsets = self._pages(pages)
 
-        async def no_cache(_hash):
+        async def no_cache(_hash, ttl_seconds=None):
             return None
 
         async def no_store(*args, **kwargs):
@@ -2721,7 +2721,162 @@ class LinkedInIndustryTests(unittest.TestCase):
                 main.build_crustdata_filters({"job_title": "F", "industry": value})
 
 
-class FindymailVerifyTests(unittest.IsolatedAsyncioTestCase):
+class SharedCreditLatchTests(unittest.IsolatedAsyncioTestCase):
+    """ColdIQ was never the only provider out of credit.
+
+    One production log has Fiber answering 402 to every search *and* every email
+    validation, Findymail 402 to every lookup, and GetLeads a cheerful 200
+    carrying `credits_exhausted: true`. None latched, so each user's search paid
+    for three doomed round trips before reaching a provider with something to
+    sell. The reasoning behind the ColdIQ latch was never specific to ColdIQ.
+    """
+
+    def setUp(self):
+        main._exhausted_until.clear()
+        main._exhausted_streak.clear()
+
+    def test_each_provider_latches_on_its_own(self):
+        main.provider_note_exhausted("fiber", True)
+
+        self.assertTrue(main.provider_out_of_credits("fiber"))
+        self.assertFalse(main.provider_out_of_credits("findymail"))
+        self.assertFalse(main.coldiq_out_of_credits())
+
+    def test_a_still_empty_account_is_asked_less_and_less_often(self):
+        waits = []
+        for _ in range(4):
+            before = main.time.monotonic()
+            main.provider_note_exhausted("fiber", True)
+            waits.append(round(main._exhausted_until["fiber"] - before))
+
+        self.assertEqual(waits, [900, 1800, 3600, 3600])
+
+    def test_one_real_answer_clears_the_backoff(self):
+        main.provider_note_exhausted("fiber", True)
+        main.provider_note_exhausted("fiber", True)
+        main.provider_note_exhausted("fiber", False)
+
+        before = main.time.monotonic()
+        main.provider_note_exhausted("fiber", True)
+        self.assertEqual(round(main._exhausted_until["fiber"] - before), 900)
+
+    def test_getleads_exhaustion_is_a_body_field_not_a_status(self):
+        # It answers 200 with zero contacts and a discount code, which reads to
+        # the chain as "no such people" — and read that way for a whole log.
+        main.provider_note_exhausted("getleads", True, "GetLeads")
+        self.assertTrue(main.provider_out_of_credits("getleads"))
+
+    async def test_a_latched_fiber_is_not_called_again(self):
+        FiberClient.reset({"/v1/people-search": (402, {"error": "no credits"})})
+        with patch.object(main.httpx, "AsyncClient", FiberClient), _fb():
+            first = await main.fiber_person_search({"job_title": "Founder"}, 6)
+            calls_after_first = len(FiberClient.calls)
+            second = await main.fiber_person_search({"job_title": "Founder"}, 6)
+
+        self.assertEqual(first["profiles"], [])
+        self.assertEqual(second["profiles"], [])
+        # The second search never left the process.
+        self.assertEqual(len(FiberClient.calls), calls_after_first)
+
+    async def test_a_latched_fiber_still_reports_out_of_credits_to_the_verifier(self):
+        # fiber_verify_email reads the 402 to explain itself, so the short
+        # circuit has to keep saying 402 rather than inventing a new code.
+        FiberClient.reset({"/v1/validate-email/single": (402, {"error": "x"})})
+        with patch.object(main.httpx, "AsyncClient", FiberClient), _fb():
+            await main.fiber_verify_email("a@b.com")
+            verdict = await main.fiber_verify_email("c@d.com")
+
+        self.assertEqual(verdict["status"], "unknown")
+        self.assertIn("credits", verdict["reason"])
+
+
+class RevealTtlTests(unittest.TestCase):
+    """A revealed email is a fact about a person, not a page of results.
+
+    Sharing the one-hour search TTL meant production bought the same reveals
+    four times in a day: "Cache EXPIRED for hash: …" and then the identical Wiza
+    and ContactOut calls for the same names at 01:50, 01:56, 16:35 and 17:06.
+    """
+
+    def test_a_reveal_outlives_a_search_by_a_long_way(self):
+        self.assertGreater(main.REVEAL_CACHE_TTL_SECONDS,
+                           main.settings.search_cache_ttl_seconds * 24)
+
+    def test_the_enrich_path_asks_for_the_reveal_ttl(self):
+        # Asserted on the source: passing the wrong TTL here does not fail, it
+        # just silently starts charging twice a day again.
+        import inspect
+        body = inspect.getsource(main.enrich_lead)
+        self.assertIn("cache_lookup(key, REVEAL_CACHE_TTL_SECONDS)", body)
+
+    def test_turning_off_search_caching_does_not_turn_off_the_reveal_ledger(self):
+        # SEARCH_CACHE_TTL_SECONDS=0 is a switch for search caching. Letting it
+        # reach the reveal ledger would restore double-charging on every reveal.
+        import inspect
+        body = inspect.getsource(main.cache_lookup)
+        self.assertIn("if ttl_seconds is None", body)
+
+
+class WizaPendingRevealTests(unittest.TestCase):
+    """Wiza charges on start, so abandoning a slow reveal abandons a purchase.
+
+    The 504 used to throw the reveal away: the user retried, a second reveal was
+    bought for the same person, and the log shows exactly that happening over
+    and over.
+    """
+
+    def setUp(self):
+        main._wiza_pending_reveals.clear()
+
+    def test_a_pending_reveal_is_remembered_before_it_is_polled(self):
+        # Remembered after polling would lose precisely the ones that time out,
+        # which are the only ones this exists for.
+        import inspect
+        body = inspect.getsource(main.reveal_lead)
+        remembered = body.index("_wiza_pending_reveals[pending_key] = reveal_id")
+        polled = body.index("Poll to a wall-clock deadline")
+        self.assertLess(remembered, polled)
+
+    def test_a_finished_reveal_stops_being_owed(self):
+        import inspect
+        body = inspect.getsource(main.reveal_lead)
+        self.assertIn("_wiza_pending_reveals.pop(pending_key, None)", body)
+
+    def test_the_resume_happens_before_a_new_reveal_is_started(self):
+        import inspect
+        body = inspect.getsource(main.reveal_lead)
+        self.assertLess(body.index("resumed = _wiza_pending_reveals.get(pending_key)"),
+                        body.index("individual_reveals"))
+        self.assertIn("if resumed:", body)
+
+    def test_the_memory_is_capped(self):
+        for i in range(main.WIZA_PENDING_REVEAL_CAP + 50):
+            main._wiza_pending_reveals[f"k{i}"] = i
+            while len(main._wiza_pending_reveals) > main.WIZA_PENDING_REVEAL_CAP:
+                main._wiza_pending_reveals.pop(next(iter(main._wiza_pending_reveals)))
+
+        self.assertEqual(len(main._wiza_pending_reveals),
+                         main.WIZA_PENDING_REVEAL_CAP)
+
+
+class CreditLatchIsolation(unittest.IsolatedAsyncioTestCase):
+    """Clears the shared out-of-credit latch between tests.
+
+    provider_note_exhausted latches on a module-level dict on purpose: that is
+    how an empty account stops costing every search a doomed round trip. Inside
+    one test run it also means a 402 stubbed by one test silently short-circuits
+    the next test's call, which surfaces as an unrelated failure further down
+    the file. Any class whose stubs answer 402, 423 or `credits_exhausted`
+    belongs here.
+    """
+
+    def setUp(self):
+        super().setUp()
+        main._exhausted_until.clear()
+        main._exhausted_streak.clear()
+
+
+class FindymailVerifyTests(CreditLatchIsolation):
     async def test_a_verified_address_is_deliverable_and_sendable(self):
         FindymailClient.reset({
             ("POST", "/api/verify"):
@@ -2757,7 +2912,7 @@ class FindymailVerifyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("credits", verdict["reason"])
 
 
-class FindymailVerifierFallbackTests(unittest.IsolatedAsyncioTestCase):
+class FindymailVerifierFallbackTests(CreditLatchIsolation):
     """ColdIQ is the primary checker and the one that runs out of credits.
 
     Production spent weeks answering "unknown" for every address because of it.
@@ -2800,7 +2955,7 @@ class FindymailVerifierFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(FindymailClient.calls, [])
 
 
-class FindymailSearchTests(unittest.IsolatedAsyncioTestCase):
+class FindymailSearchTests(CreditLatchIsolation):
     async def test_submit_poll_then_page(self):
         FindymailClient.reset({
             ("POST", "/api/intellimatch/search"): (200, {"hash": "abc123"}),
@@ -3049,7 +3204,7 @@ class FiberIndustryTests(unittest.TestCase):
                 {"job_title": "F", "industry": "vertical ai agents"})
 
 
-class FiberSearchTests(unittest.IsolatedAsyncioTestCase):
+class FiberSearchTests(CreditLatchIsolation):
     def _row(self):
         return {"name": "Ada Lovelace", "first_name": "Ada", "last_name": "Lovelace",
                 "headline": "Founder at Acme", "primary_slug": "ada",
@@ -3170,7 +3325,7 @@ class FiberRevealTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(FiberClient.calls, [])
 
 
-class FiberVerifyTests(unittest.IsolatedAsyncioTestCase):
+class FiberVerifyTests(CreditLatchIsolation):
     async def _verdict(self, payload, status=200):
         FiberClient.reset({"/v1/validate-email/single": (status, payload)})
         with patch.object(main.httpx, "AsyncClient", FiberClient), _fb():
@@ -3416,7 +3571,7 @@ class RevealLedgerTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.01)
             return answer if answer is not None else self._answer()
 
-        async def lookup(key):
+        async def lookup(key, ttl_seconds=None):
             if stored is not None and key not in store:
                 return Row(stored)
             return store.get(key)
@@ -3756,7 +3911,7 @@ class DuplicateSearchTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self, payload):
                 self.results = json.dumps(payload)
 
-        async def lookup(h):
+        async def lookup(h, ttl_seconds=None):
             return stored.get(h) if cache_enabled else None
 
         async def store(h, params, payload):
@@ -4045,7 +4200,7 @@ class CustomerIdentitySourceTests(unittest.TestCase):
                                                "next_cursor": None}],
                                   "total": 1, "provider": "bytemine"})
 
-        async def lookup(_h):
+        async def lookup(_h, ttl_seconds=None):
             return Row()
 
         async def store(*a, **k):
@@ -4095,7 +4250,7 @@ class CustomerIdentitySourceTests(unittest.TestCase):
                                                "next_cursor": None}],
                                   "total": 1, "provider": "bytemine"})
 
-        async def lookup(_h):
+        async def lookup(_h, ttl_seconds=None):
             return Row()
 
         async def seen(scope, limit=None):
@@ -4176,12 +4331,12 @@ class ColdiqCreditLatchTests(unittest.IsolatedAsyncioTestCase):
     """A 402 is a fact about the balance — there is no reason to keep asking."""
 
     def setUp(self):
-        main._coldiq_exhausted_until = 0.0
-        main._coldiq_exhausted_streak = 0
+        main._exhausted_until.clear()
+        main._exhausted_streak.clear()
 
     def tearDown(self):
-        main._coldiq_exhausted_until = 0.0
-        main._coldiq_exhausted_streak = 0
+        main._exhausted_until.clear()
+        main._exhausted_streak.clear()
 
     def test_a_still_empty_account_is_asked_less_and_less_often(self):
         # Production re-asked the same balance of 0.1102 four times an hour all
@@ -4190,7 +4345,7 @@ class ColdiqCreditLatchTests(unittest.IsolatedAsyncioTestCase):
         for _ in range(6):
             before = main.time.monotonic()
             main.coldiq_note_status(402)
-            waits.append(round(main._coldiq_exhausted_until - before))
+            waits.append(round(main._exhausted_until["coldiq"] - before))
 
         self.assertEqual(waits[:3], [900, 1800, 3600])
         # Capped, so a top-up is still noticed within the hour.
@@ -4203,7 +4358,7 @@ class ColdiqCreditLatchTests(unittest.IsolatedAsyncioTestCase):
 
         before = main.time.monotonic()
         main.coldiq_note_status(402)
-        self.assertEqual(round(main._coldiq_exhausted_until - before), 900)
+        self.assertEqual(round(main._exhausted_until["coldiq"] - before), 900)
 
     def test_a_non_payment_error_does_not_latch(self):
         main.coldiq_note_status(429)
@@ -4238,7 +4393,7 @@ class ColdiqCreditLatchTests(unittest.IsolatedAsyncioTestCase):
         main.coldiq_note_status(402)
         self.assertTrue(main.coldiq_out_of_credits())
 
-        main._coldiq_exhausted_until = 0.0
+        main._exhausted_until.clear()
         RoutedClient.reset({"/v1/email/find": (200, {"data": {"email": "a@b.com"}})})
         with patch.object(main.httpx, "AsyncClient", RoutedClient), \
              patch.object(main.settings, "coldiq_api_key", "key"):
@@ -4625,7 +4780,7 @@ class CacheReplayTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self, payload):
                 self.results = json.dumps(payload)
 
-        async def lookup(h):
+        async def lookup(h, ttl_seconds=None):
             return stored.get(h)
 
         async def store(h, params, payload):
@@ -5081,6 +5236,24 @@ class ExhaustedPoolTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(missing, [],
                          f"these legs are invisible to the seen ledger: {missing}")
+
+        # The same sweep for the ICP check, for the same reason. A leg that
+        # skips it answers a search it was asked without part of the ICP and
+        # shows the rows anyway — the silent broadening the check exists to
+        # prevent — and it has to run *before* the ledger write, or people
+        # dropped for the ICP would be recorded as already shown and burnt out
+        # of the pool for good.
+        unchecked = [leg for leg, chunk in legs.items()
+                     if "keep_on_icp" not in chunk]
+
+        self.assertEqual(unchecked, [],
+                         f"these legs never check the ICP they skipped: {unchecked}")
+
+        for leg, chunk in legs.items():
+            with self.subTest(leg=leg):
+                self.assertLess(chunk.index("keep_on_icp"),
+                                chunk.index("record_new_campaign_profiles"),
+                                f"{leg} records the ledger before checking the ICP")
 
     def test_the_audit_covers_every_provider_in_the_chain(self):
         # The sweep above only proves something if it actually reaches every
@@ -5967,7 +6140,7 @@ class ContactOutRepeatLeadTests(unittest.IsolatedAsyncioTestCase):
     async def run_search(self, request, pages):
         search, asked = self._pages(pages)
 
-        async def no_cache(_hash):
+        async def no_cache(_hash, ttl_seconds=None):
             return None
 
         async def no_store(*args, **kwargs):
@@ -6343,6 +6516,193 @@ class MoltSetsFilterTests(unittest.TestCase):
                 self.assertEqual(caught.exception.field, field)
 
 
+class IcpEnforcementTests(unittest.TestCase):
+    """Searching with what a provider can filter, checking the rest locally.
+
+    Four legs of ten sat out one production search — bytemine on company_size,
+    crustdata on industry, coldiq on location, wiza on keywords — so the ICP
+    stayed whole and almost nobody answered it. Each refusal was correct about
+    filtering and wrong about honouring: Crustdata's own note says "the field
+    reads back fine in a response ... returnable and filterable are not the
+    same thing here".
+    """
+
+    def test_the_bucket_spans_the_three_taxonomies_in_this_file(self):
+        # Ours, classic LinkedIn (what Bytemine and Crustdata return) and
+        # current LinkedIn (what Fiber, GetLeads and MoltSets return). Five
+        # spellings of one answer; a comparison that misses that drops every
+        # good row.
+        same = ("computer software", "Computer Software", "Software Development",
+                "IT Services and IT Consulting", "Information Technology")
+        buckets = {main.industry_bucket(v) for v in same}
+        self.assertEqual(len(buckets), 1, buckets)
+        self.assertNotIn(None, buckets)
+
+    def test_different_sectors_do_not_share_a_bucket(self):
+        self.assertNotEqual(main.industry_bucket("computer software"),
+                            main.industry_bucket("construction"))
+        self.assertNotEqual(main.industry_bucket("legal services"),
+                            main.industry_bucket("retail"))
+
+    def test_an_unrecognised_industry_cannot_decide_anything(self):
+        # None means "cannot tell", which leaves the leg refusing rather than
+        # guessing per row.
+        self.assertIsNone(main.industry_bucket("Salon & Spa"))
+        self.assertIsNone(main.lead_satisfies({"industry": "Computer Software"},
+                                              "industry", "Salon & Spa"))
+
+    def test_a_matching_industry_is_kept_and_a_wrong_one_dropped(self):
+        self.assertIs(main.lead_satisfies({"industry": "Software Development"},
+                                          "industry", "computer software"), True)
+        self.assertIs(main.lead_satisfies({"industry": "Construction"},
+                                          "industry", "computer software"), False)
+
+    def test_a_silent_row_is_unknown_rather_than_a_match(self):
+        self.assertIsNone(main.lead_satisfies({}, "industry", "computer software"))
+        self.assertIsNone(main.lead_satisfies({"industry": None},
+                                              "industry", "computer software"))
+
+    def test_a_headcount_inside_the_band_is_kept(self):
+        self.assertIs(main.lead_satisfies({"company_headcount": 7},
+                                          "company_size", "1-10"), True)
+        self.assertIs(main.lead_satisfies({"company_headcount": "1,200"},
+                                          "company_size", "1-10"), False)
+
+    def test_a_band_has_to_sit_inside_the_one_asked_for(self):
+        # Overlapping is not matching: 11-50 is not 1-10.
+        self.assertIs(main.lead_satisfies({"company_size": "1-10"},
+                                          "company_size", "1-10"), True)
+        self.assertIs(main.lead_satisfies({"company_size": "11-50"},
+                                          "company_size", "1-10"), False)
+        self.assertIs(main.lead_satisfies({"company_size": "5001-10000"},
+                                          "company_size", "1-10"), False)
+
+    def test_a_country_is_matched_by_name_or_code(self):
+        self.assertIs(main.lead_satisfies({"location": "Austin, Texas, United States"},
+                                          "location", "US"), True)
+        self.assertIs(main.lead_satisfies({"country": "United States"},
+                                          "location", "US"), True)
+        self.assertIs(main.lead_satisfies({"location": "Berlin, Germany"},
+                                          "location", "US"), False)
+
+    def test_the_lithuania_case_now_resolves_as_a_country(self):
+        self.assertIs(main.lead_satisfies({"location": "Vilnius, Lithuania"},
+                                          "location", "Lithuania"), True)
+        self.assertIs(main.lead_satisfies({"location": "Warsaw, Poland"},
+                                          "location", "Lithuania"), False)
+
+    def test_a_region_cannot_be_checked(self):
+        self.assertIsNone(main.lead_satisfies({"location": "Berlin, Germany"},
+                                              "location", "Europe"))
+
+    def test_a_row_with_no_location_is_unknown(self):
+        self.assertIsNone(main.lead_satisfies({}, "location", "US"))
+
+    def test_enforce_keeps_only_rows_that_can_be_shown_to_match(self):
+        rows = [{"n": "match"}, {"n": "wrong"}, {"n": "silent"}]
+        leads = {"match": {"industry": "Software Development"},
+                 "wrong": {"industry": "Construction"},
+                 "silent": {}}
+        dropped: list = []
+
+        kept = main.enforce_icp(rows, {"industry": "computer software"},
+                               {"industry"}, lambda r: leads[r["n"]], dropped)
+
+        self.assertEqual([r["n"] for r in kept], ["match"])
+        self.assertEqual(dropped, [2])
+
+    def test_enforce_requires_every_skipped_filter_to_pass(self):
+        rows = [{"n": "both"}, {"n": "half"}]
+        leads = {"both": {"industry": "Software Development",
+                          "company_headcount": 5},
+                 "half": {"industry": "Software Development",
+                          "company_headcount": 900}}
+
+        kept = main.enforce_icp(
+            rows, {"industry": "computer software", "company_size": "1-10"},
+            {"industry", "company_size"}, lambda r: leads[r["n"]], [])
+
+        self.assertEqual([r["n"] for r in kept], ["both"])
+
+    def test_enforce_with_nothing_to_check_is_a_passthrough(self):
+        rows = [{"n": 1}, {"n": 2}]
+        self.assertIs(main.enforce_icp(rows, {}, set(), lambda r: {}, []), rows)
+
+    def test_an_unreadable_row_is_dropped_rather_than_crashing_the_leg(self):
+        def boom(_row):
+            raise KeyError("shape")
+
+        kept = main.enforce_icp([{"n": 1}], {"industry": "computer software"},
+                                {"industry"}, boom, [])
+        self.assertEqual(kept, [])
+
+    def test_the_four_production_refusals_now_split_correctly(self):
+        """The log line that started this, leg by leg.
+
+        Three of the four can be measured on the rows that come back; the
+        fourth cannot, because no lead shape carries a keyword.
+        """
+        self.assertEqual(main.icp_checkable("bytemine", {"company_size"}),
+                         {"company_size"})
+        self.assertEqual(main.icp_checkable("crustdata", {"industry"}),
+                         {"industry"})
+        self.assertEqual(main.icp_checkable("coldiq", {"location"}),
+                         {"location"})
+        self.assertEqual(main.icp_checkable("wiza", {"keywords"}), set())
+
+    def test_bytemine_still_cannot_be_checked_on_a_country(self):
+        # city + state only, so a row cannot prove a country.
+        self.assertEqual(main.icp_checkable("bytemine", {"location"}), set())
+
+    def test_an_unknown_provider_is_never_assumed_checkable(self):
+        self.assertEqual(main.icp_checkable("nobody", {"industry"}), set())
+
+    def test_every_provider_in_the_chain_has_a_capability_entry(self):
+        # A leg missing here silently keeps refusing, which is safe but is a
+        # contributor lost by omission rather than by decision.
+        self.assertEqual(set(main.PROVIDER_ORDER) - set(main.ICP_CHECKABLE), set())
+
+    def test_the_check_is_bound_to_the_row_not_the_search(self):
+        """The subtlest trap in this change, and it cannot fail loudly.
+
+        transform_bytemine_profile and transform_crustdata_profile fall back to
+        `search_params.get("industry")` and `search_params.get("company_size")`
+        when the row is silent. That is right for display — a lead from a
+        software search is a software company — and fatal for checking: bound to
+        the search, every silent row reports the requested value back and passes
+        a test it was never measured against, so the enforcement would quietly
+        become a no-op while looking like it worked.
+
+        Asserted on the source because there is no output that differs: a
+        no-op check and a working one both return rows.
+        """
+        import inspect, re
+        body = inspect.getsource(main.walk_search)
+        call = re.search(r"enforce_icp\(\s*rows,.*?\)", body, re.S)
+        self.assertIsNotNone(call, "enforce_icp is no longer called in walk_search")
+        self.assertIn("transform_for(name, {})", call.group(0),
+                      "the ICP check must bind the transform to {} — bound to "
+                      "the search it silently passes every row")
+
+    def test_the_echoing_transforms_are_still_the_reason_for_that(self):
+        # If the fallbacks ever go away the rule above can relax, so tie the
+        # rule to the thing that makes it necessary rather than to a comment.
+        for fn in (main.transform_bytemine_profile, main.transform_crustdata_profile):
+            with self.subTest(transform=fn.__name__):
+                lead = fn({}, {"industry": "computer software",
+                               "company_size": "1-10"})
+                self.assertEqual(lead["industry"], "computer software")
+                self.assertEqual(lead["company_size"], "1-10")
+                alone = fn({}, {})
+                self.assertIsNone(alone["industry"])
+                self.assertIsNone(alone["company_size"])
+
+    def test_no_capability_claims_a_filter_that_cannot_be_checked_at_all(self):
+        for provider, fields in main.ICP_CHECKABLE.items():
+            with self.subTest(provider=provider):
+                self.assertEqual(fields - main.ICP_ENFORCEABLE, frozenset())
+
+
 class EmptyLegLogTests(unittest.TestCase):
     """An empty page has two opposite causes and they need different words.
 
@@ -6659,7 +7019,7 @@ class MoltSetsRepeatLeadTests(unittest.IsolatedAsyncioTestCase):
     async def run_search(self, request, pages):
         search, asked = self._pages(pages)
 
-        async def no_cache(_hash):
+        async def no_cache(_hash, ttl_seconds=None):
             return None
 
         async def no_store(*args, **kwargs):
