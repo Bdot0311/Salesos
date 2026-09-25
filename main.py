@@ -2338,6 +2338,38 @@ _BM_COUNTRY_CODE = {
     "ua": "UA", "ukraine": "UA", "ae": "AE", "united arab emirates": "AE",
     "sa": "SA", "saudi arabia": "SA", "tr": "TR", "turkey": "TR",
     "ru": "RU", "russia": "RU",
+    # Everything below was missing, and a country missing from this map is not
+    # refused — classify_location falls through to "city", because any token
+    # longer than two characters that is not a US state is read as one. So a
+    # search for Lithuania went out as cities:["Lithuania"] to GetLeads, a
+    # 25-mile radius around a free-form city called "Lithuania" to Fiber, and
+    # city:"Lithuania" to MoltSets. No person's city is "Lithuania", so all
+    # three answered zero while reporting success, and the user saw an empty
+    # page for a market that is full of people.
+    #
+    # Names only, deliberately. The frontend's normalizeCountry passes a
+    # country it does not know through unchanged, which is exactly how the
+    # name arrives here; a two-letter token always comes from its own map and
+    # already resolves. Adding two-letter aliases here would also quietly
+    # reassign "MT", "PA", "MA", "TN", "AZ" and "ID" away from the US states
+    # that share them, which is a different decision than fixing this bug.
+    "lithuania": "LT", "latvia": "LV", "estonia": "EE",
+    "greece": "GR", "slovakia": "SK", "slovenia": "SI", "croatia": "HR",
+    "serbia": "RS", "bulgaria": "BG", "iceland": "IS", "luxembourg": "LU",
+    "malta": "MT", "cyprus": "CY", "belarus": "BY",
+    "vietnam": "VN", "viet nam": "VN", "thailand": "TH", "malaysia": "MY",
+    "indonesia": "ID", "philippines": "PH", "the philippines": "PH",
+    "hong kong": "HK", "pakistan": "PK", "bangladesh": "BD",
+    "sri lanka": "LK", "nepal": "NP", "kazakhstan": "KZ",
+    "armenia": "AM", "azerbaijan": "AZ",
+    "egypt": "EG", "morocco": "MA", "tunisia": "TN", "algeria": "DZ",
+    "ghana": "GH", "ethiopia": "ET", "tanzania": "TZ", "uganda": "UG",
+    "zimbabwe": "ZW", "zambia": "ZM", "senegal": "SN", "cameroon": "CM",
+    "peru": "PE", "ecuador": "EC", "venezuela": "VE", "uruguay": "UY",
+    "paraguay": "PY", "bolivia": "BO", "panama": "PA", "guatemala": "GT",
+    "costa rica": "CR", "jamaica": "JM",
+    "qatar": "QA", "kuwait": "KW", "bahrain": "BH", "oman": "OM",
+    "jordan": "JO", "lebanon": "LB", "iraq": "IQ",
 }
 
 # Two-letter codes that name a US state *and* a country we recognise — CA, DE,
@@ -2349,7 +2381,17 @@ _BM_COUNTRY_CODE = {
 #
 # Derived rather than listed: written by hand it drifts from the country map it
 # describes, and a code in one but not the other is a silent misread.
-_STATE_CODE_IS_ALSO_A_COUNTRY = _US_STATE_CODES & set(_BM_COUNTRY_CODE.values())
+#
+# Derived from the map's *keys*, not its values. A code only reaches the country
+# branch when the map can be looked up by it, and the two are not the same set:
+# adding Lithuania, Malta, Panama and the rest put MT, PA, MA, TN, AZ and ID
+# among the values while their two-letter spellings were deliberately left out,
+# because those tokens mean the US state to anyone typing them. Reading values
+# here claimed six codes resolved to countries when they still resolve to
+# states — describing behaviour the code does not have.
+_STATE_CODE_IS_ALSO_A_COUNTRY = _US_STATE_CODES & {
+    _alias.upper() for _alias in _BM_COUNTRY_CODE if len(_alias) == 2
+}
 
 # Reverse lookups, for providers whose filters take names where classify_location
 # hands back a code. Derived from the maps above rather than written out again,
@@ -2361,6 +2403,17 @@ _STATE_CODE_IS_ALSO_A_COUNTRY = _US_STATE_CODES & set(_BM_COUNTRY_CODE.values())
 _GL_COUNTRY_NAME: dict = {}
 for _name, _code in sorted(_BM_COUNTRY_CODE.items(), key=lambda kv: -len(kv[0])):
     _GL_COUNTRY_NAME.setdefault(_code, _name.title())
+
+# Where "longest spelling wins" picks the wrong one. The rule works because the
+# short forms are abbreviations, but an alias can be *longer* than the real
+# name — "viet nam" beats "vietnam", "the philippines" beats "philippines" —
+# and these names are sent to GetLeads and MoltSets as exact-match filters, so
+# the wrong spelling is a market that silently returns nobody. Title-casing is
+# wrong for the same reason wherever a name carries a lowercase connective.
+_GL_COUNTRY_NAME.update({
+    "VN": "Vietnam",
+    "PH": "Philippines",
+})
 _US_STATE_CODE_TO_NAME = {
     _code: _name.title() for _name, _code in _US_STATE_NAME_TO_CODE.items()
 }
@@ -3395,6 +3448,21 @@ _FIBER_COUNTRY3 = {
     "NZ": "NZL", "PL": "POL", "PT": "PRT", "RO": "ROU", "RU": "RUS",
     "SA": "SAU", "SE": "SWE", "SG": "SGP", "TR": "TUR", "TW": "TWN",
     "UA": "UKR", "US": "USA", "ZA": "ZAF",
+    # Kept in step with _BM_COUNTRY_CODE by
+    # test_every_country_the_parser_emits_has_an_iso3 — a country added there
+    # without a code here makes Fiber sit out that whole market.
+    "LT": "LTU", "LV": "LVA", "EE": "EST", "GR": "GRC", "SK": "SVK",
+    "SI": "SVN", "HR": "HRV", "RS": "SRB", "BG": "BGR", "IS": "ISL",
+    "LU": "LUX", "MT": "MLT", "CY": "CYP", "BY": "BLR", "VN": "VNM",
+    "TH": "THA", "MY": "MYS", "ID": "IDN", "PH": "PHL", "HK": "HKG",
+    "PK": "PAK", "BD": "BGD", "LK": "LKA", "NP": "NPL", "KZ": "KAZ",
+    "AM": "ARM", "AZ": "AZE", "EG": "EGY", "MA": "MAR", "TN": "TUN",
+    "DZ": "DZA", "GH": "GHA", "ET": "ETH", "TZ": "TZA", "UG": "UGA",
+    "ZW": "ZWE", "ZM": "ZMB", "SN": "SEN", "CM": "CMR", "PE": "PER",
+    "EC": "ECU", "VE": "VEN", "UY": "URY", "PY": "PRY", "BO": "BOL",
+    "PA": "PAN", "GT": "GTM", "CR": "CRI", "JM": "JAM", "QA": "QAT",
+    "KW": "KWT", "BH": "BHR", "OM": "OMN", "JO": "JOR", "LB": "LBN",
+    "IQ": "IRQ",
 }
 
 # free-form-city requires a radius, so one has to be chosen. A city in an ICP
@@ -4324,12 +4392,43 @@ _MS_EMPLOYEE_RANGE = {
     "1001-5000": "1001-5000",
 }
 
-# Their 22 industry buckets, from our lowercase vocabulary. Only the fallback:
-# `linkedin_industry` is tried first because it takes LinkedIn's own labels —
-# the same modern taxonomy Fiber and GetLeads are on — and is far finer than
-# these. A bucket is better than nothing when the modern name has no match,
-# but "Information Technology" for an ICP that said "computer software" is a
-# much wider net, so it is second choice rather than first.
+# Their `linkedin_industry` vocabulary, which is LinkedIn's *current* industry
+# list — not the one modern_linkedin_industry returns.
+#
+# Production proved the difference. `linkedin_industry: "Computer Software"`
+# went out on every software search and matched nothing, while ContactOut
+# answered the same ICP with 131 people. "Computer Software" is the *classic*
+# LinkedIn name; the 2022 taxonomy renamed it "Software Development", which is
+# the spelling MoltSets' own docs use. Same for "Education Management", which
+# is now "Education Administration Programs".
+#
+# So this map holds only labels MoltSets themselves evidence — six named in
+# their filter docs, two more in their example response (`E-Learning
+# Providers`, `IT Services and IT Consulting`). Everything else goes to the 22
+# buckets below, which their docs enumerate in full and are therefore certain.
+# A guessed label here is not a near miss, it is zero rows.
+#
+# modern_linkedin_industry is deliberately not reused: Fiber and GetLeads have
+# their own documented vocabularies built on it, and correcting it for them is
+# a separate change against evidence this log does not contain.
+_MS_LINKEDIN_INDUSTRY = {
+    "computer software": "Software Development",
+    "information technology and services": "IT Services and IT Consulting",
+    "hospitality": "Hospitality",
+    "legal services": "Legal Services",
+    "law practice": "Legal Services",
+    "health, wellness and fitness": "Wellness and Fitness Services",
+    "construction": "Construction",
+    "staffing and recruiting": "Staffing and Recruiting",
+    "e-learning": "E-Learning Providers",
+}
+
+# Their 22 industry buckets, from our lowercase vocabulary. The default rather
+# than the fallback: this list is enumerated in full in their docs, so every
+# value here is one they accept. `linkedin_industry` above is finer but only
+# trustworthy for the labels they spell out, and a filter that matches nothing
+# is worse than one that matches a wider bucket — the ICP's industry is still
+# applied either way.
 _MS_INDUSTRY = {
     "computer software": "Information Technology",
     "information technology and services": "Information Technology",
@@ -4538,13 +4637,14 @@ def build_moltsets_filters(p: dict) -> dict:
         body["seniority"] = level
 
     if p.get("industry"):
-        # linkedin_industry first: it takes LinkedIn's own labels, the same
-        # modern vocabulary Fiber and GetLeads use, and is far finer than the
-        # 22 buckets. The buckets are the fallback, not the default.
-        modern = modern_linkedin_industry(p["industry"])
+        # A label their docs actually name wins, because it is finer. Otherwise
+        # one of the 22 enumerated buckets. Never a guessed LinkedIn label —
+        # see _MS_LINKEDIN_INDUSTRY for what that cost in production.
+        key = str(p["industry"]).strip().lower()
+        label = _MS_LINKEDIN_INDUSTRY.get(key)
         bucket = moltsets_industry(p["industry"])
-        if modern:
-            body["linkedin_industry"] = modern
+        if label:
+            body["linkedin_industry"] = label
         elif bucket:
             body["industry"] = bucket
         else:
@@ -4598,11 +4698,25 @@ def build_moltsets_filters(p: dict) -> dict:
         else:
             raise ProviderUnsupported("location", location)
 
-    # A segment phrase has no taxonomy anywhere, and `query` is their
-    # free-text field. It is deliberately not used for the role: see `title`.
+    # `query` is not a company-description field. It searches full_name,
+    # first_name, last_name, company name, title and headline, and their docs
+    # say multi-word queries distribute terms across those fields — so it wants
+    # one phrase, matched against a person.
+    #
+    # Production sent it four concepts at once: "managed print services, audio
+    # visual solutions, Education tools and technologies, digital signage
+    # solutions". Nobody's name, title or headline is all four of those, so
+    # every one of those searches returned zero. A single phrase ("ai saas") is
+    # what the field is for; a list is a question it cannot be asked, and there
+    # is no second free-text field to spread it over, so it is refused and the
+    # legs that do have one — Fiber's keywordsV2, GetLeads' company_description
+    # — answer instead.
     segment = p.get("keywords") or p.get("semantic_keywords")
     if segment:
-        body["query"] = str(segment)
+        terms = [t.strip() for t in str(segment).split(",") if t.strip()]
+        if len(terms) > 1:
+            raise ProviderUnsupported("keywords", segment)
+        body["query"] = terms[0] if terms else str(segment)
 
     if not body:
         raise HTTPException(status_code=400, detail="At least one search parameter required")
@@ -6437,6 +6551,28 @@ def drop_already_seen(rows: list, seen_keys: set, suppressed: list) -> list:
     return kept
 
 
+def log_empty_leg(provider: str, rows_seen: int, scope) -> None:
+    """Say which kind of empty a paging leg ended on.
+
+    Two opposite facts arrive as the same empty page: this provider has nobody
+    matching the ICP, and this provider has people but the searcher has been
+    shown all of them. The paging legs printed the second for both, so a
+    production log read "GetLeads has no one left ... that customer:… has not
+    already been shown" on a search whose very next line was `Seen ledger: 0
+    person(s)`. That is not a small wording problem: it points the reader at
+    the ledger when the answer is the query, and it did so on three legs at
+    once for a whole Lithuania run that was actually failing on location.
+    """
+    if rows_seen:
+        print(f"{provider}: all {rows_seen} row(s) it returned had already been "
+              f"shown to {scope or 'this searcher'} — the pool for this search "
+              "is spent, not empty")
+    else:
+        print(f"{provider} returned no rows at all for this search — nobody "
+              "matches the ICP here, which is the filters rather than the "
+              "seen ledger")
+
+
 def search_seen_scope(request: SearchRequest) -> Optional[str]:
     """The ledger this search reads and writes so nobody is shown twice.
 
@@ -7850,6 +7986,7 @@ async def walk_search(request: SearchRequest):
             seen = {i for i in (linkedin_identity(u) for u in (exclusions or [])) if i}
             found: list = []
             total = 0
+            rows_seen = 0
 
             for _ in range(MOLTSETS_MAX_PAGES):
                 page_started = time.monotonic()
@@ -7857,6 +7994,7 @@ async def walk_search(request: SearchRequest):
                     params, max(wanted - len(found), 1), offset=offset)
                 page_seconds = time.monotonic() - page_started
                 rows = data["profiles"]
+                rows_seen += len(rows)
                 total = data["total"]
 
                 fresh = rows
@@ -7888,8 +8026,7 @@ async def walk_search(request: SearchRequest):
             if seen_scope:
                 found = await record_new_campaign_profiles(seen_scope, found)
             if exhausted:
-                print(f"MoltSets has no one left for this search that "
-                      f"{seen_scope or 'this searcher'} has not already been shown")
+                log_empty_leg("MoltSets", rows_seen, seen_scope)
 
             return found, total, None
 
@@ -7917,11 +8054,14 @@ async def walk_search(request: SearchRequest):
             found: list = []
             total = 0
 
+            rows_seen = 0
+
             for _ in range(GETLEADS_MAX_PAGES):
                 page_started = time.monotonic()
                 data = await getleads_person_search(params, wanted, offset=offset)
                 page_seconds = time.monotonic() - page_started
                 page = data["profiles"]
+                rows_seen += len(page)
                 total = data["total"]
 
                 fresh = page
@@ -7967,8 +8107,7 @@ async def walk_search(request: SearchRequest):
             if seen_scope:
                 found = await record_new_campaign_profiles(seen_scope, found)
             if exhausted:
-                print(f"GetLeads has no one left for this search that "
-                      f"{seen_scope or 'this searcher'} has not already been shown")
+                log_empty_leg("GetLeads", rows_seen, seen_scope)
 
             return found, total, None
 
@@ -8025,6 +8164,7 @@ async def walk_search(request: SearchRequest):
             found: list = []
             total = 0
             next_page = None
+            rows_seen = 0
 
             for _ in range(CONTACTOUT_MAX_PAGES):
                 page_started = time.monotonic()
@@ -8032,6 +8172,7 @@ async def walk_search(request: SearchRequest):
                     params, max(wanted - len(found), 1), page=page)
                 page_seconds = time.monotonic() - page_started
                 rows = data["profiles"]
+                rows_seen += len(rows)
                 total = data["total"]
                 next_page = data.get("next_page")
 
@@ -8065,8 +8206,7 @@ async def walk_search(request: SearchRequest):
             if seen_scope:
                 found = await record_new_campaign_profiles(seen_scope, found)
             if exhausted:
-                print(f"ContactOut has no one left for this search that "
-                      f"{seen_scope or 'this searcher'} has not already been shown")
+                log_empty_leg("ContactOut", rows_seen, seen_scope)
 
             # The next page number is this leg's cursor, so the following
             # request resumes where this one stopped rather than paying for the
