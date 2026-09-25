@@ -1107,6 +1107,47 @@ class LocationClassificationTests(unittest.TestCase):
         # "Georgia" the US state, not GE the country.
         self.assertEqual(main.classify_location("Georgia"), ("state", "GA"))
 
+    def test_a_country_we_do_not_know_is_never_read_as_a_city(self):
+        """The Lithuania bug, and the reason it cost a whole run.
+
+        A country missing from _BM_COUNTRY_CODE is not refused — any token over
+        two characters that is not a US state falls through to "city". So a
+        production search for Lithuania went out as cities:["Lithuania"] to
+        GetLeads, a 25-mile radius around a free-form city called "Lithuania"
+        to Fiber, and city:"Lithuania" to MoltSets. Nobody's city is
+        "Lithuania", so every leg answered zero while reporting success.
+
+        Driven off a list of real countries rather than the map itself, because
+        asserting the map against the map proves nothing.
+        """
+        for name in ("Lithuania", "Latvia", "Estonia", "Vietnam", "Thailand",
+                     "Philippines", "Greece", "Hong Kong", "Pakistan", "Egypt",
+                     "Peru", "Qatar", "Croatia", "Bulgaria", "Kazakhstan",
+                     "Morocco", "Ghana", "Ecuador", "Panama", "Costa Rica"):
+            with self.subTest(country=name):
+                kind, _ = main.classify_location(name)
+                self.assertEqual(kind, "country", f"{name} read as {kind}")
+
+    def test_a_real_city_is_still_a_city(self):
+        # The fix must not turn the whole world into countries.
+        for name in ("Austin", "San Francisco", "Vilnius", "Bengaluru"):
+            with self.subTest(city=name):
+                self.assertEqual(main.classify_location(name)[0], "city")
+
+    def test_a_country_name_round_trips_to_the_spelling_providers_want(self):
+        # GetLeads and MoltSets match the country name exactly, so an alias
+        # longer than the real name would silently empty that market —
+        # "viet nam" beat "vietnam", "the philippines" beat "philippines".
+        for name, expected in (("Lithuania", "Lithuania"),
+                               ("Vietnam", "Vietnam"),
+                               ("Philippines", "Philippines"),
+                               ("Sri Lanka", "Sri Lanka"),
+                               ("United States", "United States"),
+                               ("uk", "United Kingdom")):
+            with self.subTest(country=name):
+                _, code = main.classify_location(name)
+                self.assertEqual(main._GL_COUNTRY_NAME[code], expected)
+
     def test_a_city_stays_a_city(self):
         self.assertEqual(main.classify_location("Berlin"), ("city", "Berlin"))
         self.assertEqual(main.classify_location("San Francisco"),
@@ -6162,21 +6203,41 @@ class MoltSetsFilterTests(unittest.TestCase):
             {"job_title": "Founder", "seniority": "owner"})
         self.assertNotIn("seniority", body)
 
-    def test_the_modern_linkedin_label_is_preferred_over_the_bucket(self):
-        # linkedin_industry takes LinkedIn's own labels and is far finer than
-        # the 22 buckets, so it is first choice.
+    def test_a_documented_label_is_preferred_over_the_bucket(self):
+        # Their docs name "Software Development" — LinkedIn's *current* label.
+        # This used to send "Computer Software", the classic one, which matched
+        # nothing in production while ContactOut answered the same ICP with 131
+        # people. The bucket is wider but correct; a guessed label is zero rows.
         body = main.build_moltsets_filters({"industry": "computer software"})
 
-        self.assertEqual(body["linkedin_industry"], "Computer Software")
+        self.assertEqual(body["linkedin_industry"], "Software Development")
         self.assertNotIn("industry", body)
 
-    def test_the_bucket_catches_what_the_modern_label_cannot(self):
-        # "law practice" has no modern LinkedIn label in our map but does
-        # belong to one of their 22 buckets.
-        self.assertIsNone(main.modern_linkedin_industry("law practice"))
-        body = main.build_moltsets_filters({"industry": "law practice"})
+    def test_the_classic_linkedin_name_is_never_sent(self):
+        # The regression guard: modern_linkedin_industry still returns the
+        # classic spelling, and reusing it here is what broke every software
+        # search on this leg.
+        self.assertEqual(main.modern_linkedin_industry("computer software"),
+                         "Computer Software")
+        body = main.build_moltsets_filters({"industry": "computer software"})
 
-        self.assertEqual(body["industry"], "Professional and Business Services")
+        self.assertNotEqual(body.get("linkedin_industry"), "Computer Software")
+
+    def test_the_bucket_catches_what_no_documented_label_covers(self):
+        # "financial services" is one of their 22 enumerated buckets but is not
+        # a label their docs spell out, so it goes to the certain field.
+        body = main.build_moltsets_filters({"industry": "financial services"})
+
+        self.assertEqual(body["industry"], "Finance and Banking")
+        self.assertNotIn("linkedin_industry", body)
+
+    def test_education_management_does_not_travel_as_a_classic_name(self):
+        # Production sent linkedin_industry "Education Management"; current
+        # LinkedIn calls it something else, so it matched nobody. No documented
+        # label covers it, so the bucket answers instead.
+        body = main.build_moltsets_filters({"industry": "education management"})
+
+        self.assertEqual(body["industry"], "Education")
         self.assertNotIn("linkedin_industry", body)
 
     def test_an_industry_neither_can_express_steps_aside(self):
@@ -6219,6 +6280,39 @@ class MoltSetsFilterTests(unittest.TestCase):
                                          "location": "Europe"})
         self.assertEqual(caught.exception.field, "location")
 
+    def test_a_country_reaches_the_country_field_not_the_city_field(self):
+        # Production sent city:"Lithuania". Their city filter matches the exact
+        # stored city and nothing else, so it returned zero every time.
+        body = main.build_moltsets_filters({"job_title": "IT Director",
+                                            "location": "Lithuania"})
+
+        self.assertEqual(body["country"], "Lithuania")
+        self.assertNotIn("city", body)
+
+    def test_one_segment_phrase_goes_into_their_free_text_field(self):
+        body = main.build_moltsets_filters({"job_title": "Founder",
+                                           "keywords": "ai saas"})
+        self.assertEqual(body["query"], "ai saas")
+
+    def test_several_segment_terms_are_refused_rather_than_concatenated(self):
+        """`query` searches a person, not a company description.
+
+        It matches full_name, first_name, last_name, company name, title and
+        headline, and their docs say a multi-word query distributes its terms
+        across those fields. Production sent it four concepts at once —
+        "managed print services, audio visual solutions, Education tools and
+        technologies, digital signage solutions" — and nobody's name or
+        headline is all four, so every such search returned zero.
+        """
+        with self.assertRaises(main.ProviderUnsupported) as caught:
+            main.build_moltsets_filters({
+                "job_title": "IT Director",
+                "keywords": ("managed print services, audio visual solutions, "
+                             "Education tools and technologies, "
+                             "digital signage solutions"),
+            })
+        self.assertEqual(caught.exception.field, "keywords")
+
     def test_a_domain_wins_over_a_name_and_arrives_bare(self):
         body = main.build_moltsets_filters({"job_title": "Founder",
                                             "company": "https://acme.com/about"})
@@ -6247,6 +6341,41 @@ class MoltSetsFilterTests(unittest.TestCase):
                     main.build_moltsets_filters(
                         {"job_title": "Founder", field: value})
                 self.assertEqual(caught.exception.field, field)
+
+
+class EmptyLegLogTests(unittest.TestCase):
+    """An empty page has two opposite causes and they need different words.
+
+    The paging legs printed "has no one left ... that <scope> has not already
+    been shown" for both, so a production log said that on a search whose next
+    line was `Seen ledger: 0 person(s)`. It points the reader at the ledger
+    when the answer is the query — and it did so on three legs at once during a
+    run that was really failing on location.
+    """
+
+    def _log(self, *args):
+        import io
+        from contextlib import redirect_stdout
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            main.log_empty_leg(*args)
+        return buffer.getvalue()
+
+    def test_no_rows_at_all_blames_the_filters(self):
+        line = self._log("MoltSets", 0, "customer:abc")
+
+        self.assertIn("no rows at all", line)
+        self.assertNotIn("already been shown", line)
+
+    def test_rows_that_were_all_filtered_blames_the_ledger(self):
+        line = self._log("MoltSets", 13, "customer:abc")
+
+        self.assertIn("13", line)
+        self.assertIn("already been shown", line)
+        self.assertIn("customer:abc", line)
+
+    def test_an_unscoped_search_still_reads_sensibly(self):
+        self.assertIn("this searcher", self._log("GetLeads", 4, None))
 
 
 class MoltSetsSearchTests(unittest.IsolatedAsyncioTestCase):
