@@ -7100,5 +7100,201 @@ class MoltSetsRepeatLeadTests(unittest.IsolatedAsyncioTestCase):
                          "morgan.hebb@packback.co")
 
 
+class VerifyEndpointTests(unittest.IsolatedAsyncioTestCase):
+    """The waterfall, reachable without buying a reveal.
+
+    Before this endpoint existed the only way to have an address checked was to
+    pay for a reveal of a person the caller already had, so search results came
+    back unverified and the caller sent blind. Fiber, ContactOut and Findymail
+    were configured and answering the whole time; nothing asked them.
+    """
+
+    @staticmethod
+    def _verdict(status="deliverable", sendable=True, by="coldiq"):
+        return {"status": status, "sendable": sendable, "checked_by": by}
+
+    async def test_answers_are_keyed_by_address(self):
+        """ColdIQ's bulk verb answers positionally, and a short array shifts a
+        verdict onto the wrong address. A map cannot express that mistake."""
+        async def coldiq(email):
+            return self._verdict(by=f"coldiq:{email}")
+
+        with patch.object(main, "coldiq_verify_email", coldiq), \
+             patch.object(main, "cache_lookup", AsyncMock(return_value=None)), \
+             patch.object(main, "cache_store", AsyncMock()):
+            out = await main.verify_emails(
+                main.VerifyRequest(emails=["ada@acme.com", "bo@acme.com"]))
+
+        self.assertEqual(set(out["results"]), {"ada@acme.com", "bo@acme.com"})
+        self.assertEqual(out["results"]["ada@acme.com"]["checked_by"],
+                         "coldiq:ada@acme.com")
+        self.assertEqual(out["results"]["bo@acme.com"]["checked_by"],
+                         "coldiq:bo@acme.com")
+
+    async def test_the_same_address_is_one_question(self):
+        asked = []
+
+        async def coldiq(email):
+            asked.append(email)
+            return self._verdict()
+
+        with patch.object(main, "coldiq_verify_email", coldiq), \
+             patch.object(main, "cache_lookup", AsyncMock(return_value=None)), \
+             patch.object(main, "cache_store", AsyncMock()):
+            out = await main.verify_emails(main.VerifyRequest(
+                emails=["Ada@Acme.com", "ada@acme.com", " ada@acme.com "]))
+
+        self.assertEqual(asked, ["ada@acme.com"])
+        self.assertEqual(list(out["results"]), ["ada@acme.com"])
+
+    async def test_email_and_emails_are_one_request(self):
+        with patch.object(main, "coldiq_verify_email",
+                          AsyncMock(return_value=self._verdict())), \
+             patch.object(main, "cache_lookup", AsyncMock(return_value=None)), \
+             patch.object(main, "cache_store", AsyncMock()):
+            out = await main.verify_emails(
+                main.VerifyRequest(email="bo@acme.com", emails=["ada@acme.com"]))
+
+        self.assertEqual(set(out["results"]), {"ada@acme.com", "bo@acme.com"})
+
+    async def test_falls_through_to_the_providers_that_can_answer(self):
+        """The whole reason the endpoint exists: ColdIQ is paused, and the
+        others are not."""
+        asked = []
+
+        async def coldiq(email):
+            return {"status": "unverified", "sendable": None,
+                    "checked_by": None, "reason": "coldiq not configured"}
+
+        async def fiber(email):
+            asked.append("fiber")
+            return self._verdict(by="fiber")
+
+        with patch.object(main, "coldiq_verify_email", coldiq), \
+             patch.object(main, "fiber_verify_email", fiber), \
+             patch.object(main, "provider_configured", lambda n: True), \
+             patch.object(main, "cache_lookup", AsyncMock(return_value=None)), \
+             patch.object(main, "cache_store", AsyncMock()):
+            out = await main.verify_emails(main.VerifyRequest(email="ada@acme.com"))
+
+        self.assertEqual(asked, ["fiber"])
+        verdict = out["results"]["ada@acme.com"]
+        self.assertEqual(verdict["checked_by"], "fiber")
+        self.assertEqual(verdict["fell_back_from"], "coldiq not configured")
+
+    async def test_an_unproven_mailbox_is_never_reported_as_clean(self):
+        async def nobody(email):
+            return {"status": "unknown", "sendable": None, "checked_by": "coldiq",
+                    "reason": "coldiq returned no verdict"}
+
+        with patch.object(main, "coldiq_verify_email", nobody), \
+             patch.object(main, "provider_configured", lambda n: False), \
+             patch.object(main, "cache_lookup", AsyncMock(return_value=None)), \
+             patch.object(main, "cache_store", AsyncMock()):
+            out = await main.verify_emails(main.VerifyRequest(email="ada@acme.com"))
+
+        self.assertIsNone(out["results"]["ada@acme.com"]["sendable"])
+
+    async def test_an_inconclusive_verdict_is_not_remembered(self):
+        """Caching `unknown` turns one outage into thirty days of not asking,
+        which is how the credits-exhausted weeks stayed invisible."""
+        store = AsyncMock()
+
+        with patch.object(main, "coldiq_verify_email", AsyncMock(return_value={
+                 "status": "unknown", "sendable": None, "checked_by": "coldiq"})), \
+             patch.object(main, "provider_configured", lambda n: False), \
+             patch.object(main, "cache_lookup", AsyncMock(return_value=None)), \
+             patch.object(main, "cache_store", store):
+            await main.verify_emails(main.VerifyRequest(email="ada@acme.com"))
+
+        store.assert_not_awaited()
+
+    async def test_a_conclusive_verdict_is_remembered(self):
+        store = AsyncMock()
+
+        with patch.object(main, "coldiq_verify_email",
+                          AsyncMock(return_value=self._verdict())), \
+             patch.object(main, "cache_lookup", AsyncMock(return_value=None)), \
+             patch.object(main, "cache_store", store):
+            await main.verify_emails(main.VerifyRequest(email="ada@acme.com"))
+
+        store.assert_awaited_once()
+
+    async def test_a_remembered_verdict_costs_nothing(self):
+        asked = []
+
+        async def coldiq(email):
+            asked.append(email)
+            return self._verdict()
+
+        class Row:
+            results = json.dumps([{"status": "deliverable", "sendable": True,
+                                   "checked_by": "fiber"}])
+
+        with patch.object(main, "coldiq_verify_email", coldiq), \
+             patch.object(main, "cache_lookup", AsyncMock(return_value=Row())), \
+             patch.object(main, "cache_store", AsyncMock()):
+            out = await main.verify_emails(main.VerifyRequest(email="ada@acme.com"))
+
+        self.assertEqual(asked, [])
+        self.assertTrue(out["results"]["ada@acme.com"]["from_cache"])
+
+    async def test_one_bad_address_does_not_sink_the_batch(self):
+        async def coldiq(email):
+            if email == "boom@acme.com":
+                raise RuntimeError("vendor client blew up")
+            return self._verdict()
+
+        with patch.object(main, "coldiq_verify_email", coldiq), \
+             patch.object(main, "cache_lookup", AsyncMock(return_value=None)), \
+             patch.object(main, "cache_store", AsyncMock()):
+            out = await main.verify_emails(main.VerifyRequest(
+                emails=["ada@acme.com", "boom@acme.com"]))
+
+        self.assertTrue(out["results"]["ada@acme.com"]["sendable"])
+        self.assertIsNone(out["results"]["boom@acme.com"]["sendable"])
+        self.assertEqual(len(out["results"]), 2)
+
+    async def test_past_the_deadline_nothing_further_is_billed(self):
+        asked = []
+
+        async def coldiq(email):
+            asked.append(email)
+            return self._verdict()
+
+        with patch.object(main, "coldiq_verify_email", coldiq), \
+             patch.object(main, "VERIFY_DEADLINE_SECONDS", -1), \
+             patch.object(main, "cache_lookup", AsyncMock(return_value=None)), \
+             patch.object(main, "cache_store", AsyncMock()):
+            out = await main.verify_emails(main.VerifyRequest(email="ada@acme.com"))
+
+        self.assertEqual(asked, [])
+        verdict = out["results"]["ada@acme.com"]
+        self.assertIsNone(verdict["sendable"])
+        self.assertIn("deadline", verdict["reason"])
+
+    async def test_an_empty_request_is_refused(self):
+        with self.assertRaises(HTTPException) as caught:
+            await main.verify_emails(main.VerifyRequest(emails=[]))
+        self.assertEqual(caught.exception.status_code, 422)
+
+    async def test_a_batch_past_the_ceiling_is_refused(self):
+        too_many = [f"p{i}@acme.com" for i in range(main.VERIFY_MAX_BATCH + 1)]
+        with self.assertRaises(HTTPException) as caught:
+            await main.verify_emails(main.VerifyRequest(emails=too_many))
+        self.assertEqual(caught.exception.status_code, 422)
+
+    async def test_the_reveal_path_still_uses_the_same_waterfall(self):
+        """One waterfall, two doors. A reveal must not drift from /verify."""
+        with patch.object(main, "verify_email_address",
+                          AsyncMock(return_value=self._verdict(by="fiber"))) as once:
+            lead = await main.verify_revealed_lead(
+                {"business_email": "ada@acme.com"}, "wiza")
+
+        once.assert_awaited_once_with("ada@acme.com")
+        self.assertEqual(lead["email_verification"]["checked_by"], "fiber")
+        self.assertTrue(lead["email_verified"])
+
+
 if __name__ == "__main__":
     unittest.main()

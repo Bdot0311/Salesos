@@ -5551,6 +5551,78 @@ async def coldiq_verify_email(email: str) -> dict:
     return verdict
 
 
+VERIFY_CACHE_TTL_SECONDS = 30 * 24 * 3600
+
+
+def verify_identity_key(email: str) -> str:
+    """One key per address, shared by every caller and every customer.
+
+    Whether a mailbox exists is not a fact about who asked, so a verdict bought
+    for one search answers the next one free. Thirty days, because mailboxes go
+    stale slowly.
+    """
+    return generate_search_hash({"_kind": "verify", "email": email})
+
+
+async def verify_email_address(email: str) -> dict:
+    """Run the verification waterfall over one address. Never raises.
+
+    ColdIQ is the primary checker, but it is also the thing that runs out of
+    credits — production spent weeks answering "unknown" for every address
+    because of it. Findymail answers the same question and bills separately,
+    so a verdict ColdIQ could not reach is worth one more attempt rather than
+    being reported as unknown.
+
+    Fiber is asked before Findymail because it answers the same question with
+    ColdIQ's detail — catch-all, role-based, disposable — where Findymail
+    returns a bare boolean. Both are only reached when ColdIQ could not
+    answer; a verdict ColdIQ actually reached is never second-guessed.
+    ContactOut sits between them: it separates a catch-all domain from a
+    genuine mailbox, which Findymail's bare boolean cannot, but it does not
+    report role-based or disposable the way Fiber does.
+
+    An inconclusive verdict is never cached. Caching "unknown" would turn one
+    provider outage into thirty days of not asking again, which is how the
+    credits-exhausted weeks stayed invisible for as long as they did.
+    """
+    email = (email or "").strip().lower()
+    if not email:
+        return {"status": "unverified", "sendable": None, "checked_by": None,
+                "reason": "no email to check"}
+
+    key = verify_identity_key(email)
+    stored = await cache_lookup(key, VERIFY_CACHE_TTL_SECONDS)
+    if stored:
+        try:
+            remembered = json.loads(stored.results)
+        except ValueError:
+            remembered = None
+        if isinstance(remembered, list) and remembered:
+            cached_verdict = dict(remembered[0])
+            cached_verdict["from_cache"] = True
+            return cached_verdict
+
+    verdict = await coldiq_verify_email(email)
+
+    for name, check in (("fiber", fiber_verify_email),
+                        ("contactout", contactout_verify_email),
+                        ("findymail", findymail_verify_email)):
+        if not (verdict.get("sendable") is None
+                and verdict.get("status") in ("unknown", "unverified")):
+            break
+        if not provider_configured(name):
+            continue
+        fallback = await check(email)
+        if fallback.get("sendable") is not None:
+            fallback["checked_at"] = datetime.now(timezone.utc).isoformat()
+            fallback["fell_back_from"] = verdict.get("reason") or verdict.get("status")
+            verdict = fallback
+
+    if verdict.get("sendable") is not None:
+        await cache_store(key, {"_kind": "verify"}, [verdict])
+    return verdict
+
+
 async def verify_revealed_lead(lead: dict, provider: str = None) -> dict:
     """Attach a deliverability verdict to a revealed lead, whoever sourced it.
 
@@ -5563,33 +5635,7 @@ async def verify_revealed_lead(lead: dict, provider: str = None) -> dict:
     told you a verdict happened but not what it was about.
     """
     email = (lead or {}).get("business_email") or (lead or {}).get("email")
-    verdict = await coldiq_verify_email(email or "")
-
-    # ColdIQ is the primary checker, but it is also the thing that runs out of
-    # credits — production spent weeks answering "unknown" for every address
-    # because of it. Findymail answers the same question and bills separately,
-    # so a verdict ColdIQ could not reach is worth one more attempt rather than
-    # being reported as unknown.
-    # Fiber is asked before Findymail because it answers the same question with
-    # ColdIQ's detail — catch-all, role-based, disposable — where Findymail
-    # returns a bare boolean. Both are only reached when ColdIQ could not
-    # answer; a verdict ColdIQ actually reached is never second-guessed.
-    # ContactOut sits between them: it separates a catch-all domain from a
-    # genuine mailbox, which Findymail's bare boolean cannot, but it does not
-    # report role-based or disposable the way Fiber does.
-    for name, check in (("fiber", fiber_verify_email),
-                        ("contactout", contactout_verify_email),
-                        ("findymail", findymail_verify_email)):
-        if not (email and verdict.get("sendable") is None
-                and verdict.get("status") in ("unknown", "unverified")):
-            break
-        if not provider_configured(name):
-            continue
-        fallback = await check(email)
-        if fallback.get("sendable") is not None:
-            fallback["checked_at"] = datetime.now(timezone.utc).isoformat()
-            fallback["fell_back_from"] = verdict.get("reason") or verdict.get("status")
-            verdict = fallback
+    verdict = await verify_email_address(email or "")
 
     lead["email_verification"] = verdict
     lead["email_verified"] = verdict.get("sendable")
@@ -7276,6 +7322,113 @@ _PLACEHOLDER_RE = re.compile(
     r"-{1,3}|\?+|tbd|test|no\s*company|company|placeholder)",
     re.IGNORECASE,
 )
+
+
+# =============================================================================
+# Verification, without paying for a reveal
+# =============================================================================
+#
+# The waterfall already ran on every revealed lead, but only there — a reveal
+# costs a provider credit, so the only way to have an address checked was to
+# buy a reveal for a person the caller already had. Search results came back
+# unchecked, and the caller was left to verify them itself or send blind.
+#
+# Sending blind is what happened. OutReign's own verifier talks to ColdIQ
+# directly, so when ColdIQ was paused the search path fell back to DNS, which
+# can prove a *domain* accepts mail and can never prove a *mailbox* exists.
+# Addresses that did not exist shipped, and the bounce rate they produced spent
+# the sending domain's reputation.
+#
+# So the waterfall gets a door of its own. Fiber, ContactOut and Findymail were
+# configured and working the whole time; nothing was asking them.
+
+
+class VerifyRequest(BaseModel):
+    """One address or many. `email` and `emails` are the same request.
+
+    The batch ceiling is enforced in the handler rather than here, because it
+    applies to the two fields together and a caller may use both.
+    """
+    email: Optional[str] = None
+    emails: Optional[list[str]] = None
+
+
+# One vendor round trip is seconds, so a batch runs them side by side. Eight is
+# what the paid legs' rate limits tolerate: ContactOut and Fiber both 429 under
+# heavier fan-out, and a 429 costs the whole address, not just the attempt.
+VERIFY_CONCURRENCY = 8
+
+# Past this a caller should page. The ceiling exists so one request cannot hold
+# the pool open long enough to starve searches running beside it.
+VERIFY_MAX_BATCH = 100
+
+# Leaves the caller room to do something with the answer. Supabase edge
+# functions die at 150s wall clock, and a verdict that arrives after the caller
+# is gone was still billed.
+VERIFY_DEADLINE_SECONDS = 90
+
+
+@app.post("/verify")
+async def verify_emails(request: VerifyRequest):
+    """Verify addresses through the same waterfall a reveal uses.
+
+    Returns `{"results": {address: verdict}}` — keyed, not positional. ColdIQ's
+    own bulk verb answers in an array aligned with the inputs, and every caller
+    of it has to carry code for the case where the array comes back short and a
+    verdict silently shifts onto the wrong address. A map cannot do that.
+
+    `sendable` is the field to read: true to send, false to hold, null when
+    nobody could say. An address nobody could answer for is reported as unknown
+    rather than as clean — the caller decides what to do with an unproven
+    mailbox, and it should get to decide knowing that is what it has.
+    """
+    addresses = list(request.emails or [])
+    if request.email:
+        addresses.append(request.email)
+
+    # Dedupe before spending anything: the same address twice in one list is
+    # one question, and the cache is keyed on the address anyway.
+    queue = list(dict.fromkeys(
+        a.strip().lower() for a in addresses if a and a.strip()
+    ))
+    if not queue:
+        raise HTTPException(status_code=422,
+                            detail="provide `email` or a non-empty `emails` list")
+    if len(queue) > VERIFY_MAX_BATCH:
+        raise HTTPException(
+            status_code=422,
+            detail=f"at most {VERIFY_MAX_BATCH} addresses per request")
+
+    results: dict[str, dict] = {}
+    deadline = asyncio.get_running_loop().time() + VERIFY_DEADLINE_SECONDS
+    cursor = 0
+
+    async def worker():
+        nonlocal cursor
+        while cursor < len(queue):
+            email = queue[cursor]
+            cursor += 1
+            # Past the deadline, say so rather than starting a call whose answer
+            # arrives after the caller has given up but is billed all the same.
+            if asyncio.get_running_loop().time() > deadline:
+                results[email] = {"status": "unknown", "sendable": None,
+                                  "checked_by": None,
+                                  "reason": "verification deadline reached"}
+                continue
+            try:
+                results[email] = await verify_email_address(email)
+            except Exception as exc:  # a vendor client should not fail the batch
+                print(f"verify {email}: unexpected {type(exc).__name__}: {exc}")
+                results[email] = {"status": "unknown", "sendable": None,
+                                  "checked_by": None,
+                                  "reason": "verification failed"}
+
+    await asyncio.gather(*(worker()
+                           for _ in range(min(VERIFY_CONCURRENCY, len(queue)))))
+
+    checked = sum(1 for v in results.values() if v.get("sendable") is not None)
+    print(f"verify batch: {checked} of {len(queue)} conclusive")
+    return {"results": results}
 
 
 class EnrichRequest(BaseModel):

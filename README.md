@@ -224,6 +224,43 @@ Accepts any one of: `company_domain`, `company_name`, `company_linkedin_id`,
 Enrich a single person via Wiza Individual Reveal (linkedin_url, email, or
 full_name + company/domain).
 
+### POST /verify
+Check whether addresses are deliverable, through the same waterfall a reveal
+uses: **ColdIQ → Fiber → ContactOut → Findymail**. A provider is only asked when
+the one before it could not answer, and a verdict ColdIQ actually reached is
+never second-guessed — so pausing ColdIQ moves the work to the others rather
+than turning verification off.
+
+Takes one address or up to 100:
+
+```json
+{ "emails": ["ada@acme.com", "bo@acme.com"] }
+```
+
+Answers keyed by address, never positionally:
+
+```json
+{ "results": {
+    "ada@acme.com": { "status": "deliverable", "sendable": true, "checked_by": "fiber" },
+    "bo@acme.com":  { "status": "undeliverable", "sendable": false, "checked_by": "fiber" }
+} }
+```
+
+`sendable` is the field to read: `true` to send, `false` to hold, `null` when
+nobody could say. An address no provider could answer for comes back `unknown`
+rather than clean — an unproven mailbox is the caller's decision to make, and it
+should get to make it knowing that is what it has.
+
+Verdicts are cached per address for 30 days and shared across callers, since
+whether a mailbox exists is not a fact about who asked. Inconclusive verdicts
+are never cached: remembering an outage would turn it into a month of not
+asking again.
+
+This exists because `/enrich` was the only door to the waterfall, and a reveal
+costs a provider credit. Search results came back unchecked, so callers either
+verified them themselves or sent blind — and sending unverified addresses is
+what spends a domain's sender reputation.
+
 ### POST /parse-icp
 Parse a plain-English ICP description into structured Wiza search filters.
 
