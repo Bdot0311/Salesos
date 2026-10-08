@@ -10614,6 +10614,44 @@ async def probe_provider_filters(name: str, params: dict) -> dict:
             "returned": len(result.get("profiles") or [])}
 
 
+def _monid_endpoint_variants(endpoint: str) -> list:
+    """Spellings of one endpoint id worth asking the gateway about.
+
+    The first live run found every registered id answering 404, so the
+    catalog's key is not the one the compiled lock file uses. Rather than
+    guess a second time, the diagnostic asks about each plausible spelling —
+    `inspect` is free, so a handful of probes costs nothing and ends the
+    guessing with the gateway's own answer.
+
+    The spellings, and why each is plausible:
+
+      v1/people/search          the compiled catalog's own key
+      /v1/people/search         the vendor wire path as-is. Monid's published
+                                example skills invoke `-e /api/v1/...` with
+                                the leading slash, and those are working
+                                examples, which makes this the likeliest fix.
+      …without /work-email      the lock file splits one shared wire path into
+                                work-email and personal-email ids. That split
+                                may be internal to the lock rather than a real
+                                catalog key.
+    """
+    found: list = []
+
+    def add(value: str) -> None:
+        bare = value.lstrip("/")
+        if not bare:
+            return
+        for form in (bare, "/" + bare):
+            if form not in found:
+                found.append(form)
+
+    add(endpoint)
+    for suffix in ("/work-email", "/personal-email"):
+        if endpoint.endswith(suffix):
+            add(endpoint[: -len(suffix)])
+    return found
+
+
 def _monid_said(payload) -> Optional[str]:
     """The gateway's own error wording, flattened to one line.
 
@@ -10672,24 +10710,35 @@ async def monid_catalog(query: str = None, limit: int = 10):
             tools[name] = {"registered": None, "known": False}
             continue
         provider, endpoint = pair
-        status, found = await monid_call(
-            "POST", "/v1/inspect",
-            body={"provider": provider, "endpoint": endpoint})
         entry = {
             "registered": f"{provider}:{endpoint}",
-            "known": status == 200,
-            "status": status,
+            "known": False,
             "held_off": not monid_tool_available(name),
         }
-        if status == 200 and isinstance(found, dict):
-            entry["price"] = found.get("price")
-            entry["summary"] = found.get("summary") or found.get("description")
-        else:
+        tried = {}
+        for candidate in _monid_endpoint_variants(endpoint):
+            status, found = await monid_call(
+                "POST", "/v1/inspect",
+                body={"provider": provider, "endpoint": candidate})
+            tried[candidate] = status
+            if status == 200 and isinstance(found, dict):
+                entry["known"] = True
+                entry["live_spelling"] = f"{provider}:{candidate}"
+                entry["price"] = found.get("price")
+                entry["summary"] = (found.get("summary")
+                                    or found.get("description"))
+                # The first spelling the gateway accepts is the answer; the
+                # rest would only cost more round trips to confirm it.
+                break
             # The gateway's own words. Without them a 404 is ambiguous in the
             # one way that matters: an id this catalog does not carry, versus a
             # verb this credential may not call. Those need opposite fixes, and
             # guessing between them is what this endpoint exists to avoid.
             entry["gateway_said"] = _monid_said(found)
+        entry["status"] = tried.get(endpoint)
+        entry["tried"] = tried
+        if entry.get("live_spelling") and entry["live_spelling"] != entry["registered"]:
+            entry["fix"] = {name: entry["live_spelling"]}
         tools[name] = entry
 
     discovered = None
@@ -10720,20 +10769,37 @@ async def monid_catalog(query: str = None, limit: int = 10):
                               "gateway_said": _monid_said(ranked)}
 
     unknown = sorted(n for n, t in tools.items() if not t.get("known"))
+
+    # Everything the probe found that disagrees with the built-in table,
+    # assembled into the exact value MONID_ENDPOINT_OVERRIDES wants. The point
+    # is that nobody has to hand-write JSON from a report: copy this one string
+    # into Railway and the table is corrected.
+    corrections = {}
+    for name, entry in tools.items():
+        fix = entry.get("fix")
+        if fix:
+            corrections.update(fix)
+    suggested = json.dumps(corrections, separators=(",", ":")) if corrections else None
     return {
         "configured": True,
         "whoami": who if who_status == 200 else {"status": who_status},
         "balance": balance if bal_status == 200 else {"status": bal_status},
         "tools": tools,
         "unknown_tools": unknown,
+        "suggested_endpoint_overrides": suggested,
         "discover_error": discover_error,
         "next_step": (
+            f"Set MONID_ENDPOINT_OVERRIDES to {suggested} in Railway — the "
+            "probe found a spelling the gateway accepts for "
+            f"{len(corrections)} tool(s)."
+            if suggested else
             "Every registered tool is live; nothing to correct."
             if not unknown else
-            "Set MONID_ENDPOINT_OVERRIDES to a JSON object mapping each name "
-            "above to \"provider:endpoint\" using the live spelling. Pass "
-            "?query=... to this endpoint to have the gateway rank its own "
-            "catalog and show you that spelling."
+            "No probed spelling was accepted for the tools in unknown_tools. "
+            "Read `tried` and `gateway_said` on each: if every spelling gets "
+            "the same refusal, this is a credential scope rather than a wrong "
+            "id — check the key's scopes under whoami against what /v1/inspect "
+            "needs. Pass ?query=... to have the gateway rank its own catalog."
         ),
         "contactout_routed_via_monid": contactout_routed_via_monid(),
         # Routing is off whenever a direct key is present, and from the outside

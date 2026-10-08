@@ -8377,3 +8377,80 @@ class HunterInVerifyWaterfallTests(unittest.TestCase):
                     enrichso_api_key="k", findymail_api_key="k",
                     monid_api_key="k"):
                 self.assertTrue(main.provider_configured(name), name)
+
+
+class MonidEndpointVariantTests(unittest.TestCase):
+    """The probe that ends the guessing about how the catalog is keyed.
+
+    The first live run had every registered id answering 404, so the compiled
+    lock file's key is not the gateway's. inspect is free, so the diagnostic
+    asks about each plausible spelling rather than making a second guess.
+    """
+
+    def test_the_catalog_key_is_asked_about_first(self):
+        # It is what the compiled catalog actually contains, so it stays the
+        # first thing tried and the default the table ships with.
+        variants = main._monid_endpoint_variants("v1/email/verify")
+
+        self.assertEqual(variants[0], "v1/email/verify")
+
+    def test_the_wire_path_with_its_slash_is_always_offered(self):
+        """Monid's own published skills invoke `-e /api/v1/...`, slash included.
+
+        Those are working examples, which makes the slashed form the likeliest
+        correction — so it is never omitted, for any endpoint.
+        """
+        for endpoint in ("v1/email/verify", "mixed_people/api_search",
+                         "email-verifier"):
+            self.assertIn("/" + endpoint,
+                          main._monid_endpoint_variants(endpoint), endpoint)
+
+    def test_the_email_type_suffix_is_tried_stripped_as_well(self):
+        # The lock file splits one shared wire path into work-email and
+        # personal-email ids. That split may be internal to the lock rather
+        # than a real catalog key, so the bare path is probed too.
+        variants = main._monid_endpoint_variants("v1/people/search/work-email")
+
+        self.assertIn("v1/people/search", variants)
+        self.assertIn("/v1/people/search", variants)
+
+    def test_a_suffix_that_is_not_there_adds_nothing(self):
+        self.assertEqual(main._monid_endpoint_variants("people/match"),
+                         ["people/match", "/people/match"])
+
+    def test_no_spelling_is_offered_twice(self):
+        for endpoint in ("v1/people/search/work-email", "/email-verifier",
+                         "people/match"):
+            variants = main._monid_endpoint_variants(endpoint)
+            self.assertEqual(len(variants), len(set(variants)), endpoint)
+
+    def test_an_empty_endpoint_probes_nothing(self):
+        # Guards the probe loop against asking the gateway about "" or "/",
+        # which would spend round trips to be told nothing useful.
+        self.assertEqual(main._monid_endpoint_variants(""), [])
+        self.assertEqual(main._monid_endpoint_variants("/"), [])
+
+
+class MonidSaidTests(unittest.TestCase):
+    """A refusal is evidence; it has to survive whatever shape it arrives in."""
+
+    def test_the_nested_error_envelope_is_read(self):
+        said = main._monid_said({"error": {"code": "NOT_FOUND",
+                                           "message": "no such endpoint"}})
+
+        self.assertIn("NOT_FOUND", said)
+        self.assertIn("no such endpoint", said)
+
+    def test_a_bare_message_is_read_too(self):
+        # Their gateway uses {message: ...} on some paths and the nested
+        # envelope on others.
+        self.assertEqual(main._monid_said({"message": "forbidden"}),
+                         "forbidden")
+
+    def test_an_unrecognised_shape_is_kept_rather_than_dropped(self):
+        said = main._monid_said({"detail": [{"loc": ["body", "endpoint"]}]})
+
+        self.assertIn("endpoint", said)
+
+    def test_nothing_at_all_stays_none(self):
+        self.assertIsNone(main._monid_said(None))
