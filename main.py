@@ -58,6 +58,16 @@ class Settings(BaseSettings):
     contactout_api_key: Optional[str] = None
     moltsets_api_key: Optional[str] = None
     enrichso_api_key: Optional[str] = None
+    # Monid is a router with a wallet, not a data provider: one key reaches
+    # Apollo, ContactOut and Hunter through a single balance. See the Monid
+    # section for which tools are routed through it and which deliberately are
+    # not.
+    monid_api_key: Optional[str] = None
+    # Corrections to the Monid tool table, as JSON mapping a logical name to
+    # "provider:endpoint". The live catalog could not be reached from the
+    # machine that wrote that table, so this is the knob that fixes a wrong id
+    # without a deploy. GET /monid/catalog prints the live spelling.
+    monid_endpoint_overrides: Optional[str] = None
     treg_token: Optional[str] = None
     treg_org_id: Optional[str] = None
     treg_base_url: str = "https://treg.to"
@@ -227,7 +237,16 @@ def provider_configured(name: str) -> bool:
     if name == "fiber":
         return bool(settings.fiber_api_key)
     if name == "contactout":
-        return bool(settings.contactout_api_key)
+        # Either credential puts this leg in the chain: its own key, or the
+        # Monid gateway standing in for it. The direct trial key expired, and
+        # a leg that drops out of the chain the moment a key lapses is how a
+        # provider silently stops contributing.
+        return bool(settings.contactout_api_key) or monid_configured()
+    if name == "monid":
+        return monid_configured()
+    if name == "hunter":
+        # Hunter has no key of its own here; it is reached through Monid.
+        return monid_configured()
     if name == "moltsets":
         return bool(settings.moltsets_api_key)
     if name == "enrichso":
@@ -3882,6 +3901,369 @@ async def fiber_verify_email(email: str) -> dict:
 
 
 # =============================================================================
+# Monid  (https://api.monid.ai)
+# =============================================================================
+#
+# Monid is not a data provider. It is a router with a wallet in front of other
+# people's APIs — "OpenRouter for agent tools" in their own words — and that
+# distinction drives every design choice below.
+#
+# Three verbs, and only the third one costs money:
+#
+#   POST /v1/discover   rank the whole catalog by what the job is   free
+#   POST /v1/inspect    one endpoint's price, schema and health     free
+#   POST /v1/run        execute it against the vendor               billed
+#
+# A run names a vendor endpoint by `provider` and `endpoint`, and `endpoint` is
+# the vendor's own wire path with the leading slash stripped: ContactOut's
+# GET /v1/email/verify is `contactout` + `v1/email/verify`, Apollo's
+# POST /people/match is `apollo` + `people/match`. That is the catalog's own
+# canonical key, so it is what we send.
+#
+# WHY THIS LEG EXISTS AT ALL, given eleven providers already:
+#
+#   1. ContactOut. The direct ContactOut trial key is dead, and Monid carries
+#      all twenty of its endpoints. Routing rather than removing keeps the
+#      filter builder, the transform and the paging that leg already had —
+#      contactout_call is the only thing that changes.
+#   2. Apollo. 230M people, and a filter surface no other leg here has:
+#      technologies in use, and what the employer is actively hiring for.
+#      Every current leg refuses `technologies` outright. Apollo honours it.
+#      Its people search is also free — 0 Apollo credits — so a search that
+#      finds nobody costs nothing.
+#   3. Hunter. One more independent email verifier behind the five we have.
+#
+# WHAT IS DELIBERATELY NOT ROUTED HERE: anything we already hold a working
+# direct key for. A router charges a margin, and paying it for Enrich.so or
+# Fiber data we can fetch ourselves would be paying twice for one row.
+#
+# BILLING, AND WHY A MISS IS SAFE: the engine settles usage on the raw vendor
+# response before any output mapping, so a vendor error, an unmatched company
+# and an unresolved person each "complete as data and settle at zero". That is
+# strictly better than the per-row legs (Fiber, GetLeads, ContactOut direct),
+# where an off-ICP row still bills. It is the reason this leg can afford to sit
+# early in the chain.
+#
+# WHAT COULD NOT BE VERIFIED FROM HERE: api.monid.ai is blocked by this
+# environment's egress policy, so no call below has been made against the live
+# gateway. The contract is read from their own MIT-licensed CLI
+# (github.com/monid-ai/cli, src/api/client.ts) and the endpoint ids from the
+# compiled catalog in github.com/monid-ai/connectors. Their live catalog is
+# larger than that public lock file and not identically keyed — the published
+# example skills call a `tikhub` provider that is absent from it — so an id
+# here can be right about the vendor and wrong about the key. Two things make
+# that recoverable without a deploy: MONID_ENDPOINT_OVERRIDES, and
+# GET /monid/catalog, which answers whoami, balance and discover so the live
+# spelling can be read off the gateway itself.
+
+MONID_BASE = "https://api.monid.ai"
+
+# Named so support can see which client a run came from, the way their CLI
+# sends "cli". It is not auth and carries nothing sensitive.
+MONID_CLIENT = "salesos"
+
+# A run may answer terminally on the POST, or come back READY/RUNNING for a
+# vendor that is slow. Their CLI polls; so do we, inside the search budget
+# rather than on a fixed sleep, because a reveal that outlives the request is
+# money spent on a row nobody receives.
+MONID_POLL_SECONDS = 2.0
+MONID_RUN_BUDGET_SECONDS = 30.0
+
+# Mirrors TERMINAL_RUN_STATUSES in their CLI (src/api/types.ts). Polling stops
+# on any of these; everything else is still in flight.
+_MONID_TERMINAL = frozenset({"COMPLETED", "FAILED", "BLOCKED", "STOPPED",
+                             "TIMED_OUT"})
+
+# How long a tool that answered 404 NOT_FOUND is left alone. A 404 from the
+# gateway means this id is not in the live catalog — a wrong guess, or a tool
+# that was withdrawn — and retrying it on every search would spend a round trip
+# per search forever to learn the same thing. It is held off rather than
+# disabled permanently so that a catalog addition is picked up without a
+# restart.
+MONID_UNKNOWN_TOOL_SECONDS = 1800.0
+
+_monid_unknown_tools: dict[str, float] = {}
+
+# The logical tools this file asks for, as (provider, endpoint) pairs in the
+# catalog's canonical spelling. Keyed by a name this codebase chooses, so a
+# vendor rename is one line here rather than a search-and-replace.
+_MONID_TOOLS = {
+    # Apollo: people search is free and returns previews plus a person id;
+    # people/match turns one into a full record and is the only billed half.
+    "apollo_people_search": ("apollo", "mixed_people/api_search"),
+    "apollo_people_match": ("apollo", "people/match"),
+    "apollo_job_postings": ("apollo", "organizations/job_postings"),
+    # ContactOut, work-email variants. Their catalog splits each shared wire
+    # path into a work-email and a personal-email id, because the two spend
+    # different credits; this app asks for work addresses.
+    "contactout_people_search": ("contactout", "v1/people/search/work-email"),
+    "contactout_people_linkedin": ("contactout", "v1/people/linkedin/work-email"),
+    "contactout_people_enrich": ("contactout", "v1/people/enrich/work-email"),
+    "contactout_email_verify": ("contactout", "v1/email/verify"),
+    # Hunter. Its base URL already carries /v2, so the wire path — and so the
+    # id — is the bare endpoint name.
+    "hunter_email_verifier": ("hunterio", "email-verifier"),
+}
+
+
+def monid_configured() -> bool:
+    """True when the gateway has a key and can be called at all."""
+    return bool(settings.monid_api_key)
+
+
+def _monid_overrides() -> dict:
+    """Operator corrections to the tool table, read off the environment.
+
+    This exists because the live catalog could not be reached from the machine
+    that wrote _MONID_TOOLS. The value is JSON mapping a logical name to
+    "provider:endpoint" or to a two-item list. A malformed value is ignored
+    with a log line rather than raised: a typo in an env var should not take
+    the whole process down at import time.
+    """
+    raw = (settings.monid_endpoint_overrides or "").strip()
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except ValueError as exc:
+        print(f"MONID_ENDPOINT_OVERRIDES is not valid JSON, ignoring it: {exc}")
+        return {}
+    if not isinstance(parsed, dict):
+        print("MONID_ENDPOINT_OVERRIDES must be a JSON object, ignoring it")
+        return {}
+
+    fixed = {}
+    for name, value in parsed.items():
+        if isinstance(value, str) and ":" in value:
+            provider, _, endpoint = value.partition(":")
+        elif isinstance(value, (list, tuple)) and len(value) == 2:
+            provider, endpoint = value[0], value[1]
+        else:
+            print(f"MONID_ENDPOINT_OVERRIDES[{name}] is not "
+                  f"'provider:endpoint', ignoring it")
+            continue
+        fixed[str(name)] = (str(provider).strip(),
+                            str(endpoint).strip().lstrip("/"))
+    return fixed
+
+
+def monid_tool(name: str) -> Optional[tuple]:
+    """The (provider, endpoint) for a logical tool, or None when unknown."""
+    override = _monid_overrides().get(name)
+    if override:
+        return override
+    pair = _MONID_TOOLS.get(name)
+    if not pair:
+        return None
+    provider, endpoint = pair
+    return provider, endpoint.lstrip("/")
+
+
+def monid_tool_available(name: str) -> bool:
+    """False while this tool is being left alone after a 404 from the gateway."""
+    until = _monid_unknown_tools.get(name)
+    if not until:
+        return True
+    if time.monotonic() >= until:
+        _monid_unknown_tools.pop(name, None)
+        return True
+    return False
+
+
+def monid_note_unknown_tool(name: str, provider: str, endpoint: str) -> None:
+    """Remember that the gateway does not know this id, and say so once."""
+    _monid_unknown_tools[name] = time.monotonic() + MONID_UNKNOWN_TOOL_SECONDS
+    print(f"Monid does not know {provider}/{endpoint} ({name}); holding it off "
+          f"for {int(MONID_UNKNOWN_TOOL_SECONDS / 60)}m. Correct it with "
+          f"MONID_ENDPOINT_OVERRIDES once GET /monid/catalog shows the live "
+          f"spelling.")
+
+
+async def monid_call(method: str, path: str, *, body: dict = None) -> tuple:
+    """Call the Monid gateway. Returns (status_code, parsed body or None).
+
+    Returns rather than raises on every status. Out of balance, rate limited
+    and an unknown tool are states of the account or the catalog, not failures
+    of this request, and a leg that raises on them takes the whole search down.
+
+    The body is parsed defensively, status first. Their own CLI carries a
+    comment about why: a proxy in front of the gateway answers 5xx with an
+    HTML error page, and parsing before reading the status turned a plain 502
+    into "Unexpected token '<'" and threw the status away, so an upstream blip
+    read as a broken client.
+    """
+    headers = {
+        "Authorization": f"Bearer {settings.monid_api_key or ''}",
+        "Content-Type": "application/json",
+        "X-Monid-Client": MONID_CLIENT,
+    }
+    printable = json.dumps(body)[:400] if body is not None else ""
+    print(f"Monid {method} {path}: {printable}")
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.request(method, f"{MONID_BASE}{path}",
+                                        headers=headers, json=body)
+    except httpx.HTTPError as exc:
+        print(f"Monid {path} unreachable: {exc}")
+        return 0, None
+
+    try:
+        parsed = resp.json()
+    except ValueError:
+        parsed = None
+
+    if resp.status_code != 200:
+        detail = ""
+        if isinstance(parsed, dict):
+            error = parsed.get("error")
+            if isinstance(error, dict):
+                detail = f"{error.get('code') or ''} {error.get('message') or ''}".strip()
+            detail = detail or str(parsed.get("message") or "")
+        print(f"Monid {path} status: {resp.status_code} "
+              f"{detail or resp.text[:300]}")
+
+    # 402 is the wallet, not this endpoint. Latching it stops every other leg
+    # routed through the gateway from spending a round trip to be told the same
+    # thing, exactly as the ColdIQ latch does.
+    provider_note_exhausted("monid", resp.status_code == 402,
+                            "Monid wallet balance")
+    return resp.status_code, parsed
+
+
+def monid_vendor_answer(run: dict) -> tuple:
+    """Unwrap a run into (vendor HTTP status, vendor payload).
+
+    The point of this shape is that a caller cannot tell it apart from a direct
+    call to the vendor, which is what lets ContactOut's existing filter
+    builder, transform and paging keep working unchanged when the transport
+    moves behind the gateway.
+
+    A run that never reached the vendor has no vendor status to report, so the
+    run's own failure is mapped onto one: BLOCKED is a control refusing to
+    spend (402, the same thing the wallet says), and FAILED or TIMED_OUT are
+    upstream failures (502).
+    """
+    if not isinstance(run, dict):
+        return 0, None
+
+    answer = run.get("providerResponse")
+    if isinstance(answer, dict) and answer.get("httpStatus"):
+        status = int(answer.get("httpStatus") or 0)
+        return status, answer.get("data") if status < 400 else answer.get("error")
+
+    # Run detail carries the mapped output instead of the raw envelope.
+    output = run.get("output")
+    if isinstance(output, dict):
+        return 200, output
+
+    state = str(run.get("status") or "").upper()
+    if state == "BLOCKED":
+        return 402, None
+    if state in ("FAILED", "TIMED_OUT", "STOPPED"):
+        return 502, None
+    return 0, None
+
+
+def monid_log_cost(name: str, run: dict) -> None:
+    """Say what a run cost, when the gateway reported one.
+
+    Every other leg here bills in credits nobody can see at request time. This
+    one answers in dollars on the run itself, so the one place that knows is
+    the only place that can write it down.
+    """
+    cost = (run or {}).get("cost")
+    if isinstance(cost, dict) and cost.get("value") is not None:
+        try:
+            value = float(cost.get("value") or 0)
+        except (TypeError, ValueError):
+            return
+        print(f"Monid {name} cost: {value:.4f} "
+              f"{cost.get('currency') or 'USD'}")
+
+
+async def monid_run(name: str, *, body: dict = None, query: dict = None,
+                    path_params: dict = None) -> tuple:
+    """Execute one catalog tool. Returns (vendor HTTP status, vendor payload).
+
+    Polls while the run is still in flight, bounded by whatever is left of the
+    search budget as well as its own ceiling — a run that outlives the request
+    is money spent on a row nobody receives.
+    """
+    if not monid_configured():
+        return 0, None
+    if provider_out_of_credits("monid"):
+        print(f"Monid skipped for {name}: wallet reported empty")
+        return 402, None
+    if not monid_tool_available(name):
+        return 404, None
+
+    pair = monid_tool(name)
+    if not pair:
+        print(f"Monid has no tool registered as {name}")
+        return 404, None
+    provider, endpoint = pair
+
+    request: dict = {"provider": provider, "endpoint": endpoint}
+    sent: dict = {}
+    if body:
+        sent["body"] = body
+    if query:
+        sent["queryParams"] = query
+    if path_params:
+        sent["pathParams"] = path_params
+    if sent:
+        request["input"] = sent
+
+    status, run = await monid_call("POST", "/v1/run", body=request)
+    if status == 404:
+        monid_note_unknown_tool(name, provider, endpoint)
+        return 404, None
+    if status != 200 or not isinstance(run, dict):
+        return status, None
+
+    monid_log_cost(name, run)
+    state = str(run.get("status") or "").upper()
+    run_id = run.get("runId")
+
+    if state not in _MONID_TERMINAL and run_id:
+        # search_seconds_left() is None outside a budgeted search — a reveal
+        # called from /enrich rather than from the chain — and min() against
+        # None raises. An unbudgeted call gets this leg's own ceiling.
+        left = search_seconds_left()
+        deadline = (MONID_RUN_BUDGET_SECONDS if left is None
+                    else min(MONID_RUN_BUDGET_SECONDS, max(0.0, left)))
+        waited = 0.0
+        while waited < deadline:
+            await asyncio.sleep(MONID_POLL_SECONDS)
+            waited += MONID_POLL_SECONDS
+            detail_status, detail = await monid_call(
+                "GET", f"/v1/runs/{run_id}")
+            if detail_status != 200 or not isinstance(detail, dict):
+                break
+            run = detail
+            state = str(run.get("status") or "").upper()
+            if state in _MONID_TERMINAL:
+                monid_log_cost(name, run)
+                break
+        else:
+            print(f"Monid {name} still {state or 'in flight'} after "
+                  f"{int(waited)}s; abandoning the wait")
+
+    return monid_vendor_answer(run)
+
+
+async def monid_discover(query: str, limit: int = 10) -> tuple:
+    """Rank the live catalog for a job. Free, per their own pricing.
+
+    Used by GET /monid/catalog rather than by any search leg: discovery per
+    search would add a round trip to every request to re-learn something that
+    changes on the order of weeks.
+    """
+    return await monid_call("POST", "/v1/discover",
+                            body={"query": query, "limit": limit})
+
+
+# =============================================================================
 # ContactOut  (https://api.contactout.com)
 # =============================================================================
 #
@@ -3961,6 +4343,57 @@ def contactout_industry(value: str) -> Optional[str]:
     return linkedin_industry(value)
 
 
+# Which Monid tool answers each ContactOut wire path. Only the paths this file
+# actually calls are listed: a path with no entry has no routed equivalent and
+# is reported as such rather than guessed at.
+_CO_MONID_TOOLS = {
+    "/v1/people/search": "contactout_people_search",
+    "/v1/people/linkedin": "contactout_people_linkedin",
+    "/v1/people/enrich": "contactout_people_enrich",
+    "/v1/email/verify": "contactout_email_verify",
+}
+
+# Parameters that only exist to pick between the work-email and personal-email
+# behaviours of a shared wire path. Monid's catalog splits that choice into two
+# separate endpoint ids instead, and we always ask for the work-email one, so
+# sending the parameter as well is at best redundant. It is dropped rather than
+# forwarded because the catalog's input schemas are strict: an unexpected
+# parameter can fail the whole run, and losing a reveal to a parameter that
+# changes nothing is the kind of silent zero this file keeps having to chase.
+_CO_MONID_DROP = frozenset({"email_type"})
+
+
+def contactout_routed_via_monid() -> bool:
+    """True when ContactOut calls should travel through the Monid gateway.
+
+    A working direct key always wins: it is one hop instead of two and carries
+    no router margin. Routing is what happens when there is no direct key —
+    which is the live situation, the direct ContactOut key having been a trial
+    that has since expired.
+    """
+    return not settings.contactout_api_key and monid_configured()
+
+
+async def contactout_call_via_monid(method: str, path: str, *,
+                                    params: dict = None,
+                                    body: dict = None) -> tuple:
+    """Run one ContactOut call through Monid, answering as ContactOut would.
+
+    The return shape is deliberately indistinguishable from a direct call, so
+    build_contactout_filters, transform_contactout_profile, the paging in the
+    search leg and contactout_reveal all keep working untouched. Routing a
+    provider should be a transport change and nothing else.
+    """
+    tool = _CO_MONID_TOOLS.get(path)
+    if not tool:
+        print(f"ContactOut {path} has no Monid equivalent registered")
+        return 0, None
+
+    query = {k: v for k, v in (params or {}).items()
+             if k not in _CO_MONID_DROP} or None
+    return await monid_run(tool, body=body, query=query)
+
+
 async def contactout_call(method: str, path: str, *, params: dict = None,
                           body: dict = None) -> tuple:
     """Call ContactOut. Returns (status_code, parsed body or None).
@@ -3973,6 +4406,10 @@ async def contactout_call(method: str, path: str, *, params: dict = None,
     limited are states of the account, not failures of this request, and a leg
     that raises on them takes the whole search down with it.
     """
+    if contactout_routed_via_monid():
+        return await contactout_call_via_monid(method, path, params=params,
+                                               body=body)
+
     headers = {
         "token": settings.contactout_api_key or "",
         "Content-Type": "application/json",
@@ -6132,6 +6569,58 @@ def verify_identity_key(email: str) -> str:
     return generate_search_hash({"_kind": "verify", "email": email})
 
 
+# Hunter's own verdict vocabulary. `result` is the field to read, not `status`:
+# `status` mixes a deliverability verdict with facts about the mailbox
+# ("webmail", "accept_all", "disposable"), while `result` is exactly the
+# three-way answer this app stores.
+_HUNTER_VERDICT = {
+    "deliverable": ("deliverable", True),
+    "undeliverable": ("undeliverable", False),
+    "risky": ("risky", False),
+}
+
+
+async def hunter_verify_email(email: str) -> dict:
+    """Verify one address through Hunter, routed via Monid, in our verdict shape.
+
+    Hunter has no key of its own in this deployment — it is reached through the
+    gateway, which is the only reason it can be added at all. Its verifier can
+    answer asynchronously (their catalog gives it a 180s ceiling with a poll),
+    and monid_run already waits inside the search budget, so nothing extra is
+    needed here.
+
+    It reports more about a mailbox than any other checker in this waterfall:
+    catch-all, disposable, webmail and an SMTP check, which is the argument for
+    having it behind the five that came before.
+    """
+    status, data = await monid_run("hunter_email_verifier",
+                                   query={"email": email})
+    payload = ((data or {}).get("data") or {}) if status == 200 else {}
+    result = payload.get("result")
+    if not result:
+        reason = ("hunter unavailable through monid" if status == 404
+                  else "monid wallet empty" if status == 402
+                  else "hunter rate limited" if status == 429
+                  else "hunter returned no verdict")
+        return {"status": "unknown", "sendable": None,
+                "checked_by": "hunter", "reason": reason}
+
+    mapped, sendable = _HUNTER_VERDICT.get(str(result).lower(),
+                                           ("unknown", None))
+    return {
+        "status": mapped,
+        "sendable": sendable,
+        "checked_by": "hunter",
+        "raw_status": result,
+        "catch_all": payload.get("accept_all"),
+        "role_based": None,
+        "disposable": payload.get("disposable"),
+        "free_provider": payload.get("webmail"),
+        "vendor": "hunter",
+        "score": payload.get("score"),
+    }
+
+
 async def verify_email_address(email: str) -> dict:
     """Run the verification waterfall over one address. Never raises.
 
@@ -6148,6 +6637,13 @@ async def verify_email_address(email: str) -> dict:
     ContactOut sits between them: it separates a catch-all domain from a
     genuine mailbox, which Findymail's bare boolean cannot, but it does not
     report role-based or disposable the way Fiber does.
+
+    Hunter is last, and only because it is newest here rather than weakest —
+    it reports catch-all, disposable, webmail and an SMTP check, which is more
+    than anything above it. It is reached through the Monid gateway rather than
+    its own key, so it costs a router margin the others do not; last is where
+    that is cheapest, since it is only asked when five checkers in front of it
+    have all declined to answer.
 
     An inconclusive verdict is never cached. Caching "unknown" would turn one
     provider outage into thirty days of not asking again, which is how the
@@ -6175,7 +6671,8 @@ async def verify_email_address(email: str) -> dict:
     for name, check in (("fiber", fiber_verify_email),
                         ("contactout", contactout_verify_email),
                         ("enrichso", enrichso_verify_email),
-                        ("findymail", findymail_verify_email)):
+                        ("findymail", findymail_verify_email),
+                        ("hunter", hunter_verify_email)):
         if not (verdict.get("sendable") is None
                 and verdict.get("status") in ("unknown", "unverified")):
             break
@@ -10115,6 +10612,90 @@ async def probe_provider_filters(name: str, params: dict) -> dict:
 
     return {"outcome": "ok", "total": result.get("total"),
             "returned": len(result.get("profiles") or [])}
+
+
+@app.get("/monid/catalog")
+async def monid_catalog(query: str = None, limit: int = 10):
+    """What the Monid gateway actually holds, read off the gateway itself.
+
+    This exists because the tool table in this file could not be verified
+    against the live catalog: api.monid.ai is unreachable from the environment
+    the integration was written in, so every (provider, endpoint) pair in
+    _MONID_TOOLS is read from their published CLI and connector repo rather
+    than confirmed. Their live catalog is known to be larger than the public
+    one and not identically keyed, so an id here can name the right vendor and
+    the wrong key.
+
+    Hit this once after deploying. For each registered tool it reports whether
+    the gateway recognises the id, and `discover` ranks the live catalog for a
+    job in its own spelling. Anything that comes back unknown is corrected with
+    MONID_ENDPOINT_OVERRIDES — no deploy, no code change.
+
+    `inspect` and `discover` are both free, per their own pricing, so this
+    costs nothing to run.
+    """
+    if not monid_configured():
+        return {"configured": False,
+                "detail": "MONID_API_KEY is not set, so the gateway cannot be "
+                          "called. Set it in Railway."}
+
+    who_status, who = await monid_call("GET", "/v1/auth/whoami")
+    bal_status, balance = await monid_call("GET", "/v1/wallet/balance")
+
+    tools = {}
+    for name in sorted(_MONID_TOOLS):
+        pair = monid_tool(name)
+        if not pair:
+            tools[name] = {"registered": None, "known": False}
+            continue
+        provider, endpoint = pair
+        status, found = await monid_call(
+            "POST", "/v1/inspect",
+            body={"provider": provider, "endpoint": endpoint})
+        entry = {
+            "registered": f"{provider}:{endpoint}",
+            "known": status == 200,
+            "status": status,
+            "held_off": not monid_tool_available(name),
+        }
+        if status == 200 and isinstance(found, dict):
+            entry["price"] = found.get("price")
+            entry["summary"] = found.get("summary") or found.get("description")
+        tools[name] = entry
+
+    discovered = None
+    if query:
+        status, ranked = await monid_call("POST", "/v1/discover",
+                                          body={"query": query,
+                                                "limit": max(1, min(limit, 25))})
+        if status == 200 and isinstance(ranked, dict):
+            discovered = [
+                {"provider": r.get("provider"),
+                 "endpoint": r.get("endpoint"),
+                 "score": r.get("score"),
+                 "price": r.get("price"),
+                 "description": (r.get("description") or "")[:200]}
+                for r in (ranked.get("results") or [])
+                if isinstance(r, dict)
+            ]
+
+    unknown = sorted(n for n, t in tools.items() if not t.get("known"))
+    return {
+        "configured": True,
+        "whoami": who if who_status == 200 else {"status": who_status},
+        "balance": balance if bal_status == 200 else {"status": bal_status},
+        "tools": tools,
+        "unknown_tools": unknown,
+        "next_step": (
+            "Every registered tool is live; nothing to correct."
+            if not unknown else
+            "Set MONID_ENDPOINT_OVERRIDES to a JSON object mapping each name "
+            "above to \"provider:endpoint\" using the live spelling. Pass "
+            "?query=... to this endpoint to have the gateway rank its own "
+            "catalog and show you that spelling."
+        ),
+        "contactout_routed_via_monid": contactout_routed_via_monid(),
+    }
 
 
 @app.get("/diagnostics/provider-filters")
