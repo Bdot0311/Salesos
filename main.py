@@ -57,6 +57,7 @@ class Settings(BaseSettings):
     fiber_api_key: Optional[str] = None
     contactout_api_key: Optional[str] = None
     moltsets_api_key: Optional[str] = None
+    enrichso_api_key: Optional[str] = None
     treg_token: Optional[str] = None
     treg_org_id: Optional[str] = None
     treg_base_url: str = "https://treg.to"
@@ -196,8 +197,17 @@ TREG_META_VALUE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 # here needs no reveal — where a Bytemine or Fiber row is a masked profile
 # that costs a second, dearer call to open. And it pages by offset, so it can
 # walk past people this searcher has already seen.
-PROVIDER_ORDER = ("bytemine", "crustdata", "moltsets", "getleads", "fiber",
-                  "contactout", "treg", "coldiq", "findymail", "wiza")
+# enrichso leads the order. It is the only leg that can express a region, a
+# revenue range or a department at all — every other one refuses those — and
+# its headcount bounds are numeric, so a band maps exactly rather than to the
+# nearest of theirs. Its search is free for the first 50 filter combinations a
+# month and 1 credit a row after that, which is cheaper per row than every leg
+# below it. Rows come back masked, so a reveal is still a separate call.
+#
+# SEARCH_PROVIDER still decides which leg *leads*; this only decides the order
+# of the rest. Set SEARCH_PROVIDER=enrichso to put it first in practice.
+PROVIDER_ORDER = ("enrichso", "bytemine", "crustdata", "moltsets", "getleads",
+                  "fiber", "contactout", "treg", "coldiq", "findymail", "wiza")
 
 
 def provider_configured(name: str) -> bool:
@@ -220,6 +230,8 @@ def provider_configured(name: str) -> bool:
         return bool(settings.contactout_api_key)
     if name == "moltsets":
         return bool(settings.moltsets_api_key)
+    if name == "enrichso":
+        return bool(settings.enrichso_api_key)
     if name == "wiza":
         return bool(settings.wiza_api_key)
     return False
@@ -4902,6 +4914,562 @@ async def moltsets_reveal(linkedin_url: str = None, name: str = None,
 
 
 # =============================================================================
+# Enrich.so  (https://dev.enrich.so/api/v3)
+# =============================================================================
+#
+# The widest filter surface in the chain by a long way — 138 fields across
+# person, company and insight dimensions. Three of them are things *no other
+# leg here can express at all*, and which this file currently refuses outright:
+#
+#   continent / countryRegion   every other leg refuses a region (see _REGIONS),
+#                               so "founders in Europe" has never reached a
+#                               provider that could answer it. This one has
+#                               Europe, Asia, APAC, EMEA, LATAM and NORAM as
+#                               first-class values.
+#   revenueMin / revenueMax     a real numeric range, where every other leg has
+#                               either nothing or a fixed band, so
+#                               refuse_unexpressible has been dropping revenue
+#                               out of every search that carried one.
+#   employeeCountMin / Max      numeric, so any headcount band maps exactly. No
+#                               11-50 spanning two of their bands, which is the
+#                               thing MoltSets has to refuse.
+#
+# It also takes jobTitle as a 25-value multi-select, so one call can cover a
+# whole ICP's title list rather than the fan-out's one-search-per-title.
+#
+# Billing, which governs everything below:
+#   search    50 free searches a month; the first 75 results of a free search
+#             are free at any page size, then 1 credit per result. The same page
+#             is not charged twice within 24 hours. Every response reports
+#             meta.creditsUsed, meta.isFreeQuery and meta.freeQueriesRemaining.
+#   count     free — no credits and no free-search quota.
+#   reveal    10 credits for an email, **525 for a phone**, 10 for a personal
+#             email. See enrichso_reveal: that one number governs this leg.
+#   validate  1 credit, and nothing at all when the verdict is `risky`.
+#
+# Search returns preview fields only — no email, no phone — so this sits in the
+# masked tier with Bytemine and Crustdata rather than with MoltSets and
+# ContactOut, whose rows arrive with an address already on them.
+
+ENRICHSO_BASE = "https://dev.enrich.so/api/v3"
+
+# Their hard ceiling on pageSize.
+ENRICHSO_MAX_PAGE = 100
+
+# How far this leg will page looking for someone new. Their own offset cap is
+# (page - 1) x pageSize < 500,000, deeper than anything else here, so this
+# bound is ours rather than theirs: each page past the first is a round trip,
+# and past the free allowance it is a credit per row.
+ENRICHSO_MAX_PAGES = 3
+
+# How long a reveal may be polled. Their guidance is every two seconds; the
+# ceiling has to fit inside the gateway budget with room for the legs that ran
+# before it, the same reasoning as WIZA_REVEAL_BUDGET_SECONDS.
+ENRICHSO_REVEAL_BUDGET_SECONDS = 30.0
+ENRICHSO_REVEAL_POLL_SECONDS = 2.0
+
+# Their seniority vocabulary, complete. Six values, all six printed in their
+# filter-options index rather than linked away, so none of this is guessed.
+#
+# There is no owner, founder or partner tier; "C-Team" is where those go. That
+# is not an invention either — build_getleads_filters already maps owner onto
+# the same spelling, because GetLeads uses this same vocabulary.
+_ES_JOB_LEVEL = {
+    "owner": "C-Team",
+    "partner": "C-Team",
+    "c_suite": "C-Team",
+    "vp": "VP",
+    "director": "Director",
+    "manager": "Manager",
+    "senior": "Staff",
+    "junior": "Staff",
+}
+
+# Their 22 job functions, verbatim. This is what lets `departments` be
+# expressed at all — nearly every other leg refuses it.
+_ES_JOB_FUNCTION = {
+    "advertising": "Advertising & Marketing",
+    "marketing": "Advertising & Marketing",
+    "creative": "Art, Culture and Creative Professionals",
+    "design": "Art, Culture and Creative Professionals",
+    "construction": "Construction",
+    "customer service": "Customer/Client Service",
+    "customer success": "Customer/Client Service",
+    "support": "Customer/Client Service",
+    "education": "Education",
+    "engineering": "Engineering",
+    "finance": "Finance & Accounting",
+    "accounting": "Finance & Accounting",
+    "management": "General Business & Management",
+    "general management": "General Business & Management",
+    "healthcare": "Healthcare & Human Services",
+    "health": "Healthcare & Human Services",
+    "human resources": "Human Resources",
+    "hr": "Human Resources",
+    "people": "Human Resources",
+    "information technology": "Information Technology",
+    "it": "Information Technology",
+    "legal": "Legal",
+    "manufacturing": "Manufacturing & Production",
+    "production": "Manufacturing & Production",
+    "operations": "Operations",
+    "public administration": "Public Administration & Safety",
+    "purchasing": "Purchasing",
+    "procurement": "Purchasing",
+    "research": "Research & Development",
+    "r&d": "Research & Development",
+    "sales": "Sales & Business Development",
+    "business development": "Sales & Business Development",
+    "science": "Science",
+    "supply chain": "Supply Chain & Logistics",
+    "logistics": "Supply Chain & Logistics",
+    "writing": "Writing/Editing",
+}
+
+# Our industry vocabulary mapped onto their 454 LinkedIn industry values.
+#
+# Every target below was checked against the real list, which matters more here
+# than anywhere else in this file: their docs say in as many words that "an
+# unknown value is not an error — it just matches nothing". That is the silent
+# zero this file keeps being bitten by.
+#
+# It is why "Computer Software" does not appear. It is not one of their values;
+# the current LinkedIn taxonomy calls it "Software Development" — the identical
+# trap that made MoltSets return zero rows for days while ContactOut answered
+# the same ICP with 131 people.
+#
+# Several of ours map to more than one of theirs. linkedinIndustry is a
+# multi-select of up to 20 whose values are OR-ed, so that is a wider net
+# rather than a conflict, and it is the honest reading: our "marketing and
+# advertising" really is both of their marketing buckets.
+_ES_INDUSTRY = {
+    "computer software": ["Software Development"],
+    "information technology and services": ["IT Services and IT Consulting"],
+    "internet": ["Information and Internet"],
+    "computer games": ["Computer Games"],
+    "computer & network security": ["Computer and Network Security"],
+    "financial services": ["Financial Services"],
+    "banking": ["Banking"],
+    "insurance": ["Insurance"],
+    "accounting": ["Accounting"],
+    "hospital & health care": ["Hospitals and Health Care"],
+    "health care": ["Hospitals and Health Care"],
+    "pharmaceuticals": ["Pharmaceutical Manufacturing"],
+    "biotechnology": ["Biotechnology"],
+    "marketing and advertising": ["Advertising Services", "Marketing Services"],
+    "real estate": ["Real Estate"],
+    "education": ["Education"],
+    "education management": ["Education Management"],
+    "e-learning": ["E-learning"],
+    "staffing and recruiting": ["Staffing and Recruiting"],
+    "management consulting": ["Business Consulting and Services"],
+    "legal services": ["Legal Services"],
+    "construction": ["Construction"],
+    "automotive": ["Automotive"],
+    "food & beverages": ["Food and Beverages"],
+    "media production": ["Media Production"],
+    "telecommunications": ["Telecommunications"],
+    "logistics and supply chain": ["Logistics", "Supply Chain and Storage"],
+    "manufacturing": ["Manufacturing"],
+    "retail": ["Retail"],
+    "oil & energy": ["Oil and Gas"],
+    "utilities": ["Utilities"],
+    "government administration": ["Government Administration"],
+    "non-profit organization management": ["Non-profit Organization Management"],
+    "nonprofit organization management": ["Non-profit Organization Management"],
+    "hospitality": ["Hospitality"],
+}
+
+# The regions this file has always had to refuse, and what they are called
+# here. Their continent list is Africa, Antarctica, Asia, Europe, North
+# America, Oceania and South America; their countryRegion list is APAC, EMEA,
+# LATAM and NORAM. Both are verbatim from the filter-options index.
+#
+# A region in _REGIONS that is not below stays refused. "benelux", "dach" and
+# "the nordics" are groupings neither field has, and a near miss would silently
+# match nothing rather than fail.
+_ES_CONTINENT = {
+    "africa": "Africa", "antarctica": "Antarctica", "asia": "Asia",
+    "europe": "Europe", "north america": "North America",
+    "oceania": "Oceania", "australasia": "Oceania",
+    "south america": "South America",
+}
+_ES_COUNTRY_REGION = {
+    "apac": "APAC", "asia pacific": "APAC", "asia-pacific": "APAC",
+    "emea": "EMEA", "middle east and africa": "EMEA",
+    "latam": "LATAM", "latin america": "LATAM",
+    "noram": "NORAM",
+}
+
+# Their email-validation verdicts, mapped onto our shared shape. `risky` is a
+# real answer and a free one — their docs say an address is not charged for
+# when the verdict is risky — and it is not sendable, so it stays distinct from
+# "nobody could tell", exactly as Fiber's "risky" and ContactOut's
+# "accept_all" do.
+_ES_VERDICT = {
+    "valid": ("deliverable", True),
+    "invalid": ("undeliverable", False),
+    "risky": ("risky", False),
+}
+
+
+async def enrichso_call(method: str, path: str, *, body: dict = None,
+                        params: dict = None, timeout: float = 60.0) -> tuple:
+    """Call Enrich.so. Returns (status_code, parsed body or None).
+
+    The key travels in `x-api-key`. They also accept it as a Bearer token; the
+    header is used because this file logs every request body it sends, and a
+    credential has no business being anywhere near that.
+
+    Returns rather than raises on 402 and 429 — out of credits and rate limited
+    are states of the account, not failures of this request, and a leg that
+    raises on them takes the whole search down with it.
+    """
+    if provider_out_of_credits("enrichso"):
+        return 402, None
+
+    headers = {
+        "x-api-key": settings.enrichso_api_key or "",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    printable = json.dumps(body)[:400] if body is not None else json.dumps(params or {})
+    print(f"Enrich.so {method} {path}: {printable}")
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.request(method, f"{ENRICHSO_BASE}{path}",
+                                        headers=headers, json=body, params=params)
+    except httpx.HTTPError as exc:
+        print(f"Enrich.so {path} unreachable: {exc}")
+        return 0, None
+
+    provider_note_exhausted("enrichso", resp.status_code == 402, "Enrich.so")
+    if resp.status_code != 200:
+        print(f"Enrich.so {path} status: {resp.status_code} {resp.text[:300]}")
+    try:
+        return resp.status_code, resp.json()
+    except ValueError:
+        return resp.status_code, None
+
+
+def build_enrichso_filters(p: dict) -> dict:
+    """Translate internal search params into a /lead-finder/search filter set.
+
+    Refuses far less than any other builder here, because this index genuinely
+    expresses more. What it does refuse, it refuses because an unknown value is
+    not rejected by their API — it silently matches nothing, which is worse
+    than stepping aside.
+    """
+    f: dict = {}
+
+    # Their technographic filters are enumerated vocabularies (6 CRM values, 49
+    # martech categories, and so on). Our `technologies` is free text, and an
+    # unmatched value here matches nothing rather than erroring — so a guess
+    # would read as "no such companies". aboutUs would accept the word as a
+    # keyword, but "mentions Salesforce in its About" is a different question
+    # from "uses Salesforce", and answering a different question is the one
+    # thing this chain must not do.
+    refuse_unexpressible(p, "technologies", "intent_topics")
+
+    if p.get("job_title"):
+        # A 25-value multi-select, and our job_title may already be a list
+        # flattened to a comma string by SearchRequest.coerce_str.
+        titles = [t.strip() for t in str(p["job_title"]).split(",") if t.strip()]
+        if titles:
+            f["jobTitle"] = titles[:25]
+        f["jobIsCurrent"] = True
+
+    # See title_supersedes_seniority: a title that already states a level and a
+    # seniority filter are one criterion sent as two, which is what emptied
+    # Bytemine and Crustdata for "Founder" + Owner.
+    if p.get("seniority") and not title_supersedes_seniority(
+            p.get("job_title"), p["seniority"]):
+        level = _ES_JOB_LEVEL.get(_canonical_seniority(p["seniority"]))
+        if not level:
+            raise ProviderUnsupported("seniority", p["seniority"])
+        f["jobLevel"] = [level]
+
+    if p.get("industry"):
+        mapped = _ES_INDUSTRY.get(str(p["industry"]).strip().lower())
+        if not mapped:
+            raise ProviderUnsupported("industry", p["industry"])
+        f["linkedinIndustry"] = mapped[:20]
+
+    if p.get("departments"):
+        wanted = []
+        for dept in p["departments"]:
+            got = _ES_JOB_FUNCTION.get(str(dept or "").strip().lower())
+            if got and got not in wanted:
+                wanted.append(got)
+        if not wanted:
+            raise ProviderUnsupported("departments", p["departments"])
+        f["jobFunction"] = wanted[:26]
+
+    # Numeric bounds, so a band maps exactly rather than to the nearest of
+    # theirs. This is the only leg here that can say 11-50 and mean it.
+    if p.get("company_size"):
+        lo, hi = _size_bounds(str(p["company_size"]))
+        if lo is None and hi is None:
+            raise ProviderUnsupported("company_size", p["company_size"])
+        if lo is not None:
+            f["employeeCountMin"] = lo
+        if hi is not None:
+            f["employeeCountMax"] = hi
+
+    # Likewise revenue, which every other leg in this chain refuses outright.
+    if p.get("revenue_min") is not None:
+        f["revenueMin"] = int(p["revenue_min"])
+    if p.get("revenue_max") is not None:
+        f["revenueMax"] = int(p["revenue_max"])
+
+    company = p.get("company")
+    domain = p.get("company_domain")
+    if company and not domain and looks_like_domain(company):
+        domain, company = company, None
+    if domain:
+        f["domain"] = [domain_host(domain) or domain]
+    elif company:
+        f["companyName"] = [company]
+        f["companyNameMode"] = "contains"
+
+    location = p.get("location") or p.get("company_location")
+    if location:
+        kind, value = classify_location(str(location))
+        token = str(location).strip().lower()
+        if kind == "region":
+            # The branch no other leg has. A region reaching a provider that
+            # can express it is the whole reason this leg sits high.
+            if token in _ES_CONTINENT:
+                f["continent"] = [_ES_CONTINENT[token]]
+            elif token in _ES_COUNTRY_REGION:
+                f["countryRegion"] = [_ES_COUNTRY_REGION[token]]
+            else:
+                raise ProviderUnsupported("location", location)
+        elif kind == "country":
+            name = _GL_COUNTRY_NAME.get(value)
+            if not name:
+                raise ProviderUnsupported("location", location)
+            f["countryName"] = [name]
+        elif kind == "state":
+            f["stateName"] = [_US_STATE_CODE_TO_NAME.get(value, value)]
+            f["countryName"] = ["United States"]
+        elif kind == "city":
+            f["city"] = str(location)
+        else:
+            raise ProviderUnsupported("location", location)
+
+    # personHeadline and aboutUs are contains matches that accept any keyword —
+    # their docs single those out as the exception to exact matching. A segment
+    # phrase has a real home here instead of being refused.
+    segment = p.get("keywords") or p.get("semantic_keywords")
+    if segment:
+        terms = [t.strip() for t in str(segment).split(",") if t.strip()]
+        if terms:
+            f["personHeadline"] = terms[:10]
+
+    if not f:
+        raise HTTPException(status_code=400, detail="At least one search parameter required")
+    return f
+
+
+def enrichso_rows(payload) -> tuple:
+    """Return (rows, total) from a lead-finder search envelope."""
+    if not isinstance(payload, dict) or not payload.get("success"):
+        return [], 0
+    data = payload.get("data") or {}
+    rows = data.get("results")
+    rows = [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+    pagination = data.get("pagination") or {}
+    return rows, int(pagination.get("totalResults") or len(rows))
+
+
+async def enrichso_person_search(params: dict, limit: int, page: int = 1,
+                                 exclude_titles: list = None) -> dict:
+    """Search Enrich.so's lead finder. Preview fields only — reveal is separate."""
+    body = {
+        "filters": build_enrichso_filters(params),
+        "page": max(int(page or 1), 1),
+        "pageSize": max(min(int(limit or 10), ENRICHSO_MAX_PAGE), 1),
+    }
+    if exclude_titles:
+        # Only personHeadline, companyHeadline, aboutUs, domain and jobTitle are
+        # supported here, so this is the one exclusion their API will take.
+        body["excludeFilters"] = {"jobTitle": exclude_titles[:25]}
+
+    status, data = await enrichso_call("POST", "/lead-finder/search", body=body)
+    if status != 200:
+        if status == 402:
+            print("Enrich.so is out of credits — skipping this leg")
+        return {"profiles": [], "total": 0, "has_more": False}
+
+    rows, total = enrichso_rows(data)
+    meta = (data or {}).get("meta") or {}
+    withheld = meta.get("resultsWithheld") or 0
+    print(f"Enrich.so returned {len(rows)} lead(s) on page {body['page']} of "
+          f"~{total} (credits {meta.get('creditsUsed', 0)}, free query "
+          f"{meta.get('isFreeQuery')}, {meta.get('freeQueriesRemaining')} free "
+          f"searches left)")
+    if withheld:
+        # Part of the page was free and the rest could not be paid for. Saying
+        # so is the difference between a short page and a wrong one.
+        print(f"Enrich.so withheld {withheld} result(s) it could not charge for")
+    return {"profiles": rows, "total": total,
+            "has_more": bool(((data or {}).get("data") or {})
+                             .get("pagination", {}).get("hasMore"))}
+
+
+def transform_enrichso_lead(row: dict, search_params: dict = None) -> dict:
+    """Map one Enrich.so preview row onto our lead shape.
+
+    Search returns no contact details — those are a separate, separately billed
+    reveal — so email and phone are None here, as for Bytemine and Crustdata.
+    """
+    del search_params  # their ranking orders the page; we do not re-score it
+
+    first, last = row.get("firstName"), row.get("lastName")
+    name = " ".join(x for x in (first, last) if x) or None
+    location = ", ".join(str(x) for x in (row.get("city"), row.get("stateName"),
+                                          row.get("countryName")) if x) or None
+    headcount = row.get("employeeCount")
+
+    return {
+        "contact_name": name,
+        "first_name": first,
+        "last_name": last,
+        "job_title": row.get("jobTitle") or row.get("linkedinHeadline"),
+        "seniority": row.get("jobLevel"),
+        "department": row.get("jobFunction"),
+        "company_name": row.get("companyName"),
+        "company_domain": domain_host(row.get("domain") or "") or None,
+        # They return SIC and NAICS descriptions rather than the LinkedIn
+        # industry that was searched on, so the row names its sector in a third
+        # vocabulary again. industry_bucket spans all of them.
+        "industry": (row.get("industrySicDescription")
+                     or row.get("industryNaicsDescription")),
+        "location": location,
+        "country": row.get("countryName"),
+        "state": row.get("stateName"),
+        "city": row.get("city"),
+        "company_headcount": headcount,
+        "company_size": _size_bucket(headcount) if headcount else None,
+        "linkedin_url": row.get("linkedinUrl"),
+        "contact_linkedin_url": row.get("linkedinUrl"),
+        "headline": row.get("linkedinHeadline"),
+        "business_email": None,
+        "email": None,
+        "email_available": None,
+        "phone": None,
+        "phone_type": None,
+        "phone_available": None,
+        "score": None,
+        # Their own stable identifier, and what /lead-finder/reveal takes.
+        "enrichso_id": row.get("id"),
+        "provider": "enrichso",
+    }
+
+
+async def enrichso_reveal_ids(lead_ids: list, want_phone: bool = False) -> dict:
+    """Reveal contact details for Enrich.so leads. Returns {id: contact}.
+
+    `fields` is always sent explicitly, and this is the single most expensive
+    detail in this provider: it **defaults to ["email", "phone"]** when omitted,
+    and a phone costs 525 credits against an email's 10. Letting the default
+    stand would bill 535 credits a lead instead of 10 — 52 times over — and
+    would turn a 100,000-credit balance into about 190 reveals rather than
+    10,000. Phones are therefore opt-in here and off by default; the other legs
+    in this chain already return phone numbers.
+    """
+    ids = [i for i in (lead_ids or []) if i]
+    if not ids:
+        return {}
+
+    fields = ["email", "phone"] if want_phone else ["email"]
+    status, data = await enrichso_call(
+        "POST", "/lead-finder/reveal",
+        body={"leads": [{"id": i} for i in ids[:25]], "fields": fields})
+    job_id = ((data or {}).get("data") or {}).get("jobId") if status == 200 else None
+    if not job_id:
+        return {}
+
+    reserved = ((data or {}).get("data") or {}).get("creditsReserved")
+    print(f"Enrich.so reveal {job_id}: {len(ids[:25])} lead(s), fields={fields}, "
+          f"{reserved} credit(s) reserved")
+
+    deadline = time.monotonic() + ENRICHSO_REVEAL_BUDGET_SECONDS
+    while time.monotonic() < deadline:
+        await asyncio.sleep(ENRICHSO_REVEAL_POLL_SECONDS)
+        status, poll = await enrichso_call(
+            "GET", f"/lead-finder/reveal-jobs/{job_id}", timeout=30.0)
+        state = ((poll or {}).get("data") or {}).get("status")
+        if status != 200 or state == "failed":
+            print(f"Enrich.so reveal {job_id} failed: "
+                  f"{((poll or {}).get('data') or {}).get('error')}")
+            return {}
+        if state != "completed":
+            continue
+        results = (((poll or {}).get("data") or {}).get("results") or {})
+        revealed = results.get("revealed") or []
+        print(f"Enrich.so reveal {job_id} complete: {len(revealed)} revealed, "
+              f"{results.get('creditsUsed')} credit(s) used")
+        return {r.get("id"): r for r in revealed if isinstance(r, dict) and r.get("id")}
+
+    # Polling is free, so giving up costs only the reveal already reserved.
+    print(f"Enrich.so reveal {job_id} did not finish within "
+          f"{int(ENRICHSO_REVEAL_BUDGET_SECONDS)}s — leaving it to finish")
+    return {}
+
+
+async def enrichso_find_email(first: str, last: str, domain: str) -> dict:
+    """Find a work email from a name and a company domain.
+
+    10 credits, and nothing when no email is found — their docs are explicit
+    that `found: false` is not charged for, which makes this a free miss and
+    worth reaching for.
+    """
+    if not (first and last and domain):
+        return {}
+    status, data = await enrichso_call("POST", "/email-finder", body={
+        "firstName": first, "lastName": last,
+        "domain": domain_host(domain) or domain})
+    found = (data or {}).get("data") or {}
+    if status != 200 or not found.get("found") or not found.get("email"):
+        return {}
+    return {
+        "email": found.get("email"),
+        "email_status": found.get("confidence"),
+        "catch_all": found.get("isCatchAll"),
+    }
+
+
+async def enrichso_verify_email(email: str) -> dict:
+    """Verify one address through Enrich.so, in our shared verdict shape."""
+    status, data = await enrichso_call("POST", "/email-validation",
+                                       body={"email": email})
+    result = ((data or {}).get("data") or {}).get("result") if status == 200 else None
+    if not result:
+        reason = ("enrichso out of credits" if status == 402
+                  else "enrichso rate limited" if status == 429
+                  else "enrichso returned no verdict")
+        return {"status": "unknown", "sendable": None,
+                "checked_by": "enrichso", "reason": reason}
+
+    payload = (data or {}).get("data") or {}
+    mapped, sendable = _ES_VERDICT.get(str(result).lower(), ("unknown", None))
+    return {
+        "status": mapped,
+        "sendable": sendable,
+        "checked_by": "enrichso",
+        "raw_status": result,
+        "catch_all": payload.get("isCatchAll"),
+        "role_based": None,
+        "disposable": None,
+        "free_provider": None,
+        "vendor": payload.get("provider"),
+        "score": payload.get("confidence"),
+    }
+
+
+# =============================================================================
 # ColdIQ  (https://api.coldiq.com)
 # =============================================================================
 #
@@ -5606,6 +6174,7 @@ async def verify_email_address(email: str) -> dict:
 
     for name, check in (("fiber", fiber_verify_email),
                         ("contactout", contactout_verify_email),
+                        ("enrichso", enrichso_verify_email),
                         ("findymail", findymail_verify_email)):
         if not (verdict.get("sendable") is None
                 and verdict.get("status") in ("unknown", "unverified")):
@@ -6715,6 +7284,9 @@ ICP_ENFORCEABLE = frozenset({"industry", "company_size", "location",
 # which is why the check binds the transform to {} (see transform_for).
 _ICP_LOC = ("location", "company_location")
 ICP_CHECKABLE = {
+    # Its rows carry a real integer employeeCount, city/state/countryName, and
+    # a SIC or NAICS industry description — so all three are measurable.
+    "enrichso":   frozenset({"industry", "company_size", *_ICP_LOC}),
     "bytemine":   frozenset({"industry", "company_size"}),
     "crustdata":  frozenset({"industry", "company_size", *_ICP_LOC}),
     "moltsets":   frozenset({"industry", *_ICP_LOC}),
@@ -8346,6 +8918,8 @@ async def walk_search(request: SearchRequest):
             return lambda row: transform_contactout_profile(row, bound)
         if name == "moltsets":
             return lambda row: transform_moltsets_profile(row, bound)
+        if name == "enrichso":
+            return lambda row: transform_enrichso_lead(row, bound)
         if name == "getleads":
             return lambda record: transform_getleads_contact(record)
         if name == "treg":
@@ -8494,6 +9068,68 @@ async def walk_search(request: SearchRequest):
             """
             return enforce_icp(rows, outer_params, skip_fields,
                                transform_for(name, {}), off_icp)
+
+        if name == "enrichso":
+            # Numbered paging, so this leg can walk past the people this
+            # searcher has already been shown rather than handing back the same
+            # first page and letting the ledger empty it.
+            #
+            # Bounded at ENRICHSO_MAX_PAGES. The first 75 rows of a free search
+            # cost nothing, so paging inside that allowance is free; past it a
+            # row is a credit, which is what the bound is for.
+            wanted = params.get("limit", 10)
+            page = 1
+            if request.start_offset:
+                page = (request.start_offset // max(min(
+                    wanted, ENRICHSO_MAX_PAGE), 1)) + 1
+
+            seen = {i for i in (linkedin_identity(u) for u in (exclusions or [])) if i}
+            found: list = []
+            total = 0
+            rows_seen = 0
+
+            for _ in range(ENRICHSO_MAX_PAGES):
+                page_started = time.monotonic()
+                data = await enrichso_person_search(
+                    params, max(wanted - len(found), 1), page=page)
+                page_seconds = time.monotonic() - page_started
+                rows = keep_on_icp(data["profiles"])
+                rows_seen += len(rows)
+                total = data["total"]
+
+                fresh = rows
+                if seen:
+                    fresh = [r for r in fresh
+                             if linkedin_identity(_profile_url(r)) not in seen]
+                if campaign_keys:
+                    fresh = drop_already_seen(fresh, campaign_keys, suppressed)
+                found.extend(fresh)
+
+                if len(found) >= wanted or not rows or not data.get("has_more"):
+                    break
+
+                # The budget is checked between legs and this loop sits inside
+                # one — the GetLeads lesson, which cost a whole search.
+                left = search_seconds_left()
+                if left is not None and left < page_seconds + CHAIN_RESERVE_SECONDS:
+                    print(f"Enrich.so: {int(left)}s of the search budget left and "
+                          f"a page costs about {int(page_seconds)}s — stopping "
+                          "here so the rest of the chain still runs")
+                    break
+                page += 1
+                print(f"Enrich.so: {len(rows) - len(fresh)} of {len(rows)} row(s) "
+                      f"already seen, {len(found)}/{wanted} collected — "
+                      f"paging to {page}")
+
+            exhausted = not found
+            found = found[:wanted]
+            if seen_scope:
+                found = await record_new_campaign_profiles(seen_scope, found)
+            if exhausted:
+                log_empty_leg("Enrich.so", rows_seen, seen_scope)
+
+            return found, total, None
+
         if name == "bytemine":
             result = await bytemine_person_search(
                 params, max(min(params.get("limit", 10), 100), 1),

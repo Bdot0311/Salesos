@@ -6516,6 +6516,492 @@ class MoltSetsFilterTests(unittest.TestCase):
                 self.assertEqual(caught.exception.field, field)
 
 
+class EnrichSoClient:
+    """Fake httpx client for Enrich.so: one `request` verb, answers per route."""
+    routes = {}
+    calls = []
+
+    def __init__(self, *a, **k):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def request(self, method, url, headers=None, json=None, params=None):
+        path = url.replace(main.ENRICHSO_BASE, "")
+        self.__class__.calls.append((method, path, json, headers))
+        status, payload = self.__class__.routes.get(
+            (method, path), (404, {"success": False}))
+        if callable(payload):
+            payload = payload(len(self.__class__.calls))
+        return RoutedResponse(status, payload)
+
+    @classmethod
+    def reset(cls, routes=None):
+        cls.routes = routes or {}
+        cls.calls = []
+
+
+def _es(**env):
+    return patch.multiple(main.settings, enrichso_api_key="sk_live_test", **env)
+
+
+def _es_row(i=1, **over):
+    row = {
+        "id": f"lead-{i}",
+        "firstName": "Ada", "lastName": "Lovelace",
+        "jobTitle": "Founder", "jobFunction": "Engineering", "jobLevel": "C-Team",
+        "companyName": "Acme", "domain": "acme.com",
+        "linkedinUrl": f"https://linkedin.com/in/ada-{i}",
+        "linkedinHeadline": "Founder at Acme",
+        "city": "Austin", "stateName": "Texas", "countryName": "United States",
+        "employeeCount": 7,
+        "industrySicDescription": "Prepackaged software",
+        "industryNaicsDescription": "Software Publishers",
+        "revenue": "<$1M",
+    }
+    row.update(over)
+    return row
+
+
+def _es_page(rows, total=None, has_more=False, meta=None):
+    return {
+        "success": True,
+        "data": {"results": rows,
+                 "pagination": {"page": 1, "pageSize": 25,
+                                "totalResults": total if total is not None else len(rows),
+                                "totalPages": 1, "hasMore": has_more}},
+        "meta": {"creditsUsed": 0, "isFreeQuery": True,
+                 "freeQueriesRemaining": 49, **(meta or {})},
+    }
+
+
+class EnrichSoFilterTests(unittest.TestCase):
+    """Their docs: "an unknown value is not an error — it just matches nothing".
+
+    That is the silent zero this file keeps being bitten by, so every value
+    this builder can emit was checked against the real 454-entry list rather
+    than inferred from a taxonomy that looked right.
+    """
+
+    def test_the_classic_linkedin_name_is_never_sent(self):
+        # "Computer Software" is not one of their 454 values; the current
+        # taxonomy calls it "Software Development". Sending the classic name is
+        # exactly what made MoltSets return zero rows for days.
+        f = main.build_enrichso_filters({"industry": "computer software"})
+
+        self.assertEqual(f["linkedinIndustry"], ["Software Development"])
+        self.assertNotIn("Computer Software", f["linkedinIndustry"])
+
+    def test_every_industry_it_can_emit_is_a_real_value(self):
+        # The guard that makes the mapping trustworthy: no target invented.
+        verified = {
+            "Software Development", "IT Services and IT Consulting",
+            "Information and Internet", "Computer Games",
+            "Computer and Network Security", "Financial Services", "Banking",
+            "Insurance", "Accounting", "Hospitals and Health Care",
+            "Pharmaceutical Manufacturing", "Biotechnology",
+            "Advertising Services", "Marketing Services", "Real Estate",
+            "Education", "Education Management", "E-learning",
+            "Staffing and Recruiting", "Business Consulting and Services",
+            "Legal Services", "Construction", "Automotive",
+            "Food and Beverages", "Media Production", "Telecommunications",
+            "Logistics", "Supply Chain and Storage", "Manufacturing", "Retail",
+            "Oil and Gas", "Utilities", "Government Administration",
+            "Non-profit Organization Management", "Hospitality",
+        }
+        emitted = {v for vals in main._ES_INDUSTRY.values() for v in vals}
+
+        self.assertEqual(emitted - verified, set())
+
+    def test_an_unmapped_industry_steps_aside_rather_than_matching_nothing(self):
+        with self.assertRaises(main.ProviderUnsupported) as caught:
+            main.build_enrichso_filters({"industry": "Salon & Spa"})
+        self.assertEqual(caught.exception.field, "industry")
+
+    def test_owner_and_founder_land_on_c_team(self):
+        # Their six levels have no owner tier, and build_getleads_filters
+        # already maps owner onto this same spelling.
+        f = main.build_enrichso_filters(
+            {"job_title": "Account Executive", "seniority": "owner"})
+        self.assertEqual(f["jobLevel"], ["C-Team"])
+
+    def test_every_level_it_emits_is_one_of_their_six(self):
+        self.assertEqual(set(main._ES_JOB_LEVEL.values()) -
+                         {"C-Team", "VP", "Director", "Manager", "Staff", "Other"},
+                         set())
+
+    def test_a_title_that_states_its_own_level_drops_the_seniority(self):
+        f = main.build_enrichso_filters({"job_title": "Founder",
+                                         "seniority": "owner"})
+        self.assertNotIn("jobLevel", f)
+
+    def test_a_whole_icp_title_list_goes_in_one_call(self):
+        # jobTitle is a 25-value multi-select, so the fan-out's
+        # one-search-per-title is not needed here.
+        f = main.build_enrichso_filters(
+            {"job_title": "Founder, Co-Founder, Head of Sales"})
+
+        self.assertEqual(f["jobTitle"], ["Founder", "Co-Founder", "Head of Sales"])
+        self.assertIs(f["jobIsCurrent"], True)
+
+    def test_a_region_finally_reaches_a_provider_that_can_express_it(self):
+        # The unlock. Every other leg refuses a region (see _REGIONS), so
+        # "founders in Europe" has never been answered by anyone.
+        self.assertEqual(main.classify_location("Europe")[0], "region")
+
+        f = main.build_enrichso_filters({"job_title": "Founder",
+                                         "location": "Europe"})
+        self.assertEqual(f["continent"], ["Europe"])
+
+    def test_a_multi_country_bloc_uses_their_region_field(self):
+        for token, expected in (("APAC", "APAC"), ("EMEA", "EMEA"),
+                                ("LATAM", "LATAM")):
+            with self.subTest(region=token):
+                f = main.build_enrichso_filters({"job_title": "Founder",
+                                                 "location": token})
+                self.assertEqual(f["countryRegion"], [expected])
+
+    def test_a_grouping_neither_field_has_is_still_refused(self):
+        # "benelux" and "dach" are in _REGIONS but in neither of their lists,
+        # and a near miss would silently match nothing.
+        for token in ("Benelux", "DACH", "Nordics"):
+            with self.subTest(region=token):
+                with self.assertRaises(main.ProviderUnsupported):
+                    main.build_enrichso_filters({"job_title": "Founder",
+                                                 "location": token})
+
+    def test_every_region_it_emits_is_a_real_value(self):
+        self.assertEqual(set(main._ES_CONTINENT.values()) -
+                         {"Africa", "Antarctica", "Asia", "Europe",
+                          "North America", "Oceania", "South America"}, set())
+        self.assertEqual(set(main._ES_COUNTRY_REGION.values()) -
+                         {"APAC", "EMEA", "LATAM", "NORAM"}, set())
+
+    def test_a_headcount_band_maps_to_exact_numeric_bounds(self):
+        # The only leg here that can say 11-50 and mean it. MoltSets has to
+        # refuse that band because theirs splits it in two.
+        f = main.build_enrichso_filters({"job_title": "Founder",
+                                         "company_size": "11-50"})
+        self.assertEqual((f["employeeCountMin"], f["employeeCountMax"]), (11, 50))
+
+    def test_an_open_ended_band_sends_only_a_floor(self):
+        f = main.build_enrichso_filters({"job_title": "Founder",
+                                         "company_size": "10001+"})
+        self.assertEqual(f["employeeCountMin"], 10001)
+        self.assertNotIn("employeeCountMax", f)
+
+    def test_revenue_is_expressed_rather_than_dropped(self):
+        # refuse_unexpressible has been dropping revenue on every search,
+        # because no other leg has a field for it.
+        f = main.build_enrichso_filters({"job_title": "Founder",
+                                         "revenue_min": 1_000_000,
+                                         "revenue_max": 50_000_000})
+        self.assertEqual((f["revenueMin"], f["revenueMax"]), (1_000_000, 50_000_000))
+
+    def test_a_department_reaches_their_job_function(self):
+        f = main.build_enrichso_filters({"job_title": "Director",
+                                         "departments": ["Engineering", "Sales"]})
+        self.assertEqual(f["jobFunction"],
+                         ["Engineering", "Sales & Business Development"])
+
+    def test_every_function_it_emits_is_one_of_their_22(self):
+        theirs = {"Advertising & Marketing",
+                  "Art, Culture and Creative Professionals", "Construction",
+                  "Customer/Client Service", "Education", "Engineering",
+                  "Finance & Accounting", "General Business & Management",
+                  "Healthcare & Human Services", "Human Resources",
+                  "Information Technology", "Legal",
+                  "Manufacturing & Production", "Operations", "Other",
+                  "Public Administration & Safety", "Purchasing",
+                  "Research & Development", "Sales & Business Development",
+                  "Science", "Supply Chain & Logistics", "Writing/Editing"}
+        self.assertEqual(set(main._ES_JOB_FUNCTION.values()) - theirs, set())
+
+    def test_a_segment_phrase_uses_their_contains_field(self):
+        # personHeadline, companyHeadline and aboutUs are the documented
+        # exception to exact matching, so a keyword has a real home here.
+        f = main.build_enrichso_filters({"job_title": "Founder",
+                                         "keywords": "ai saas, devtools"})
+        self.assertEqual(f["personHeadline"], ["ai saas", "devtools"])
+
+    def test_technologies_are_refused_rather_than_guessed(self):
+        # Their technographics are enumerated vocabularies, and an unmatched
+        # value matches nothing silently. aboutUs would take the word, but
+        # "mentions Salesforce" is a different question from "uses Salesforce".
+        with self.assertRaises(main.ProviderUnsupported) as caught:
+            main.build_enrichso_filters({"job_title": "Founder",
+                                         "technologies": ["Salesforce"]})
+        self.assertEqual(caught.exception.field, "technologies")
+
+    def test_a_domain_wins_over_a_name(self):
+        f = main.build_enrichso_filters({"job_title": "Founder",
+                                         "company": "https://acme.com/about"})
+        self.assertEqual(f["domain"], ["acme.com"])
+        self.assertNotIn("companyName", f)
+
+
+class EnrichSoSearchTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        main._exhausted_until.clear()
+        main._exhausted_streak.clear()
+
+    async def test_it_reads_the_search_envelope(self):
+        EnrichSoClient.reset({("POST", "/lead-finder/search"):
+                              (200, _es_page([_es_row(1), _es_row(2)], total=412))})
+        with patch.object(main.httpx, "AsyncClient", EnrichSoClient), _es():
+            data = await main.enrichso_person_search({"job_title": "Founder"}, 25)
+
+        self.assertEqual(len(data["profiles"]), 2)
+        self.assertEqual(data["total"], 412)
+
+    async def test_a_response_without_success_is_not_a_hit(self):
+        EnrichSoClient.reset({("POST", "/lead-finder/search"):
+                              (200, {"success": False, "data": {"results": [_es_row()]}})})
+        with patch.object(main.httpx, "AsyncClient", EnrichSoClient), _es():
+            data = await main.enrichso_person_search({"job_title": "Founder"}, 25)
+
+        self.assertEqual(data["profiles"], [])
+
+    async def test_the_key_travels_in_the_header_not_the_body(self):
+        EnrichSoClient.reset({("POST", "/lead-finder/search"): (200, _es_page([]))})
+        with patch.object(main.httpx, "AsyncClient", EnrichSoClient), _es():
+            await main.enrichso_person_search({"job_title": "Founder"}, 25)
+
+        _, _, body, headers = EnrichSoClient.calls[0]
+        self.assertEqual(headers["x-api-key"], "sk_live_test")
+        self.assertNotIn("sk_live_test", json.dumps(body))
+
+    async def test_the_page_is_capped_at_their_ceiling(self):
+        EnrichSoClient.reset({("POST", "/lead-finder/search"): (200, _es_page([]))})
+        with patch.object(main.httpx, "AsyncClient", EnrichSoClient), _es():
+            await main.enrichso_person_search({"job_title": "Founder"}, 5000)
+
+        self.assertEqual(EnrichSoClient.calls[0][2]["pageSize"], main.ENRICHSO_MAX_PAGE)
+
+    async def test_out_of_credits_is_an_empty_page_and_latches(self):
+        EnrichSoClient.reset({("POST", "/lead-finder/search"):
+                              (402, {"success": False})})
+        with patch.object(main.httpx, "AsyncClient", EnrichSoClient), _es():
+            first = await main.enrichso_person_search({"job_title": "Founder"}, 25)
+            spent = len(EnrichSoClient.calls)
+            second = await main.enrichso_person_search({"job_title": "Founder"}, 25)
+
+        self.assertEqual(first["profiles"], [])
+        self.assertEqual(second["profiles"], [])
+        # The latch every provider now shares: the second call never left.
+        self.assertEqual(len(EnrichSoClient.calls), spent)
+
+
+class EnrichSoRevealTests(unittest.IsolatedAsyncioTestCase):
+    """The 525-credit trap.
+
+    `fields` defaults to ["email", "phone"] when omitted, and a phone costs 525
+    credits against an email's 10. Letting the default stand would bill 535 a
+    lead instead of 10 — and would turn a 100,000-credit balance into about 190
+    reveals rather than 10,000.
+    """
+
+    def setUp(self):
+        main._exhausted_until.clear()
+        main._exhausted_streak.clear()
+
+    def _routes(self, revealed):
+        return {
+            ("POST", "/lead-finder/reveal"):
+                (200, {"success": True, "data": {"jobId": "job-1",
+                                                 "status": "pending",
+                                                 "creditsReserved": 10}}),
+            ("GET", "/lead-finder/reveal-jobs/job-1"):
+                (200, {"success": True,
+                       "data": {"jobId": "job-1", "status": "completed",
+                                "results": {"revealed": revealed,
+                                            "creditsUsed": 10}}}),
+        }
+
+    async def test_fields_is_always_explicit_and_email_only_by_default(self):
+        EnrichSoClient.reset(self._routes([{"id": "lead-1",
+                                            "emailAddress": "ada@acme.com"}]))
+        with patch.object(main.httpx, "AsyncClient", EnrichSoClient), _es(), \
+             patch.object(main.asyncio, "sleep", AsyncMock()):
+            out = await main.enrichso_reveal_ids(["lead-1"])
+
+        body = EnrichSoClient.calls[0][2]
+        self.assertEqual(body["fields"], ["email"])
+        self.assertNotIn("phone", body["fields"])
+        self.assertEqual(out["lead-1"]["emailAddress"], "ada@acme.com")
+
+    async def test_a_phone_is_only_asked_for_when_asked_for(self):
+        EnrichSoClient.reset(self._routes([]))
+        with patch.object(main.httpx, "AsyncClient", EnrichSoClient), _es(), \
+             patch.object(main.asyncio, "sleep", AsyncMock()):
+            await main.enrichso_reveal_ids(["lead-1"], want_phone=True)
+
+        self.assertEqual(EnrichSoClient.calls[0][2]["fields"], ["email", "phone"])
+
+    async def test_it_never_reveals_more_than_their_batch_ceiling(self):
+        EnrichSoClient.reset(self._routes([]))
+        with patch.object(main.httpx, "AsyncClient", EnrichSoClient), _es(), \
+             patch.object(main.asyncio, "sleep", AsyncMock()):
+            await main.enrichso_reveal_ids([f"lead-{i}" for i in range(60)])
+
+        self.assertEqual(len(EnrichSoClient.calls[0][2]["leads"]), 25)
+
+    async def test_a_failed_job_is_empty_rather_than_an_exception(self):
+        EnrichSoClient.reset({
+            ("POST", "/lead-finder/reveal"):
+                (200, {"success": True, "data": {"jobId": "job-1"}}),
+            ("GET", "/lead-finder/reveal-jobs/job-1"):
+                (200, {"success": True, "data": {"status": "failed",
+                                                 "error": "nope"}}),
+        })
+        with patch.object(main.httpx, "AsyncClient", EnrichSoClient), _es(), \
+             patch.object(main.asyncio, "sleep", AsyncMock()):
+            self.assertEqual(await main.enrichso_reveal_ids(["lead-1"]), {})
+
+    async def test_no_ids_spends_nothing(self):
+        EnrichSoClient.reset({})
+        with patch.object(main.httpx, "AsyncClient", EnrichSoClient), _es():
+            self.assertEqual(await main.enrichso_reveal_ids([]), {})
+        self.assertEqual(EnrichSoClient.calls, [])
+
+
+class EnrichSoTransformTests(unittest.TestCase):
+    def test_the_documented_row_shape_maps_across(self):
+        lead = main.transform_enrichso_lead(_es_row())
+
+        self.assertEqual(lead["contact_name"], "Ada Lovelace")
+        self.assertEqual(lead["job_title"], "Founder")
+        self.assertEqual(lead["company_name"], "Acme")
+        self.assertEqual(lead["company_domain"], "acme.com")
+        self.assertEqual(lead["location"], "Austin, Texas, United States")
+        self.assertEqual(lead["provider"], "enrichso")
+        self.assertEqual(lead["enrichso_id"], "lead-1")
+
+    def test_a_search_row_carries_no_contact_details(self):
+        lead = main.transform_enrichso_lead(_es_row())
+        self.assertIsNone(lead["business_email"])
+        self.assertIsNone(lead["phone"])
+
+    def test_the_row_can_be_measured_against_the_icp(self):
+        # ICP_CHECKABLE claims industry, company_size and location for this
+        # leg, so the row has to actually evidence all three.
+        lead = main.transform_enrichso_lead(_es_row())
+
+        self.assertEqual(lead["company_headcount"], 7)
+        self.assertIs(main.lead_satisfies(lead, "company_size", "1-10"), True)
+        self.assertIs(main.lead_satisfies(lead, "company_size", "51-200"), False)
+        self.assertIs(main.lead_satisfies(lead, "location", "US"), True)
+        self.assertIsNotNone(lead["industry"])
+
+    def test_a_row_is_identifiable_to_the_seen_ledger(self):
+        self.assertTrue(main._profile_lead_key(_es_row()))
+
+
+class EnrichSoVerifyTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        main._exhausted_until.clear()
+        main._exhausted_streak.clear()
+
+    async def run_verify(self, payload, status=200):
+        EnrichSoClient.reset({("POST", "/email-validation"): (status, payload)})
+        with patch.object(main.httpx, "AsyncClient", EnrichSoClient), _es():
+            return await main.enrichso_verify_email("ada@acme.com")
+
+    async def test_valid_is_sendable(self):
+        v = await self.run_verify({"success": True,
+                                   "data": {"result": "valid",
+                                            "confidence": "definitive"}})
+        self.assertEqual(v["status"], "deliverable")
+        self.assertIs(v["sendable"], True)
+
+    async def test_risky_is_a_real_answer_and_not_a_sendable_one(self):
+        # And a free one: their docs say a risky verdict is not charged for.
+        v = await self.run_verify({"success": True,
+                                   "data": {"result": "risky", "isCatchAll": True}})
+        self.assertEqual(v["status"], "risky")
+        self.assertIs(v["sendable"], False)
+        self.assertIs(v["catch_all"], True)
+
+    async def test_invalid_is_held(self):
+        v = await self.run_verify({"success": True, "data": {"result": "invalid"}})
+        self.assertIs(v["sendable"], False)
+
+    async def test_out_of_credits_says_so_rather_than_guessing(self):
+        v = await self.run_verify({"success": False}, status=402)
+        self.assertEqual(v["status"], "unknown")
+        self.assertIsNone(v["sendable"])
+        self.assertIn("credits", v["reason"])
+
+    async def test_it_joins_the_verification_waterfall(self):
+        import inspect
+        body = inspect.getsource(main.verify_email_address)
+        self.assertIn("enrichso_verify_email", body)
+
+
+class EnrichSoEmailFinderTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        main._exhausted_until.clear()
+        main._exhausted_streak.clear()
+
+    async def test_a_name_and_domain_find_an_address(self):
+        EnrichSoClient.reset({("POST", "/email-finder"):
+                              (200, {"success": True,
+                                     "data": {"found": True,
+                                              "email": "ada@acme.com",
+                                              "confidence": "high"}})})
+        with patch.object(main.httpx, "AsyncClient", EnrichSoClient), _es():
+            got = await main.enrichso_find_email("Ada", "Lovelace",
+                                                 "https://acme.com")
+
+        self.assertEqual(EnrichSoClient.calls[0][2]["domain"], "acme.com")
+        self.assertEqual(got["email"], "ada@acme.com")
+
+    async def test_a_miss_is_empty_and_costs_nothing(self):
+        EnrichSoClient.reset({("POST", "/email-finder"):
+                              (200, {"success": True,
+                                     "data": {"found": False, "email": None}})})
+        with patch.object(main.httpx, "AsyncClient", EnrichSoClient), _es():
+            self.assertEqual(
+                await main.enrichso_find_email("Ada", "Lovelace", "acme.com"), {})
+
+    async def test_an_incomplete_identity_is_never_sent(self):
+        EnrichSoClient.reset({})
+        with patch.object(main.httpx, "AsyncClient", EnrichSoClient), _es():
+            self.assertEqual(await main.enrichso_find_email("Ada", None, "acme.com"), {})
+        self.assertEqual(EnrichSoClient.calls, [])
+
+
+class EnrichSoChainTests(unittest.TestCase):
+    def test_it_leads_the_order(self):
+        self.assertEqual(main.PROVIDER_ORDER[0], "enrichso")
+
+    def test_no_key_removes_it_rather_than_breaking_the_chain(self):
+        with patch.object(main.settings, "bytemine_api_key", "b"), \
+             patch.object(main.settings, "enrichso_api_key", None), \
+             patch.object(main.settings, "search_provider", "bytemine"):
+            self.assertNotIn("enrichso", main.provider_chain())
+
+    def test_a_key_is_all_it_takes(self):
+        with patch.object(main.settings, "bytemine_api_key", "b"), \
+             patch.object(main.settings, "enrichso_api_key", "sk_live_x"), \
+             patch.object(main.settings, "search_provider", "bytemine"):
+            self.assertIn("enrichso", main.provider_chain())
+
+    def test_a_pasted_key_with_a_trailing_space_still_builds_a_header(self):
+        stripped = main.Settings(database_url="postgresql://x",
+                                 enrichso_api_key="sk_live_x ")
+        self.assertEqual(stripped.enrichso_api_key, "sk_live_x")
+
+    def test_its_rows_are_claimed_as_icp_checkable(self):
+        self.assertEqual(main.ICP_CHECKABLE["enrichso"],
+                         frozenset({"industry", "company_size",
+                                    "location", "company_location"}))
+
+
 class IcpEnforcementTests(unittest.TestCase):
     """Searching with what a provider can filter, checking the rest locally.
 
