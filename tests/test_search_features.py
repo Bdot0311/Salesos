@@ -7784,3 +7784,596 @@ class VerifyEndpointTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MonidResponse:
+    """A response whose body may not be JSON at all.
+
+    RoutedResponse always encodes its payload, which cannot express the case
+    monid_call is specifically written to survive: a proxy in front of the
+    gateway answering with an HTML error page.
+    """
+
+    def __init__(self, status_code, payload=None, text=None):
+        self.status_code = status_code
+        self._payload = payload
+        self.text = text if text is not None else json.dumps(payload)
+
+    def json(self):
+        if self._payload is None:
+            raise ValueError("not json")
+        return self._payload
+
+
+class MonidClient:
+    """Fake httpx client for the Monid gateway, answering per (method, path)."""
+
+    routes = {}
+    calls = []
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def request(self, method, url, headers=None, json=None, params=None):
+        path = url.replace(main.MONID_BASE, "")
+        self.__class__.calls.append(
+            {"method": method, "path": path, "body": json,
+             "headers": headers or {}})
+        key = (method, path)
+        answer = self.__class__.routes.get(key)
+        if answer is None:
+            return MonidResponse(404, {"error": {"code": "NOT_FOUND",
+                                                 "message": "no such endpoint"}})
+        if callable(answer):
+            seen = len([c for c in self.__class__.calls if c["path"] == path])
+            answer = answer(seen)
+        status, payload = answer
+        if isinstance(payload, MonidResponse):
+            return payload
+        return MonidResponse(status, payload)
+
+    @classmethod
+    def reset(cls, routes=None):
+        cls.routes = routes or {}
+        cls.calls = []
+
+
+def _monid(**env):
+    """Patch settings for a Monid test."""
+    env.setdefault("monid_endpoint_overrides", None)
+    return patch.multiple(main.settings, monid_api_key="monid_live_test", **env)
+
+
+def _run_ok(payload, status=200, cost=None):
+    """A COMPLETED run carrying a vendor answer."""
+    run = {"runId": "run_1", "status": "COMPLETED",
+           "providerResponse": {"httpStatus": status, "data": payload}}
+    if cost is not None:
+        run["cost"] = {"value": cost, "currency": "USD"}
+    return 200, run
+
+
+class MonidIsolation(unittest.IsolatedAsyncioTestCase):
+    """Clears both module-level latches the gateway keeps.
+
+    Two of them, for two different failures: the shared out-of-credit latch
+    (an empty wallet) and the unknown-tool latch (an id the live catalog does
+    not have). Both are deliberately process-wide so one answer stops costing
+    every later search a doomed round trip, and both therefore leak between
+    tests if they are not cleared here.
+    """
+
+    def setUp(self):
+        super().setUp()
+        main._exhausted_until.clear()
+        main._exhausted_streak.clear()
+        main._monid_unknown_tools.clear()
+        MonidClient.reset()
+
+
+class MonidToolTableTests(unittest.TestCase):
+    def test_every_registered_endpoint_is_catalog_spelled(self):
+        """No leading slash: the catalog keys its endpoints without one.
+
+        The compiled catalog spells ContactOut's GET /v1/email/verify as
+        `contactout#v1/email/verify` — the vendor wire path with the slash
+        stripped. Sending the slash would be a different string, and a string
+        the gateway may not resolve.
+        """
+        for name, (provider, endpoint) in main._MONID_TOOLS.items():
+            self.assertTrue(provider, name)
+            self.assertFalse(endpoint.startswith("/"),
+                             f"{name} endpoint should not lead with a slash")
+            self.assertTrue(endpoint, name)
+
+    def test_hunters_id_does_not_repeat_the_version_in_its_base_url(self):
+        # api.hunter.io/v2 already carries the version, so the wire path — and
+        # so the id — is the bare endpoint name. "v2/email-verifier" would be
+        # a 404 against the live catalog.
+        self.assertEqual(main._MONID_TOOLS["hunter_email_verifier"],
+                         ("hunterio", "email-verifier"))
+
+    def test_an_override_can_be_written_either_way(self):
+        with patch.multiple(
+                main.settings,
+                monid_api_key="k",
+                monid_endpoint_overrides=json.dumps({
+                    "hunter_email_verifier": "hunterio:v2/email-verifier",
+                    "apollo_people_match": ["apollo", "/people/match"],
+                })):
+            self.assertEqual(main.monid_tool("hunter_email_verifier"),
+                             ("hunterio", "v2/email-verifier"))
+            # A slash the operator pasted in is stripped, so a correction
+            # cannot reintroduce the very thing the test above guards against.
+            self.assertEqual(main.monid_tool("apollo_people_match"),
+                             ("apollo", "people/match"))
+
+    def test_a_malformed_override_is_ignored_rather_than_fatal(self):
+        """A typo in an env var must not take the process down.
+
+        It is read lazily, per call, rather than at import — so a bad value
+        degrades that one lookup to the built-in default instead of making the
+        app unbootable.
+        """
+        for bad in ("not json at all", json.dumps(["a", "list"]),
+                    json.dumps({"hunter_email_verifier": "no-colon"})):
+            with patch.multiple(main.settings, monid_api_key="k",
+                                monid_endpoint_overrides=bad):
+                self.assertEqual(main.monid_tool("hunter_email_verifier"),
+                                 ("hunterio", "email-verifier"))
+
+    def test_an_unregistered_name_resolves_to_nothing(self):
+        with patch.multiple(main.settings, monid_api_key="k",
+                            monid_endpoint_overrides=None):
+            self.assertIsNone(main.monid_tool("no_such_tool"))
+
+
+class MonidTransportTests(MonidIsolation):
+    async def test_the_key_travels_as_a_bearer_token(self):
+        MonidClient.reset({("GET", "/v1/auth/whoami"): (200, {"ok": True})})
+        with _monid(), patch("main.httpx.AsyncClient", MonidClient):
+            status, _ = await main.monid_call("GET", "/v1/auth/whoami")
+
+        self.assertEqual(status, 200)
+        headers = MonidClient.calls[0]["headers"]
+        self.assertEqual(headers["Authorization"], "Bearer monid_live_test")
+        # Named so a run can be traced back to this app rather than their CLI.
+        self.assertEqual(headers["X-Monid-Client"], "salesos")
+
+    async def test_an_html_error_page_is_reported_as_its_status(self):
+        """The status must survive a body that is not JSON.
+
+        Their own CLI carries a comment about this: parsing before reading the
+        status turned a plain 502 into a JSON syntax error and threw the status
+        away, so an upstream blip read as a broken client.
+        """
+        MonidClient.reset({
+            ("GET", "/v1/wallet/balance"):
+                (502, MonidResponse(502, None, text="<html>bad gateway</html>")),
+        })
+        with _monid(), patch("main.httpx.AsyncClient", MonidClient):
+            status, body = await main.monid_call("GET", "/v1/wallet/balance")
+
+        self.assertEqual(status, 502)
+        self.assertIsNone(body)
+
+    async def test_an_unreachable_gateway_is_a_zero_not_a_raise(self):
+        class Boom(MonidClient):
+            async def request(self, *args, **kwargs):
+                raise main.httpx.ConnectError("no route")
+
+        with _monid(), patch("main.httpx.AsyncClient", Boom):
+            status, body = await main.monid_call("GET", "/v1/auth/whoami")
+
+        self.assertEqual(status, 0)
+        self.assertIsNone(body)
+
+    async def test_an_empty_wallet_latches_for_every_routed_tool(self):
+        """402 is the wallet, not the endpoint.
+
+        Every tool here shares one balance, so one 402 has to stop the others
+        spending a round trip to be told the same thing — the ColdIQ lesson,
+        applied to a provider where several legs share the account.
+        """
+        MonidClient.reset({
+            ("POST", "/v1/run"):
+                (402, {"error": {"code": "INSUFFICIENT_BALANCE",
+                                 "message": "top up"}}),
+        })
+        with _monid(), patch("main.httpx.AsyncClient", MonidClient):
+            await main.monid_run("contactout_email_verify",
+                                 query={"email": "a@b.com"})
+            self.assertTrue(main.provider_out_of_credits("monid"))
+
+            before = len(MonidClient.calls)
+            status, _ = await main.monid_run("hunter_email_verifier",
+                                             query={"email": "a@b.com"})
+
+        self.assertEqual(status, 402)
+        self.assertEqual(len(MonidClient.calls), before,
+                         "a latched wallet must not cost another round trip")
+
+
+class MonidRunTests(MonidIsolation):
+    async def test_the_run_envelope_names_provider_endpoint_and_input(self):
+        MonidClient.reset({("POST", "/v1/run"): _run_ok({"data": {"ok": 1}})})
+        with _monid(), patch("main.httpx.AsyncClient", MonidClient):
+            await main.monid_run("hunter_email_verifier",
+                                 query={"email": "a@b.com"})
+
+        body = MonidClient.calls[0]["body"]
+        self.assertEqual(body["provider"], "hunterio")
+        self.assertEqual(body["endpoint"], "email-verifier")
+        # Query params belong under input.queryParams, not at the top level.
+        self.assertEqual(body["input"], {"queryParams": {"email": "a@b.com"}})
+
+    async def test_nothing_to_send_means_no_input_key_at_all(self):
+        MonidClient.reset({("POST", "/v1/run"): _run_ok({})})
+        with _monid(), patch("main.httpx.AsyncClient", MonidClient):
+            await main.monid_run("apollo_people_search")
+
+        self.assertNotIn("input", MonidClient.calls[0]["body"])
+
+    async def test_a_vendor_answer_is_returned_as_the_vendor_sent_it(self):
+        """The unwrap is the whole point of this layer.
+
+        A caller cannot tell a routed call from a direct one, which is what
+        lets ContactOut's filter builder and transform keep working untouched
+        when its transport moves behind the gateway.
+        """
+        MonidClient.reset({
+            ("POST", "/v1/run"): _run_ok({"profiles": [{"full_name": "A"}]}),
+        })
+        with _monid(), patch("main.httpx.AsyncClient", MonidClient):
+            status, data = await main.monid_run("contactout_people_search",
+                                                body={"page": 1})
+
+        self.assertEqual(status, 200)
+        self.assertEqual(data, {"profiles": [{"full_name": "A"}]})
+
+    async def test_a_vendor_error_status_is_passed_through(self):
+        MonidClient.reset({
+            ("POST", "/v1/run"):
+                (200, {"runId": "r", "status": "COMPLETED",
+                       "providerResponse": {"httpStatus": 404,
+                                            "error": {"message": "no match"}}}),
+        })
+        with _monid(), patch("main.httpx.AsyncClient", MonidClient):
+            status, _ = await main.monid_run("contactout_people_linkedin",
+                                             query={"profile": "x"})
+
+        # 404 from the vendor is "we have nothing for this person" and the
+        # ContactOut reveal already treats it that way. It must not be confused
+        # with a 404 from the gateway, which means the id is wrong.
+        self.assertEqual(status, 404)
+
+    async def test_a_run_still_in_flight_is_polled_until_it_settles(self):
+        def runs(_):
+            return (200, {"runId": "r1", "status": "COMPLETED",
+                          "providerResponse": {"httpStatus": 200,
+                                               "data": {"done": True}}})
+
+        MonidClient.reset({
+            ("POST", "/v1/run"): (200, {"runId": "r1", "status": "RUNNING"}),
+            ("GET", "/v1/runs/r1"): runs,
+        })
+        with _monid(), patch("main.httpx.AsyncClient", MonidClient), \
+                patch.object(main, "MONID_POLL_SECONDS", 0):
+            status, data = await main.monid_run("hunter_email_verifier",
+                                                query={"email": "a@b.com"})
+
+        self.assertEqual(status, 200)
+        self.assertEqual(data, {"done": True})
+        self.assertTrue(any(c["path"] == "/v1/runs/r1"
+                            for c in MonidClient.calls))
+
+    async def test_an_unknown_id_is_held_off_rather_than_retried(self):
+        """A 404 from the gateway means the id is wrong, which will stay wrong.
+
+        It is the failure mode this integration is most likely to hit: the tool
+        table was written without being able to reach the live catalog. Retrying
+        it every search would spend one round trip per search forever to learn
+        the same thing.
+        """
+        MonidClient.reset({
+            ("POST", "/v1/run"):
+                (404, {"error": {"code": "NOT_FOUND", "message": "unknown"}}),
+        })
+        with _monid(), patch("main.httpx.AsyncClient", MonidClient):
+            status, _ = await main.monid_run("hunter_email_verifier",
+                                             query={"email": "a@b.com"})
+            self.assertEqual(status, 404)
+            self.assertFalse(main.monid_tool_available("hunter_email_verifier"))
+
+            before = len(MonidClient.calls)
+            status, _ = await main.monid_run("hunter_email_verifier",
+                                             query={"email": "b@c.com"})
+
+        self.assertEqual(status, 404)
+        self.assertEqual(len(MonidClient.calls), before)
+        # Held off, not disabled: a catalog addition is picked up without a
+        # restart once the window lapses.
+        self.assertGreater(main.MONID_UNKNOWN_TOOL_SECONDS, 0)
+
+    async def test_one_unknown_id_does_not_hold_off_the_others(self):
+        MonidClient.reset({
+            ("POST", "/v1/run"): (404, {"error": {"code": "NOT_FOUND"}}),
+        })
+        with _monid(), patch("main.httpx.AsyncClient", MonidClient):
+            await main.monid_run("hunter_email_verifier",
+                                 query={"email": "a@b.com"})
+
+        self.assertFalse(main.monid_tool_available("hunter_email_verifier"))
+        self.assertTrue(main.monid_tool_available("contactout_people_search"))
+
+    async def test_an_unconfigured_gateway_never_calls_out(self):
+        with patch.multiple(main.settings, monid_api_key=None), \
+                patch("main.httpx.AsyncClient", MonidClient):
+            status, _ = await main.monid_run("hunter_email_verifier",
+                                             query={"email": "a@b.com"})
+
+        self.assertEqual(status, 0)
+        self.assertEqual(MonidClient.calls, [])
+
+
+class MonidVendorAnswerTests(unittest.TestCase):
+    """A run that never reached the vendor still has to answer as a status."""
+
+    def test_a_blocked_run_reads_as_payment_required(self):
+        # BLOCKED is a spend control refusing — the same thing the wallet says,
+        # so it maps onto the status the latch already understands.
+        self.assertEqual(
+            main.monid_vendor_answer({"status": "BLOCKED"})[0], 402)
+
+    def test_a_failed_or_timed_out_run_reads_as_an_upstream_failure(self):
+        for state in ("FAILED", "TIMED_OUT", "STOPPED"):
+            self.assertEqual(
+                main.monid_vendor_answer({"status": state})[0], 502, state)
+
+    def test_run_detail_output_is_accepted_when_there_is_no_raw_envelope(self):
+        status, data = main.monid_vendor_answer(
+            {"status": "COMPLETED", "output": {"data": {"x": 1}}})
+
+        self.assertEqual(status, 200)
+        self.assertEqual(data, {"data": {"x": 1}})
+
+    def test_nonsense_is_a_zero_rather_than_a_crash(self):
+        self.assertEqual(main.monid_vendor_answer(None), (0, None))
+        self.assertEqual(main.monid_vendor_answer({})[0], 0)
+
+
+class ContactOutViaMonidTests(MonidIsolation):
+    async def test_a_working_direct_key_is_preferred_over_the_router(self):
+        """One hop and no router margin beats two hops and a margin."""
+        with patch.multiple(main.settings, contactout_api_key="co_direct",
+                            monid_api_key="monid_live_test"):
+            self.assertFalse(main.contactout_routed_via_monid())
+
+    async def test_routing_turns_on_when_the_direct_key_is_gone(self):
+        with patch.multiple(main.settings, contactout_api_key=None,
+                            monid_api_key="monid_live_test"):
+            self.assertTrue(main.contactout_routed_via_monid())
+
+    async def test_with_neither_credential_nothing_is_routed(self):
+        with patch.multiple(main.settings, contactout_api_key=None,
+                            monid_api_key=None):
+            self.assertFalse(main.contactout_routed_via_monid())
+
+    async def test_each_called_path_has_a_registered_equivalent(self):
+        """Every ContactOut path this file calls must be routable.
+
+        Routing a provider is only safe if the whole provider routes. A path
+        with no entry would fail just that one call — a reveal that silently
+        returns nothing while search still works, which is the hardest kind of
+        gap to notice.
+        """
+        for path in ("/v1/people/search", "/v1/people/linkedin",
+                     "/v1/people/enrich", "/v1/email/verify"):
+            self.assertIn(path, main._CO_MONID_TOOLS, path)
+            self.assertIsNotNone(main.monid_tool(main._CO_MONID_TOOLS[path]))
+
+    async def test_a_search_body_reaches_the_vendor_unchanged(self):
+        MonidClient.reset({
+            ("POST", "/v1/run"): _run_ok({"profiles": {}, "metadata": {}}),
+        })
+        with patch.multiple(main.settings, contactout_api_key=None,
+                            monid_api_key="monid_live_test",
+                            monid_endpoint_overrides=None), \
+                patch("main.httpx.AsyncClient", MonidClient):
+            await main.contactout_call("POST", "/v1/people/search",
+                                       body={"job_title": ["cto"],
+                                             "page": 1})
+
+        sent = MonidClient.calls[0]["body"]
+        self.assertEqual(sent["provider"], "contactout")
+        self.assertEqual(sent["endpoint"], "v1/people/search/work-email")
+        self.assertEqual(sent["input"]["body"],
+                         {"job_title": ["cto"], "page": 1})
+
+    async def test_the_work_email_selector_is_not_forwarded(self):
+        """email_type picks between two wire behaviours; the id already did.
+
+        Their catalog splits that choice into separate endpoint ids, and the
+        input schemas are strict — an unexpected parameter can fail the whole
+        run. Losing a paid reveal to a parameter that changes nothing is
+        exactly the silent zero this file keeps having to chase.
+        """
+        MonidClient.reset({("POST", "/v1/run"): _run_ok({"profile": {}})})
+        with patch.multiple(main.settings, contactout_api_key=None,
+                            monid_api_key="monid_live_test",
+                            monid_endpoint_overrides=None), \
+                patch("main.httpx.AsyncClient", MonidClient):
+            await main.contactout_reveal("https://linkedin.com/in/x",
+                                         want_phone=True)
+
+        query = MonidClient.calls[0]["body"]["input"]["queryParams"]
+        self.assertNotIn("email_type", query)
+        # Everything else survives: the profile asked about, and the phone opt-in.
+        self.assertEqual(query["profile"], "https://linkedin.com/in/x")
+        self.assertEqual(query["include_phone"], "true")
+
+    async def test_a_path_with_no_equivalent_answers_zero(self):
+        with patch.multiple(main.settings, contactout_api_key=None,
+                            monid_api_key="monid_live_test",
+                            monid_endpoint_overrides=None), \
+                patch("main.httpx.AsyncClient", MonidClient):
+            status, body = await main.contactout_call("GET", "/v1/unmapped")
+
+        self.assertEqual(status, 0)
+        self.assertIsNone(body)
+        self.assertEqual(MonidClient.calls, [])
+
+    async def test_a_routed_reveal_still_returns_our_reveal_shape(self):
+        """The transform is untouched by the transport move."""
+        MonidClient.reset({
+            ("POST", "/v1/run"): _run_ok({
+                "profile": {"work_email": ["a@b.com"],
+                            "personal_email": [],
+                            "phone": ["+1555"]},
+            }),
+        })
+        with patch.multiple(main.settings, contactout_api_key=None,
+                            monid_api_key="monid_live_test",
+                            monid_endpoint_overrides=None), \
+                patch("main.httpx.AsyncClient", MonidClient):
+            revealed = await main.contactout_reveal("https://linkedin.com/in/x")
+
+        # _contactout_contact's shape, reached through the gateway rather than
+        # directly: the array-valued snake_case spelling still unwraps.
+        self.assertEqual(revealed.get("email"), "a@b.com")
+        self.assertEqual(revealed.get("phone"), "+1555")
+
+
+class MonidProviderConfiguredTests(unittest.TestCase):
+    def test_contactout_stays_in_the_chain_on_the_gateway_alone(self):
+        """The reason this change exists: the direct trial key expired.
+
+        A leg that drops out of the chain the moment a key lapses is how a
+        provider silently stops contributing.
+        """
+        with patch.multiple(main.settings, contactout_api_key=None,
+                            monid_api_key="monid_live_test"):
+            self.assertTrue(main.provider_configured("contactout"))
+
+    def test_contactout_leaves_the_chain_when_neither_credential_is_set(self):
+        with patch.multiple(main.settings, contactout_api_key=None,
+                            monid_api_key=None):
+            self.assertFalse(main.provider_configured("contactout"))
+
+    def test_hunter_is_configured_by_the_gateway_because_it_has_no_key(self):
+        with patch.multiple(main.settings, monid_api_key="monid_live_test"):
+            self.assertTrue(main.provider_configured("hunter"))
+        with patch.multiple(main.settings, monid_api_key=None):
+            self.assertFalse(main.provider_configured("hunter"))
+
+    def test_hunter_is_a_verifier_not_a_search_leg(self):
+        # It verifies addresses; it does not find people. Putting it in the
+        # search chain would mean walk_search dispatching a leg that has no
+        # branch, which returns nothing and reads as a dead provider.
+        self.assertNotIn("hunter", main.PROVIDER_ORDER)
+
+
+class HunterVerifyTests(MonidIsolation):
+    async def test_a_deliverable_address_is_sendable(self):
+        MonidClient.reset({
+            ("POST", "/v1/run"): _run_ok({
+                "data": {"status": "valid", "result": "deliverable",
+                         "score": 97, "accept_all": False,
+                         "disposable": False, "webmail": False},
+            }),
+        })
+        with _monid(), patch("main.httpx.AsyncClient", MonidClient):
+            verdict = await main.hunter_verify_email("john@example.com")
+
+        self.assertEqual(verdict["status"], "deliverable")
+        self.assertIs(verdict["sendable"], True)
+        self.assertEqual(verdict["checked_by"], "hunter")
+        self.assertEqual(verdict["score"], 97)
+
+    async def test_the_three_way_result_drives_the_verdict_not_status(self):
+        """`result` is the deliverability answer; `status` mixes in mailbox facts.
+
+        An address at a catch-all domain comes back status "accept_all" with
+        result "risky". Reading `status` would store "accept_all" as a verdict,
+        which is not one of the three this app stores.
+        """
+        cases = {"deliverable": True, "undeliverable": False, "risky": False}
+        for result, sendable in cases.items():
+            MonidClient.reset({
+                ("POST", "/v1/run"): _run_ok({
+                    "data": {"status": "accept_all", "result": result,
+                             "accept_all": True},
+                }),
+            })
+            with _monid(), patch("main.httpx.AsyncClient", MonidClient):
+                verdict = await main.hunter_verify_email("a@b.com")
+
+            self.assertIs(verdict["sendable"], sendable, result)
+            self.assertIn(verdict["status"],
+                          ("deliverable", "undeliverable", "risky"))
+            self.assertIs(verdict["catch_all"], True, result)
+
+    async def test_an_unknown_result_is_never_reported_as_sendable(self):
+        MonidClient.reset({
+            ("POST", "/v1/run"): _run_ok({"data": {"result": "something new"}}),
+        })
+        with _monid(), patch("main.httpx.AsyncClient", MonidClient):
+            verdict = await main.hunter_verify_email("a@b.com")
+
+        self.assertEqual(verdict["status"], "unknown")
+        self.assertIsNone(verdict["sendable"])
+
+    async def test_an_unavailable_tool_says_so_rather_than_guessing(self):
+        MonidClient.reset({
+            ("POST", "/v1/run"): (404, {"error": {"code": "NOT_FOUND"}}),
+        })
+        with _monid(), patch("main.httpx.AsyncClient", MonidClient):
+            verdict = await main.hunter_verify_email("a@b.com")
+
+        self.assertIsNone(verdict["sendable"])
+        self.assertEqual(verdict["reason"], "hunter unavailable through monid")
+
+    async def test_an_empty_wallet_is_reported_as_such(self):
+        MonidClient.reset({
+            ("POST", "/v1/run"):
+                (402, {"error": {"code": "INSUFFICIENT_BALANCE"}}),
+        })
+        with _monid(), patch("main.httpx.AsyncClient", MonidClient):
+            verdict = await main.hunter_verify_email("a@b.com")
+
+        self.assertEqual(verdict["reason"], "monid wallet empty")
+
+
+class HunterInVerifyWaterfallTests(unittest.TestCase):
+    def test_hunter_is_asked_and_is_asked_last(self):
+        """Source inspection, because the ordering is the behaviour.
+
+        Each checker is only reached when everything before it declined to
+        answer, so position decides how often the router margin is paid.
+        """
+        import inspect
+
+        body = inspect.getsource(main.verify_email_address)
+        for name in ("fiber", "contactout", "enrichso", "findymail", "hunter"):
+            self.assertIn(f'"{name}"', body, name)
+
+        order = [n for n in ("fiber", "contactout", "enrichso", "findymail",
+                             "hunter") if f'"{n}"' in body]
+        self.assertEqual(order[-1], "hunter",
+                         "hunter costs a router margin, so it goes last")
+
+    def test_every_checker_in_the_waterfall_has_a_configured_check(self):
+        # A checker whose provider_configured has no branch is skipped on every
+        # search, silently — the whole point of adding it would be lost.
+        for name in ("fiber", "contactout", "enrichso", "findymail", "hunter"):
+            with patch.multiple(
+                    main.settings, fiber_api_key="k", contactout_api_key="k",
+                    enrichso_api_key="k", findymail_api_key="k",
+                    monid_api_key="k"):
+                self.assertTrue(main.provider_configured(name), name)
