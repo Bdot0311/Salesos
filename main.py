@@ -10614,6 +10614,29 @@ async def probe_provider_filters(name: str, params: dict) -> dict:
             "returned": len(result.get("profiles") or [])}
 
 
+def _monid_said(payload) -> Optional[str]:
+    """The gateway's own error wording, flattened to one line.
+
+    Their envelope is `{error: {code, message}}` on some paths and a bare
+    `{message: ...}` on others, so both are read. Anything else is truncated
+    rather than dropped: an unrecognised shape is still evidence, and this is
+    the one place that gets to see it.
+    """
+    if not isinstance(payload, dict):
+        return None if payload is None else str(payload)[:200]
+    error = payload.get("error")
+    if isinstance(error, dict):
+        said = f"{error.get('code') or ''} {error.get('message') or ''}".strip()
+        if said:
+            return said[:300]
+    if isinstance(error, str) and error:
+        return error[:300]
+    message = payload.get("message")
+    if message:
+        return str(message)[:300]
+    return json.dumps(payload)[:300]
+
+
 @app.get("/monid/catalog")
 async def monid_catalog(query: str = None, limit: int = 10):
     """What the Monid gateway actually holds, read off the gateway itself.
@@ -10661,9 +10684,16 @@ async def monid_catalog(query: str = None, limit: int = 10):
         if status == 200 and isinstance(found, dict):
             entry["price"] = found.get("price")
             entry["summary"] = found.get("summary") or found.get("description")
+        else:
+            # The gateway's own words. Without them a 404 is ambiguous in the
+            # one way that matters: an id this catalog does not carry, versus a
+            # verb this credential may not call. Those need opposite fixes, and
+            # guessing between them is what this endpoint exists to avoid.
+            entry["gateway_said"] = _monid_said(found)
         tools[name] = entry
 
     discovered = None
+    discover_error = None
     if query:
         status, ranked = await monid_call("POST", "/v1/discover",
                                           body={"query": query,
@@ -10678,6 +10708,16 @@ async def monid_catalog(query: str = None, limit: int = 10):
                 for r in (ranked.get("results") or [])
                 if isinstance(r, dict)
             ]
+            # An empty ranking is itself an answer, and a different one from a
+            # refused call: say which happened rather than returning null for
+            # both.
+            if not discovered:
+                discover_error = {"status": status,
+                                  "gateway_said": "ranked nothing for this query",
+                                  "keys": sorted(ranked.keys())}
+        else:
+            discover_error = {"status": status,
+                              "gateway_said": _monid_said(ranked)}
 
     unknown = sorted(n for n, t in tools.items() if not t.get("known"))
     return {
@@ -10686,6 +10726,7 @@ async def monid_catalog(query: str = None, limit: int = 10):
         "balance": balance if bal_status == 200 else {"status": bal_status},
         "tools": tools,
         "unknown_tools": unknown,
+        "discover_error": discover_error,
         "next_step": (
             "Every registered tool is live; nothing to correct."
             if not unknown else
@@ -10695,6 +10736,18 @@ async def monid_catalog(query: str = None, limit: int = 10):
             "catalog and show you that spelling."
         ),
         "contactout_routed_via_monid": contactout_routed_via_monid(),
+        # Routing is off whenever a direct key is present, and from the outside
+        # that looks identical to routing being broken. An expired key still
+        # reads as "set", so this says which of the two it is.
+        "contactout_routing": (
+            "routed through Monid"
+            if contactout_routed_via_monid() else
+            "NOT routed: CONTACTOUT_API_KEY is still set, and a direct key "
+            "always wins. Clear that variable in Railway to route ContactOut "
+            "through the gateway."
+            if settings.contactout_api_key else
+            "NOT routed: MONID_API_KEY is not set."
+        ),
     }
 
 
