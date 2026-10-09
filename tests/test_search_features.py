@@ -7851,9 +7851,19 @@ def _monid(**env):
 
 
 def _run_ok(payload, status=200, cost=None):
-    """A COMPLETED run carrying a vendor answer."""
+    """A COMPLETED run carrying a vendor answer, in the gateway's real shape.
+
+    Observed against api.monid.ai: the payload is in `output` and
+    providerResponse carries only {"httpStatus": n}. The helper used to put
+    the payload under providerResponse.data, which is not a shape the gateway
+    produces — so every test using it passed against a fiction while the real
+    thing decoded to no rows at all.
+    """
     run = {"runId": "run_1", "status": "COMPLETED",
-           "providerResponse": {"httpStatus": status, "data": payload}}
+           "output": payload,
+           "providerResponse": {"httpStatus": status},
+           "billing": {"reportedCost": {"currency": "USD", "value": 0,
+                                        "unit": "MICRO_DOLLAR"}}}
     if cost is not None:
         run["cost"] = {"value": cost, "currency": "USD"}
     return 200, run
@@ -7912,6 +7922,7 @@ class MonidToolTableTests(unittest.TestCase):
         self.assertEqual(main._MONID_TOOLS, {
             "apollo_people_search": ("apollo", "/mixed_people/api_search"),
             "apollo_people_match": ("apollo", "/people/match"),
+            "apollo_company_search": ("apollo", "/mixed_companies/search"),
             "contactout_people_search":
                 ("contactout", "/v1/people/search/work-email"),
             "contactout_people_linkedin":
@@ -8152,8 +8163,74 @@ class MonidRunTests(MonidIsolation):
         self.assertEqual(MonidClient.calls, [])
 
 
+# The exact envelope api.monid.ai returned for a successful synchronous run
+# of apollo /mixed_people/api_search, trimmed to the keys that matter. Pinned
+# verbatim because assuming its shape instead of observing it is what caused
+# the silent zero these tests now guard: providerResponse carries ONLY
+# httpStatus, and the vendor payload is in `output`.
+LIVE_SYNC_RUN = {
+    "runId": "01M4H7BX524QHF7Q61PH0Y5P9F",
+    "provider": "apollo",
+    "endpoint": "/mixed_people/api_search",
+    "status": "COMPLETED",
+    "output": {"total_entries": 224672,
+               "people": [{"id": "66f72dc96054dd0001ced904",
+                           "first_name": "Vineet",
+                           "title": "Chief Technology Officer (CTO)"}]},
+    "providerResponse": {"httpStatus": 200},
+    "price": {"type": "PER_CALL",
+              "amount": {"value": 0, "currency": "USD"}},
+    "billing": {"reportedCost": {"currency": "USD", "value": 0,
+                                 "unit": "MICRO_DOLLAR"}},
+    "resultCount": 2,
+    "billedUnits": 2,
+}
+
+
 class MonidVendorAnswerTests(unittest.TestCase):
     """A run that never reached the vendor still has to answer as a status."""
+
+    def test_the_live_sync_envelope_yields_the_vendor_payload(self):
+        """The regression that mattered: 200 with rows, not 200 with None.
+
+        providerResponse holds nothing but httpStatus, so reading `data` off
+        it returned None for every successful call — and a ContactOut search
+        answering 200 with no rows reads as "nobody matches that ICP" rather
+        than as a bug.
+        """
+        status, data = main.monid_vendor_answer(LIVE_SYNC_RUN)
+
+        self.assertEqual(status, 200)
+        self.assertIsNotNone(data, "the vendor payload must not be dropped")
+        self.assertEqual(len(data["people"]), 1)
+        self.assertEqual(data["total_entries"], 224672)
+
+    def test_a_read_back_run_answers_the_same_way(self):
+        # Run detail carries the same two keys, so both paths have to agree —
+        # a polled run must not decode differently from a synchronous one.
+        detail = {**LIVE_SYNC_RUN, "cost": {"value": 0, "currency": "USD"}}
+        self.assertEqual(main.monid_vendor_answer(detail),
+                         main.monid_vendor_answer(LIVE_SYNC_RUN))
+
+    def test_data_on_provider_response_is_still_honoured(self):
+        # Kept as a fallback in case an endpoint does carry it, so the fix for
+        # one shape does not break the other.
+        status, data = main.monid_vendor_answer(
+            {"status": "COMPLETED",
+             "providerResponse": {"httpStatus": 200, "data": {"x": 1}}})
+
+        self.assertEqual((status, data), (200, {"x": 1}))
+
+    def test_a_vendor_error_keeps_its_status_and_body(self):
+        status, data = main.monid_vendor_answer(
+            {"status": "COMPLETED",
+             "providerResponse": {"httpStatus": 404,
+                                  "error": {"message": "no match"}}})
+
+        # 404 is ContactOut's "nothing for this person"; the reveal treats it
+        # as an empty answer, so the status has to survive intact.
+        self.assertEqual(status, 404)
+        self.assertEqual(data, {"message": "no match"})
 
     def test_a_blocked_run_reads_as_payment_required(self):
         # BLOCKED is a spend control refusing — the same thing the wallet says,
@@ -8491,3 +8568,260 @@ class MonidSaidTests(unittest.TestCase):
 
     def test_nothing_at_all_stays_none(self):
         self.assertIsNone(main._monid_said(None))
+
+
+# The organization row api.monid.ai actually returned for
+# apollo /mixed_companies/search with q_organization_name=stripe, trimmed.
+# Pinned from the live response: this index carries name, domain and LinkedIn
+# but NO industry and NO headcount, which is why transform_apollo_company
+# leaves those null rather than inventing them.
+LIVE_APOLLO_ORG = {
+    "id": "5d0a0fbff6512580bf33a120",
+    "name": "Stripe",
+    "website_url": "http://www.stripe.com",
+    "primary_domain": "stripe.com",
+    "linkedin_url": "http://www.linkedin.com/company/stripe",
+    "founded_year": 2010,
+    "organization_revenue": 1000000000,
+    "logo_url": "https://example.test/logo.png",
+}
+
+
+class ApolloCompanyFilterTests(unittest.TestCase):
+    def test_a_name_is_sent_as_the_scalar_name_filter(self):
+        # q_organization_name is the one scalar filter on this endpoint; the
+        # rest are arrays. Sending a list here matches nothing.
+        f = main.build_apollo_company_filters({"company": "Stripe"})
+
+        self.assertEqual(f["q_organization_name"], "Stripe")
+        self.assertNotIn("q_organization_domains_list[]", f)
+
+    def test_a_domain_in_the_company_field_is_treated_as_a_domain(self):
+        """The frontend and the ICP parser both do this.
+
+        A bare domain is not a name Apollo will match, so searching for it as
+        one returns nobody — the same trap resolve_company_domain exists for
+        on the Wiza path.
+        """
+        f = main.build_apollo_company_filters({"company": "stripe.com"})
+
+        self.assertEqual(f["q_organization_domains_list[]"], ["stripe.com"])
+        self.assertNotIn("q_organization_name", f)
+
+    def test_keywords_are_expressible_here(self):
+        """The case the old path refused outright.
+
+        Matching a COMPANY on a keyword is the question being asked. Using a
+        keyword as a stand-in for an industry taxonomy on a PERSON would
+        answer a different question — see build_enrichso_filters.
+        """
+        f = main.build_apollo_company_filters(
+            {"keywords": "payments infrastructure, fintech"})
+
+        self.assertEqual(f["q_organization_keyword_tags[]"],
+                         ["payments infrastructure", "fintech"])
+
+    def test_an_open_ended_headcount_band_gets_a_concrete_ceiling(self):
+        # Their format is "lower,upper" and they reject a blank upper bound.
+        f = main.build_apollo_company_filters({"company": "x",
+                                               "company_size": "10001+"})
+
+        band = f["organization_num_employees_ranges[]"][0]
+        self.assertTrue(band.startswith("10001,"))
+        self.assertNotEqual(band, "10001,")
+
+    def test_industry_is_never_reinterpreted_as_a_keyword(self):
+        """Apollo's company search has no industry filter, only keyword tags.
+
+        Quietly sending the industry as a tag would answer a different
+        question and return the wrong companies confidently.
+        """
+        f = main.build_apollo_company_filters(
+            {"company": "x", "industry": "computer software"})
+
+        self.assertNotIn("q_organization_keyword_tags[]", f)
+        self.assertNotIn("industry", json.dumps(f))
+
+    def test_nothing_to_search_on_steps_aside(self):
+        with self.assertRaises(main.ProviderUnsupported):
+            main.build_apollo_company_filters({"seniority": "vp"})
+
+
+class ApolloCompanyTransformTests(unittest.TestCase):
+    def test_the_live_row_becomes_our_company_shape(self):
+        got = main.transform_apollo_company(LIVE_APOLLO_ORG)
+
+        self.assertEqual(got["company_name"], "Stripe")
+        self.assertEqual(got["company_domain"], "stripe.com")
+        self.assertEqual(got["apollo_organization_id"],
+                         "5d0a0fbff6512580bf33a120")
+        self.assertEqual(got["provider"], "apollo")
+
+    def test_absent_firmographics_stay_absent(self):
+        """This index has no industry or headcount, so neither is invented."""
+        got = main.transform_apollo_company(LIVE_APOLLO_ORG)
+
+        self.assertIsNone(got["industry"])
+        self.assertIsNone(got["location"])
+
+    def test_a_company_index_row_claims_no_contacts(self):
+        # Reporting a fabricated count would make these rows sort against the
+        # rolled-up Wiza ones as if they carried contacts they do not.
+        got = main.transform_apollo_company(LIVE_APOLLO_ORG)
+
+        self.assertEqual(got["matched_contacts"], 0)
+        self.assertEqual(got["sample_contacts"], [])
+
+    def test_a_domain_is_recovered_from_the_website_when_missing(self):
+        got = main.transform_apollo_company(
+            {"name": "X", "website_url": "https://www.example.com/about"})
+
+        self.assertEqual(got["company_domain"], "example.com")
+
+
+class ApolloCompanyRowTests(unittest.TestCase):
+    def test_organizations_are_preferred_over_accounts(self):
+        """A live response carried both keys.
+
+        Accounts are the companies already in the workspace's CRM, so merging
+        them would show one business twice in a suggestion list.
+        """
+        rows = main.apollo_company_rows(
+            {"organizations": [{"name": "A"}], "accounts": [{"name": "A"}]})
+
+        self.assertEqual(rows, [{"name": "A"}])
+
+    def test_accounts_answer_when_there_are_no_organizations(self):
+        rows = main.apollo_company_rows(
+            {"organizations": [], "accounts": [{"name": "B"}]})
+
+        self.assertEqual(rows, [{"name": "B"}])
+
+    def test_an_empty_or_odd_payload_is_no_rows_not_a_crash(self):
+        for payload in ({}, None, {"organizations": None},
+                        {"organizations": ["not a dict"]}):
+            self.assertEqual(main.apollo_company_rows(payload), [])
+
+
+class CompanySearchChainTests(unittest.IsolatedAsyncioTestCase):
+    """What /company/search does when a leg is dead.
+
+    The defect this covers was live in production: the endpoint had Wiza
+    behind it and nothing else, Wiza stopped returning profiles, and every
+    query answered `success: true, count: 0`. "stripe" by name and stripe.com
+    by domain both came back empty, which reads as "no such company" rather
+    than as an outage, so the frontend's suggestions silently went blank and
+    the cause was looked for in the wrong place.
+    """
+
+    def _patches(self, **keys):
+        async def no_cache(_hash, ttl_seconds=None):
+            return None
+
+        async def no_store(*args, **kwargs):
+            return None
+
+        settings = {"crustdata_api_key": None, "wiza_api_key": None,
+                    "monid_api_key": None, "bytemine_api_key": "b",
+                    "search_provider": "bytemine", "contactout_api_key": None}
+        settings.update(keys)
+        return [patch.multiple(main.settings, **settings),
+                patch.object(main, "cache_lookup", no_cache),
+                patch.object(main, "cache_store", no_store)]
+
+    async def _run(self, request, patches):
+        for p in patches:
+            p.start()
+        try:
+            return await main.company_search(request, enrich=False)
+        finally:
+            for p in patches:
+                p.stop()
+
+    async def test_no_configured_provider_is_an_error_not_an_empty_list(self):
+        """The silent zero, made loud.
+
+        200 with an empty list is indistinguishable from "nobody matches",
+        which is exactly how the outage stayed invisible.
+        """
+        with self.assertRaises(HTTPException) as caught:
+            await self._run(main.SearchRequest(company="stripe"),
+                            self._patches())
+
+        self.assertEqual(caught.exception.status_code, 503)
+        self.assertIn("No company-search provider", caught.exception.detail)
+
+    async def test_apollo_answers_when_wiza_returns_nothing(self):
+        """The actual production scenario: Wiza up but returning no profiles."""
+        async def empty_wiza(*a, **k):
+            return {"profiles": [], "total": 0}
+
+        async def apollo(*a, **k):
+            return [main.transform_apollo_company(LIVE_APOLLO_ORG)]
+
+        patches = self._patches(wiza_api_key="w", monid_api_key="m")
+        patches += [patch.object(main, "wiza_prospect_search", empty_wiza),
+                    patch.object(main, "monid_apollo_company_search", apollo)]
+        out = await self._run(main.SearchRequest(company="stripe"), patches)
+
+        self.assertEqual(out["count"], 1)
+        self.assertEqual(out["companies"][0]["company_name"], "Stripe")
+        # And the trace says which leg answered, so the next outage is one
+        # response away from being diagnosed rather than a day of guessing.
+        legs = {t["provider"]: t["status"] for t in out["providers_tried"]}
+        self.assertEqual(legs["wiza"], "ok")
+        self.assertEqual(legs["apollo"], "ok")
+
+    async def test_a_leg_that_cannot_express_a_filter_does_not_end_the_search(self):
+        """Keywords: refused by the Wiza path, expressible by Apollo.
+
+        The old code turned the first refusal into a 422 for the whole
+        request, so a filter one leg could not express looked unsupported
+        everywhere.
+        """
+        async def refusing_wiza(*a, **k):
+            raise main.ProviderUnsupported("keywords", "payments")
+
+        async def apollo(*a, **k):
+            return [main.transform_apollo_company(LIVE_APOLLO_ORG)]
+
+        patches = self._patches(wiza_api_key="w", monid_api_key="m")
+        patches += [patch.object(main, "wiza_prospect_search", refusing_wiza),
+                    patch.object(main, "monid_apollo_company_search", apollo)]
+        out = await self._run(main.SearchRequest(keywords="payments"), patches)
+
+        self.assertEqual(out["count"], 1)
+
+    async def test_a_refusal_names_the_legs_that_actually_declined(self):
+        """The message used to name whichever provider led PEOPLE search.
+
+        It said "bytemine cannot search companies by keywords" while the code
+        was calling Wiza, which sent the investigation to the wrong provider
+        entirely.
+        """
+        async def refusing_wiza(*a, **k):
+            raise main.ProviderUnsupported("keywords", "payments")
+
+        patches = self._patches(wiza_api_key="w")
+        patches += [patch.object(main, "wiza_prospect_search", refusing_wiza)]
+        with self.assertRaises(HTTPException) as caught:
+            await self._run(main.SearchRequest(keywords="payments"), patches)
+
+        detail = caught.exception.detail
+        self.assertEqual(caught.exception.status_code, 422)
+        self.assertIn("keywords", detail)
+        self.assertIn("wiza", detail)
+        self.assertNotIn("bytemine", detail)
+
+    async def test_legs_that_ran_and_found_nothing_still_answer_empty(self):
+        """An honest zero stays a zero — the fix must not invent an error."""
+        async def empty_wiza(*a, **k):
+            return {"profiles": [], "total": 0}
+
+        patches = self._patches(wiza_api_key="w")
+        patches += [patch.object(main, "wiza_prospect_search", empty_wiza)]
+        out = await self._run(main.SearchRequest(company="nosuchco"), patches)
+
+        self.assertTrue(out["success"])
+        self.assertEqual(out["count"], 0)
+        self.assertEqual([t["status"] for t in out["providers_tried"]], ["ok"])
