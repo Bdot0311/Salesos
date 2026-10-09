@@ -7878,26 +7878,55 @@ class MonidIsolation(unittest.IsolatedAsyncioTestCase):
 
 
 class MonidToolTableTests(unittest.TestCase):
-    def test_every_registered_endpoint_is_catalog_spelled(self):
-        """No leading slash: the catalog keys its endpoints without one.
+    def test_every_registered_endpoint_keeps_its_leading_slash(self):
+        """The live gateway keys endpoints on the wire path, slash included.
 
-        The compiled catalog spells ContactOut's GET /v1/email/verify as
-        `contactout#v1/email/verify` — the vendor wire path with the slash
-        stripped. Sending the slash would be a different string, and a string
-        the gateway may not resolve.
+        This was established the hard way: the table first shipped with the
+        slash stripped, the way the compiled catalog in monid-ai/connectors
+        stores it, and every single id answered 404 against the live gateway.
+        Its own discover results and the curl hints it returns both carry the
+        slash, and inspect confirmed each pair below with it.
         """
         for name, (provider, endpoint) in main._MONID_TOOLS.items():
             self.assertTrue(provider, name)
-            self.assertFalse(endpoint.startswith("/"),
-                             f"{name} endpoint should not lead with a slash")
-            self.assertTrue(endpoint, name)
+            self.assertTrue(endpoint.startswith("/"),
+                            f"{name} endpoint must lead with a slash")
+            self.assertTrue(endpoint.strip("/"), name)
 
     def test_hunters_id_does_not_repeat_the_version_in_its_base_url(self):
         # api.hunter.io/v2 already carries the version, so the wire path — and
         # so the id — is the bare endpoint name. "v2/email-verifier" would be
         # a 404 against the live catalog.
         self.assertEqual(main._MONID_TOOLS["hunter_email_verifier"],
-                         ("hunterio", "email-verifier"))
+                         ("hunterio", "/email-verifier"))
+
+    def test_the_table_matches_what_inspect_confirmed_live(self):
+        """The exact pairs /v1/inspect answered 200 for, pinned.
+
+        These were not derived from documentation — the published connector
+        repo disagrees with the live catalog on the leading slash, and its
+        lock file does not list Hunter at all. Each pair here was confirmed
+        against the running gateway, so a future edit that "tidies" a
+        spelling has to fail a test rather than a production search.
+        """
+        self.assertEqual(main._MONID_TOOLS, {
+            "apollo_people_search": ("apollo", "/mixed_people/api_search"),
+            "apollo_people_match": ("apollo", "/people/match"),
+            "contactout_people_search":
+                ("contactout", "/v1/people/search/work-email"),
+            "contactout_people_linkedin":
+                ("contactout", "/v1/people/linkedin/work-email"),
+            "contactout_people_enrich":
+                ("contactout", "/v1/people/enrich/work-email"),
+            "contactout_email_verify": ("contactout", "/v1/email/verify"),
+            "hunter_email_verifier": ("hunterio", "/email-verifier"),
+        })
+
+    def test_apollos_job_postings_endpoint_is_not_registered(self):
+        # It is in the public connector repo but 404s on this gateway's live
+        # catalog. Registering a tool the gateway does not have would spend a
+        # round trip per search to be told so, then latch off.
+        self.assertNotIn("apollo_job_postings", main._MONID_TOOLS)
 
     def test_an_override_can_be_written_either_way(self):
         with patch.multiple(
@@ -7907,12 +7936,13 @@ class MonidToolTableTests(unittest.TestCase):
                     "hunter_email_verifier": "hunterio:v2/email-verifier",
                     "apollo_people_match": ["apollo", "/people/match"],
                 })):
+            # Normalised towards the slash, so a correction typed without one
+            # still resolves — an operator pasting a path out of a report
+            # should not have to know this detail to get a working value.
             self.assertEqual(main.monid_tool("hunter_email_verifier"),
-                             ("hunterio", "v2/email-verifier"))
-            # A slash the operator pasted in is stripped, so a correction
-            # cannot reintroduce the very thing the test above guards against.
+                             ("hunterio", "/v2/email-verifier"))
             self.assertEqual(main.monid_tool("apollo_people_match"),
-                             ("apollo", "people/match"))
+                             ("apollo", "/people/match"))
 
     def test_a_malformed_override_is_ignored_rather_than_fatal(self):
         """A typo in an env var must not take the process down.
@@ -7926,7 +7956,7 @@ class MonidToolTableTests(unittest.TestCase):
             with patch.multiple(main.settings, monid_api_key="k",
                                 monid_endpoint_overrides=bad):
                 self.assertEqual(main.monid_tool("hunter_email_verifier"),
-                                 ("hunterio", "email-verifier"))
+                                 ("hunterio", "/email-verifier"))
 
     def test_an_unregistered_name_resolves_to_nothing(self):
         with patch.multiple(main.settings, monid_api_key="k",
@@ -8009,7 +8039,7 @@ class MonidRunTests(MonidIsolation):
 
         body = MonidClient.calls[0]["body"]
         self.assertEqual(body["provider"], "hunterio")
-        self.assertEqual(body["endpoint"], "email-verifier")
+        self.assertEqual(body["endpoint"], "/email-verifier")
         # Query params belong under input.queryParams, not at the top level.
         self.assertEqual(body["input"], {"queryParams": {"email": "a@b.com"}})
 
@@ -8192,7 +8222,7 @@ class ContactOutViaMonidTests(MonidIsolation):
 
         sent = MonidClient.calls[0]["body"]
         self.assertEqual(sent["provider"], "contactout")
-        self.assertEqual(sent["endpoint"], "v1/people/search/work-email")
+        self.assertEqual(sent["endpoint"], "/v1/people/search/work-email")
         self.assertEqual(sent["input"]["body"],
                          {"job_title": ["cto"], "page": 1})
 
@@ -8387,12 +8417,15 @@ class MonidEndpointVariantTests(unittest.TestCase):
     asks about each plausible spelling rather than making a second guess.
     """
 
-    def test_the_catalog_key_is_asked_about_first(self):
-        # It is what the compiled catalog actually contains, so it stays the
-        # first thing tried and the default the table ships with.
-        variants = main._monid_endpoint_variants("v1/email/verify")
-
-        self.assertEqual(variants[0], "v1/email/verify")
+    def test_the_live_key_is_asked_about_first(self):
+        # The slashed form is what the gateway actually answers to, so it is
+        # tried first whichever way the endpoint was written down.
+        self.assertEqual(
+            main._monid_endpoint_variants("/v1/email/verify")[0],
+            "/v1/email/verify")
+        self.assertEqual(
+            main._monid_endpoint_variants("v1/email/verify")[0],
+            "/v1/email/verify")
 
     def test_the_wire_path_with_its_slash_is_always_offered(self):
         """Monid's own published skills invoke `-e /api/v1/...`, slash included.
@@ -8403,6 +8436,10 @@ class MonidEndpointVariantTests(unittest.TestCase):
         for endpoint in ("v1/email/verify", "mixed_people/api_search",
                          "email-verifier"):
             self.assertIn("/" + endpoint,
+                          main._monid_endpoint_variants(endpoint), endpoint)
+            # and the stripped form stays as a fallback, since the compiled
+            # catalog still stores it that way.
+            self.assertIn(endpoint,
                           main._monid_endpoint_variants(endpoint), endpoint)
 
     def test_the_email_type_suffix_is_tried_stripped_as_well(self):
@@ -8415,8 +8452,8 @@ class MonidEndpointVariantTests(unittest.TestCase):
         self.assertIn("/v1/people/search", variants)
 
     def test_a_suffix_that_is_not_there_adds_nothing(self):
-        self.assertEqual(main._monid_endpoint_variants("people/match"),
-                         ["people/match", "/people/match"])
+        self.assertEqual(main._monid_endpoint_variants("/people/match"),
+                         ["/people/match", "people/match"])
 
     def test_no_spelling_is_offered_twice(self):
         for endpoint in ("v1/people/search/work-email", "/email-verifier",

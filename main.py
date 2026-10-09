@@ -3987,23 +3987,51 @@ _monid_unknown_tools: dict[str, float] = {}
 # The logical tools this file asks for, as (provider, endpoint) pairs in the
 # catalog's canonical spelling. Keyed by a name this codebase chooses, so a
 # vendor rename is one line here rather than a search-and-replace.
+# Every pair below was confirmed against the live gateway with /v1/inspect,
+# which is free, and each price is the one inspect reported.
+#
+# The spelling is the vendor's wire path INCLUDING its leading slash. That is
+# the gateway's own key — its discover results and its own curl hints both use
+# it — and it is the one thing the compiled catalog in monid-ai/connectors does
+# differently, since ids.lock.json stores the same paths stripped. Registering
+# the stripped form is why the first live run had all eight ids answering 404.
 _MONID_TOOLS = {
-    # Apollo: people search is free and returns previews plus a person id;
-    # people/match turns one into a full record and is the only billed half.
-    "apollo_people_search": ("apollo", "mixed_people/api_search"),
-    "apollo_people_match": ("apollo", "people/match"),
-    "apollo_job_postings": ("apollo", "organizations/job_postings"),
+    # Apollo: people search is free, and returns previews plus a person id
+    # rather than contact details. people/match turns one into a full record
+    # and is the only billed half.
+    "apollo_people_search": ("apollo", "/mixed_people/api_search"),      # $0
+    "apollo_people_match": ("apollo", "/people/match"),                  # $0.026
     # ContactOut, work-email variants. Their catalog splits each shared wire
     # path into a work-email and a personal-email id, because the two spend
-    # different credits; this app asks for work addresses.
-    "contactout_people_search": ("contactout", "v1/people/search/work-email"),
-    "contactout_people_linkedin": ("contactout", "v1/people/linkedin/work-email"),
-    "contactout_people_enrich": ("contactout", "v1/people/enrich/work-email"),
-    "contactout_email_verify": ("contactout", "v1/email/verify"),
-    # Hunter. Its base URL already carries /v2, so the wire path — and so the
-    # id — is the bare endpoint name.
-    "hunter_email_verifier": ("hunterio", "email-verifier"),
+    # different credits; this app asks for work addresses. The personal-email
+    # reveal is twice the price of the work one, which is the other reason not
+    # to let that choice travel in a parameter.
+    "contactout_people_search": ("contactout", "/v1/people/search/work-email"),    # $0.02
+    "contactout_people_linkedin": ("contactout", "/v1/people/linkedin/work-email"),  # $0.10
+    "contactout_people_enrich": ("contactout", "/v1/people/enrich/work-email"),    # $0.02
+    "contactout_email_verify": ("contactout", "/v1/email/verify"),       # $0.01/result
+    # Hunter's base URL already carries /v2, so its wire path is the bare
+    # endpoint name. "/v2/email-verifier" is a 404 on this catalog.
+    "hunter_email_verifier": ("hunterio", "/email-verifier"),            # $0.01225/result
 }
+
+# Apollo's /organizations/job_postings is deliberately absent: it is in the
+# public connector repo but not in this gateway's live catalog (404 on
+# inspect). The hiring-signal filters on Apollo's people search do not need it.
+
+
+def _monid_endpoint(value: str) -> str:
+    """The gateway's spelling of an endpoint id: the wire path, slash and all.
+
+    Normalising towards the slash rather than away from it is deliberate. It
+    is what the live catalog keys on, and it means an operator correcting a
+    tool through MONID_ENDPOINT_OVERRIDES gets a working value whether or not
+    they happen to include it.
+    """
+    bare = str(value or "").strip()
+    if not bare:
+        return ""
+    return bare if bare.startswith("/") else "/" + bare
 
 
 def monid_configured() -> bool:
@@ -4042,8 +4070,7 @@ def _monid_overrides() -> dict:
             print(f"MONID_ENDPOINT_OVERRIDES[{name}] is not "
                   f"'provider:endpoint', ignoring it")
             continue
-        fixed[str(name)] = (str(provider).strip(),
-                            str(endpoint).strip().lstrip("/"))
+        fixed[str(name)] = (str(provider).strip(), _monid_endpoint(endpoint))
     return fixed
 
 
@@ -4056,7 +4083,7 @@ def monid_tool(name: str) -> Optional[tuple]:
     if not pair:
         return None
     provider, endpoint = pair
-    return provider, endpoint.lstrip("/")
+    return provider, _monid_endpoint(endpoint)
 
 
 def monid_tool_available(name: str) -> bool:
@@ -10617,38 +10644,34 @@ async def probe_provider_filters(name: str, params: dict) -> dict:
 def _monid_endpoint_variants(endpoint: str) -> list:
     """Spellings of one endpoint id worth asking the gateway about.
 
-    The first live run found every registered id answering 404, so the
-    catalog's key is not the one the compiled lock file uses. Rather than
-    guess a second time, the diagnostic asks about each plausible spelling —
-    `inspect` is free, so a handful of probes costs nothing and ends the
-    guessing with the gateway's own answer.
+    Every id in _MONID_TOOLS is now confirmed live, so this is a safety net
+    rather than a search: it exists because the catalog is someone else's and
+    can be re-keyed without warning, and because a correction typed into
+    MONID_ENDPOINT_OVERRIDES may arrive in whichever spelling its author had
+    to hand. `inspect` is free, so probing a few forms costs nothing and
+    answers with the gateway's own word instead of a guess.
 
-    The spellings, and why each is plausible:
+    The spellings, in the order asked:
 
-      v1/people/search          the compiled catalog's own key
-      /v1/people/search         the vendor wire path as-is. Monid's published
-                                example skills invoke `-e /api/v1/...` with
-                                the leading slash, and those are working
-                                examples, which makes this the likeliest fix.
-      …without /work-email      the lock file splits one shared wire path into
-                                work-email and personal-email ids. That split
-                                may be internal to the lock rather than a real
-                                catalog key.
+      /v1/people/search/work-email   the live key: the wire path with its slash
+      v1/people/search/work-email    the compiled lock file's stripped form
+      /v1/people/search              without the email-type suffix, in case
+      v1/people/search               that split stops being a catalog key
     """
     found: list = []
 
     def add(value: str) -> None:
-        bare = value.lstrip("/")
-        if not bare:
+        slashed = _monid_endpoint(value)
+        if not slashed or slashed == "/":
             return
-        for form in (bare, "/" + bare):
+        for form in (slashed, slashed.lstrip("/")):
             if form not in found:
                 found.append(form)
 
     add(endpoint)
     for suffix in ("/work-email", "/personal-email"):
-        if endpoint.endswith(suffix):
-            add(endpoint[: -len(suffix)])
+        if _monid_endpoint(endpoint).endswith(suffix):
+            add(_monid_endpoint(endpoint)[: -len(suffix)])
     return found
 
 
