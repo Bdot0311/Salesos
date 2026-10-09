@@ -7851,9 +7851,19 @@ def _monid(**env):
 
 
 def _run_ok(payload, status=200, cost=None):
-    """A COMPLETED run carrying a vendor answer."""
+    """A COMPLETED run carrying a vendor answer, in the gateway's real shape.
+
+    Observed against api.monid.ai: the payload is in `output` and
+    providerResponse carries only {"httpStatus": n}. The helper used to put
+    the payload under providerResponse.data, which is not a shape the gateway
+    produces — so every test using it passed against a fiction while the real
+    thing decoded to no rows at all.
+    """
     run = {"runId": "run_1", "status": "COMPLETED",
-           "providerResponse": {"httpStatus": status, "data": payload}}
+           "output": payload,
+           "providerResponse": {"httpStatus": status},
+           "billing": {"reportedCost": {"currency": "USD", "value": 0,
+                                        "unit": "MICRO_DOLLAR"}}}
     if cost is not None:
         run["cost"] = {"value": cost, "currency": "USD"}
     return 200, run
@@ -8152,8 +8162,74 @@ class MonidRunTests(MonidIsolation):
         self.assertEqual(MonidClient.calls, [])
 
 
+# The exact envelope api.monid.ai returned for a successful synchronous run
+# of apollo /mixed_people/api_search, trimmed to the keys that matter. Pinned
+# verbatim because assuming its shape instead of observing it is what caused
+# the silent zero these tests now guard: providerResponse carries ONLY
+# httpStatus, and the vendor payload is in `output`.
+LIVE_SYNC_RUN = {
+    "runId": "01M4H7BX524QHF7Q61PH0Y5P9F",
+    "provider": "apollo",
+    "endpoint": "/mixed_people/api_search",
+    "status": "COMPLETED",
+    "output": {"total_entries": 224672,
+               "people": [{"id": "66f72dc96054dd0001ced904",
+                           "first_name": "Vineet",
+                           "title": "Chief Technology Officer (CTO)"}]},
+    "providerResponse": {"httpStatus": 200},
+    "price": {"type": "PER_CALL",
+              "amount": {"value": 0, "currency": "USD"}},
+    "billing": {"reportedCost": {"currency": "USD", "value": 0,
+                                 "unit": "MICRO_DOLLAR"}},
+    "resultCount": 2,
+    "billedUnits": 2,
+}
+
+
 class MonidVendorAnswerTests(unittest.TestCase):
     """A run that never reached the vendor still has to answer as a status."""
+
+    def test_the_live_sync_envelope_yields_the_vendor_payload(self):
+        """The regression that mattered: 200 with rows, not 200 with None.
+
+        providerResponse holds nothing but httpStatus, so reading `data` off
+        it returned None for every successful call — and a ContactOut search
+        answering 200 with no rows reads as "nobody matches that ICP" rather
+        than as a bug.
+        """
+        status, data = main.monid_vendor_answer(LIVE_SYNC_RUN)
+
+        self.assertEqual(status, 200)
+        self.assertIsNotNone(data, "the vendor payload must not be dropped")
+        self.assertEqual(len(data["people"]), 1)
+        self.assertEqual(data["total_entries"], 224672)
+
+    def test_a_read_back_run_answers_the_same_way(self):
+        # Run detail carries the same two keys, so both paths have to agree —
+        # a polled run must not decode differently from a synchronous one.
+        detail = {**LIVE_SYNC_RUN, "cost": {"value": 0, "currency": "USD"}}
+        self.assertEqual(main.monid_vendor_answer(detail),
+                         main.monid_vendor_answer(LIVE_SYNC_RUN))
+
+    def test_data_on_provider_response_is_still_honoured(self):
+        # Kept as a fallback in case an endpoint does carry it, so the fix for
+        # one shape does not break the other.
+        status, data = main.monid_vendor_answer(
+            {"status": "COMPLETED",
+             "providerResponse": {"httpStatus": 200, "data": {"x": 1}}})
+
+        self.assertEqual((status, data), (200, {"x": 1}))
+
+    def test_a_vendor_error_keeps_its_status_and_body(self):
+        status, data = main.monid_vendor_answer(
+            {"status": "COMPLETED",
+             "providerResponse": {"httpStatus": 404,
+                                  "error": {"message": "no match"}}})
+
+        # 404 is ContactOut's "nothing for this person"; the reveal treats it
+        # as an empty answer, so the status has to survive intact.
+        self.assertEqual(status, 404)
+        self.assertEqual(data, {"message": "no match"})
 
     def test_a_blocked_run_reads_as_payment_required(self):
         # BLOCKED is a spend control refusing — the same thing the wallet says,

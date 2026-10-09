@@ -4174,15 +4174,35 @@ def monid_vendor_answer(run: dict) -> tuple:
         return 0, None
 
     answer = run.get("providerResponse")
-    if isinstance(answer, dict) and answer.get("httpStatus"):
-        status = int(answer.get("httpStatus") or 0)
-        return status, answer.get("data") if status < 400 else answer.get("error")
+    answer = answer if isinstance(answer, dict) else {}
+    status = int(answer.get("httpStatus") or 0)
 
-    # Run detail carries the mapped output instead of the raw envelope.
-    output = run.get("output")
-    if isinstance(output, dict):
-        return 200, output
+    # `output` is where the vendor payload actually lives — on the synchronous
+    # run and on a run read back by id alike — while providerResponse carries
+    # nothing but {"httpStatus": n}.
+    #
+    # This cost a silent zero. An earlier version read `data` off
+    # providerResponse and matched on it first, so every successful routed
+    # call answered (200, None): a ContactOut search returned HTTP 200 with no
+    # rows, which reads from the outside as "ContactOut has nobody like that"
+    # rather than as a bug. `data` is still read as a fallback in case some
+    # endpoint does carry it.
+    payload = run.get("output")
+    if payload is None:
+        payload = answer.get("data")
 
+    if status >= 400:
+        # A vendor error: 404 is ContactOut's "nothing for this person", which
+        # the reveal already treats as an empty answer rather than a failure.
+        return status, answer.get("error") or payload
+    if status:
+        return status, payload
+    if payload is not None:
+        return 200, payload
+
+    # No vendor status at all means the run never reached the vendor, so its
+    # own failure is mapped onto one: BLOCKED is a control refusing to spend
+    # (what the wallet says), FAILED or TIMED_OUT are upstream failures.
     state = str(run.get("status") or "").upper()
     if state == "BLOCKED":
         return 402, None
@@ -4206,6 +4226,24 @@ def monid_log_cost(name: str, run: dict) -> None:
             return
         print(f"Monid {name} cost: {value:.4f} "
               f"{cost.get('currency') or 'USD'}")
+        return
+
+    # A synchronous run carries no `cost` — only a run read back by id does.
+    # What it does carry is billing.reportedCost, which is the same number in
+    # its own unit, so the line is printed with that unit rather than assumed
+    # to be dollars: reading MICRO_DOLLAR as USD would understate a charge by
+    # six orders of magnitude, and this log line is the only place the spend
+    # is visible at all.
+    reported = ((run or {}).get("billing") or {}).get("reportedCost")
+    if isinstance(reported, dict) and reported.get("value") is not None:
+        try:
+            value = float(reported.get("value") or 0)
+        except (TypeError, ValueError):
+            return
+        unit = reported.get("unit") or reported.get("currency") or "USD"
+        billed = (run or {}).get("billedUnits")
+        suffix = f" over {billed} billed unit(s)" if billed is not None else ""
+        print(f"Monid {name} cost: {value:g} {unit}{suffix}")
 
 
 async def monid_run(name: str, *, body: dict = None, query: dict = None,
