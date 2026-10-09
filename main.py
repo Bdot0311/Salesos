@@ -4001,6 +4001,10 @@ _MONID_TOOLS = {
     # and is the only billed half.
     "apollo_people_search": ("apollo", "/mixed_people/api_search"),      # $0
     "apollo_people_match": ("apollo", "/people/match"),                  # $0.026
+    # 30M companies, and the only company index in this file that can be
+    # searched by name, domain OR keyword. Billed per call rather than per
+    # row, so asking for ten suggestions costs the same as asking for one.
+    "apollo_company_search": ("apollo", "/mixed_companies/search"),      # $0.026/call
     # ContactOut, work-email variants. Their catalog splits each shared wire
     # path into a work-email and a personal-email id, because the two spend
     # different credits; this app asks for work addresses. The personal-email
@@ -4231,9 +4235,9 @@ def monid_log_cost(name: str, run: dict) -> None:
     # A synchronous run carries no `cost` — only a run read back by id does.
     # What it does carry is billing.reportedCost, which is the same number in
     # its own unit, so the line is printed with that unit rather than assumed
-    # to be dollars: reading MICRO_DOLLAR as USD would understate a charge by
-    # six orders of magnitude, and this log line is the only place the spend
-    # is visible at all.
+    # to be dollars. A real one read 26000 MICRO_DOLLAR for a $0.026 call, so
+    # printing that figure as USD would overstate the spend a millionfold, and
+    # this log line is the only place the spend is visible at all.
     reported = ((run or {}).get("billing") or {}).get("reportedCost")
     if isinstance(reported, dict) and reported.get("value") is not None:
         try:
@@ -4326,6 +4330,155 @@ async def monid_discover(query: str, limit: int = 10) -> tuple:
     """
     return await monid_call("POST", "/v1/discover",
                             body={"query": query, "limit": limit})
+
+
+
+# -----------------------------------------------------------------------------
+# Apollo company search, routed through Monid
+# -----------------------------------------------------------------------------
+#
+# /company/search had exactly one real provider behind it — Wiza, rolled up out
+# of a people search — and when that stopped returning profiles the endpoint
+# answered `success: true, count: 0` for every query in production. Searching
+# for "stripe" by name and by domain both came back empty, which reads as "no
+# such company" rather than as an outage.
+#
+# Apollo is the fix for three reasons:
+#
+#   1. It is a company index, not a people search rolled up. A company with no
+#      contacts in the index still exists, which the Wiza path cannot express.
+#   2. It can be searched by name, by domain OR by keyword. The keyword case is
+#      the one that was refused outright before.
+#   3. It bills $0.026 per CALL, not per row, so asking for ten suggestions
+#      costs the same as asking for one.
+#
+# Keyword search here is legitimate in a way it is not for people: matching a
+# COMPANY on "payments infrastructure" is the question being asked, where using
+# a keyword tag as a stand-in for an industry taxonomy on a person would answer
+# a different question. See build_enrichso_filters for that distinction.
+
+# Their documented ceiling: 100 per page, 500 pages.
+APOLLO_COMPANY_MAX_PAGE = 100
+
+
+def build_apollo_company_filters(p: dict) -> dict:
+    """Translate internal search params into /mixed_companies/search params.
+
+    The schema is the live one, read off the gateway's own `inspect` rather
+    than from the published connector repo.
+    """
+    f: dict = {}
+
+    company = p.get("company")
+    domain = p.get("company_domain")
+    # The frontend and the ICP parser both put a bare domain in `company`
+    # sometimes, and a domain is not a name Apollo will match.
+    if company and not domain and looks_like_domain(company):
+        domain, company = company, None
+
+    if domain:
+        host = domain_host(domain) or domain
+        f["q_organization_domains_list[]"] = [host]
+    if company:
+        # A single string, not a list — the one filter here that is scalar.
+        f["q_organization_name"] = str(company)
+
+    if p.get("keywords"):
+        tags = [t.strip() for t in str(p["keywords"]).split(",") if t.strip()]
+        if tags:
+            f["q_organization_keyword_tags[]"] = tags[:25]
+
+    location = p.get("company_location") or p.get("location")
+    if location:
+        f["organization_locations[]"] = [str(location)]
+
+    if p.get("company_size"):
+        lo, hi = _size_bounds(str(p["company_size"]))
+        if lo is not None:
+            # Their format is a "lower,upper" string per band. An open-ended
+            # top band is sent with their own documented ceiling rather than
+            # left blank, which they reject.
+            f["organization_num_employees_ranges[]"] = [
+                f"{lo},{hi if hi is not None else 1000000}"]
+
+    if p.get("revenue_min") is not None:
+        f["revenue_range[min]"] = int(p["revenue_min"])
+    if p.get("revenue_max") is not None:
+        f["revenue_range[max]"] = int(p["revenue_max"])
+
+    # Technologies, which no other company path here can express at all.
+    if p.get("technologies"):
+        uids = [str(t).strip().lower().replace(" ", "_").replace(".", "_")
+                for t in p["technologies"] if str(t or "").strip()]
+        if uids:
+            f["currently_using_any_of_technology_uids[]"] = uids[:25]
+
+    # Industry is deliberately absent: Apollo's company search has no industry
+    # filter, only keyword tags, and a keyword is not a taxonomy. An industry
+    # stated by the user is left to a leg that can actually express it rather
+    # than quietly reinterpreted here.
+    if not f:
+        raise ProviderUnsupported("company, company_domain or keywords",
+                                  "nothing Apollo can search companies by")
+    return f
+
+
+def transform_apollo_company(org: dict) -> dict:
+    """One Apollo organization in the shape /company/search returns.
+
+    `matched_contacts` is 0 and `sample_contacts` empty on purpose: this is a
+    company index, so there are no people attached to the row. Reporting a
+    fabricated count would make these rows sort against the Wiza ones as if
+    they carried contacts they do not.
+    """
+    domain = org.get("primary_domain") or domain_host(org.get("website_url") or "")
+    revenue = org.get("organization_revenue")
+    return {
+        "company_name": org.get("name"),
+        "company_domain": domain or None,
+        "industry": None,
+        "location": None,
+        "company_linkedin_url": org.get("linkedin_url"),
+        "company_website": org.get("website_url"),
+        "founded_year": org.get("founded_year"),
+        "annual_revenue": revenue,
+        "logo_url": org.get("logo_url"),
+        "apollo_organization_id": org.get("id"),
+        "provider": "apollo",
+        "matched_contacts": 0,
+        "sample_contacts": [],
+    }
+
+
+def apollo_company_rows(payload: dict) -> list:
+    """The organizations out of one company-search response.
+
+    Two keys carry them — `organizations` and `accounts` — and a live response
+    carried both. Accounts are the ones already in the workspace's CRM, so they
+    are read as a fallback rather than merged: the same company appearing twice
+    would read as two suggestions for one business.
+    """
+    data = payload or {}
+    for key in ("organizations", "accounts"):
+        rows = data.get(key)
+        if isinstance(rows, list) and rows:
+            return [r for r in rows if isinstance(r, dict)]
+    return []
+
+
+async def monid_apollo_company_search(params: dict, size: int) -> list:
+    """Search Apollo's company index through the gateway. Never raises."""
+    query = build_apollo_company_filters(params)
+    query["per_page"] = max(min(size or 10, APOLLO_COMPANY_MAX_PAGE), 1)
+    query["page"] = 1
+
+    status, data = await monid_run("apollo_company_search", query=query)
+    if status != 200 or not isinstance(data, dict):
+        print(f"Apollo company search unavailable: status {status}")
+        return []
+    rows = apollo_company_rows(data)
+    print(f"Apollo company search: {len(rows)} company row(s)")
+    return [transform_apollo_company(r) for r in rows]
 
 
 # =============================================================================
@@ -10364,28 +10517,117 @@ async def company_search(request: SearchRequest, enrich: bool = True, enrich_lim
     size = 30
     enrich_limit = max(min(enrich_limit, 30), 0)
 
+    # Why this is a chain now, where it used to be one provider:
+    #
+    # It had Wiza behind it and nothing else, and Wiza stopped returning
+    # profiles. Every company query in production then answered
+    # `success: true, count: 0` — "stripe" by name and stripe.com by domain
+    # both came back empty, which reads as "no such company" rather than as an
+    # outage, and the frontend's company suggestions simply went blank.
+    #
+    # The legs, cheapest first:
+    #
+    #   crustdata   firmographics inline on its people search; no extra call
+    #   wiza        credit-free preview, rolled up into companies
+    #   apollo      a real company index via the Monid gateway, $0.026 per
+    #               CALL — so the whole page of suggestions costs one charge
+    #
+    # A leg that cannot express a filter steps aside and the next one is tried,
+    # because another leg may express it: Apollo searches companies by keyword,
+    # which the Wiza path refuses outright. Only when no leg can express it is
+    # the request refused, and the refusal then names the legs that actually
+    # declined rather than whichever provider happens to lead people search.
+    trace: list = []
+
     async def fetcher():
-        if prov == "crustdata":
+        refused: dict = {}
+        ran = 0
+
+        async def leg(name: str, call):
+            """Run one leg. Returns its companies, or None when it stepped aside."""
+            nonlocal ran
+            try:
+                rows = await call()
+            except ProviderUnsupported as unsupported:
+                refused[name] = str(unsupported.field)
+                trace.append({"provider": name, "status": "cannot express",
+                              "field": str(unsupported.field)})
+                return None
+            except HTTPException as exc:
+                # One leg's outage is not the endpoint's answer.
+                print(f"Company search: {name} failed ({exc.detail})")
+                trace.append({"provider": name, "status": "error",
+                              "detail": str(exc.detail)[:200]})
+                return None
+            ran += 1
+            trace.append({"provider": name, "status": "ok",
+                          "companies": len(rows)})
+            return rows
+
+        companies = None
+
+        if provider_configured("crustdata"):
             # Crustdata returns firmographics inline, so companies are fully
             # populated from the people search — no per-company enrich needed.
-            data = await crustdata_person_search(params, size)
-            return aggregate_companies_crustdata(data.get("profiles") or [])
+            async def crust():
+                data = await crustdata_person_search(params, size)
+                return aggregate_companies_crustdata(data.get("profiles") or [])
+            companies = await leg("crustdata", crust)
+            if companies:
+                return companies
 
-        try:
-            data = await wiza_prospect_search(params, size)
-        except ProviderUnsupported as unsupported:
-            # No chain here either — a company list built without the filter
-            # would be a list of the wrong companies.
+        if provider_configured("wiza"):
+            async def wiza():
+                data = await wiza_prospect_search(params, size)
+                return aggregate_companies(data.get("profiles") or [])
+            rolled = await leg("wiza", wiza)
+            if rolled:
+                companies = rolled
+            elif rolled is not None and companies is None:
+                companies = rolled
+
+        if not companies and monid_configured():
+            found = await leg(
+                "apollo",
+                lambda: monid_apollo_company_search(params, enrich_limit or 10))
+            if found:
+                # A company index, so there is nothing to enrich per company
+                # and nothing to roll up — these rows are already companies.
+                return found
+            if found is not None and companies is None:
+                companies = found
+
+        if companies is None:
+            # Nothing ran: every leg either refused the filters or is not
+            # configured. Answering 200 with an empty list here is what made
+            # the outage invisible, so say which it was instead.
+            if refused:
+                raise HTTPException(
+                    status_code=422,
+                    detail=("No configured provider can search companies by "
+                            + ", ".join(sorted(set(refused.values())))
+                            + f" (tried: {', '.join(sorted(refused))}). "
+                            "Remove that filter or configure a provider that "
+                            "supports it."),
+                )
             raise HTTPException(
-                status_code=422,
-                detail=(f"{prov} cannot search companies by {unsupported.field}. "
-                        "Remove that filter or configure a provider that supports it."),
-            ) from unsupported
-        companies = aggregate_companies(data.get("profiles") or [])
+                status_code=503,
+                detail=("No company-search provider is available. Configure "
+                        "CRUSTDATA_API_KEY, WIZA_API_KEY or MONID_API_KEY."),
+            )
+
+        if not companies:
+            print(f"Company search: {ran} leg(s) ran and none had a match")
+            return companies
         if not enrich:
             return companies
 
         # Auto-enrich firmographics for the top companies (2 credits each).
+        # Gated on Wiza being configured: without the gate a dead Wiza meant
+        # one doomed round trip per company, every time, to populate nothing.
+        if not provider_configured("wiza"):
+            return companies
+
         for company in companies[:enrich_limit]:
             ident = {}
             if company.get("company_domain"):
@@ -10426,6 +10668,12 @@ async def company_search(request: SearchRequest, enrich: bool = True, enrich_lim
         "total": len(companies),
         "companies": companies,
         "data": companies,
+        # Which legs ran and what each said. An empty list is a legitimate
+        # answer — no company matched — and this is what tells it apart from
+        # a provider that was never callable, which is the confusion that let
+        # the Wiza outage look like "no such company" for as long as it did.
+        # Absent on a cache hit, because no leg ran to be traced.
+        "providers_tried": None if from_cache else trace,
     }
 
 
