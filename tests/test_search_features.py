@@ -8825,3 +8825,574 @@ class CompanySearchChainTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(out["success"])
         self.assertEqual(out["count"], 0)
         self.assertEqual([t["status"] for t in out["providers_tried"]], ["ok"])
+
+
+# One people.search row exactly as api.routergrowth.com returned it, for a
+# search of company_domains=["stripe.com"] at detail="full". Pinned verbatim
+# because the shape was measured, not read off a doc: current_title and
+# current_company are the fields that carry the role, and they are null unless
+# detail="full" is sent.
+LIVE_RG_PERSON = {
+    "name": "Prantik Mazumdar",
+    "first_name": "Prantik",
+    "last_name": "Mazumdar",
+    "current_title": "Managing Director",
+    "current_company": "Stripe",
+    "company_domain": "stripe.com",
+    "seniority": "",
+    "headline": "Managing Director at Stripe",
+    "linkedin_url": "https://www.linkedin.com/in/prantikmazumdar",
+    "location": "Singapore",
+    "email": "",
+    "email_status": "",
+}
+
+
+class RouterGrowthClient:
+    """Fake httpx client for the RouterGrowth gateway, per (method, path)."""
+
+    routes = {}
+    calls = []
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def request(self, method, url, headers=None, json=None, params=None):
+        path = url.replace(main.ROUTERGROWTH_BASE, "")
+        self.__class__.calls.append(
+            {"method": method, "path": path, "body": json,
+             "headers": headers or {}})
+        answer = self.__class__.routes.get((method, path))
+        if answer is None:
+            return RoutedResponse(
+                404, {"error": {"code": "capability_not_found",
+                                "message": "no such capability"}})
+        if callable(answer):
+            seen = len([c for c in self.__class__.calls if c["path"] == path])
+            answer = answer(seen)
+        status, payload = answer
+        return RoutedResponse(status, payload)
+
+    @classmethod
+    def reset(cls, routes=None):
+        cls.routes = routes or {}
+        cls.calls = []
+
+
+def _rg(**env):
+    """Patch settings for a RouterGrowth test."""
+    return patch.multiple(main.settings,
+                          routergrowth_api_key="rg_live_test", **env)
+
+
+def _rg_run(result, status="succeeded", charged="0.002", provider="icypeas",
+            attempts=None):
+    """A finished run in the gateway's real shape."""
+    return 200, {
+        "run_id": "run_test",
+        "status": status,
+        "kind": "capability",
+        "provider": provider,
+        "routing_reason": "lowest quoted price",
+        "billing": {"currency": "USD", "quoted": charged, "charged": charged},
+        "attempts": attempts or [{"provider": provider,
+                                  "outcome": "succeeded"}],
+        "result": result,
+    }
+
+
+class RouterGrowthIsolation(unittest.IsolatedAsyncioTestCase):
+    """Clears the shared out-of-credit latch between tests.
+
+    One wallet sits behind every RouterGrowth capability, so the latch is
+    process-wide on purpose: one empty-balance answer has to stop verification
+    and search both from spending a doomed round trip. Inside one test run that
+    also means a stubbed 402 leaks into the next test.
+    """
+
+    def setUp(self):
+        super().setUp()
+        main._exhausted_until.clear()
+        main._exhausted_streak.clear()
+        RouterGrowthClient.reset()
+
+
+class RouterGrowthPeopleInputTests(unittest.TestCase):
+    def test_detail_full_is_always_sent(self):
+        """Without it every row's role and employer come back null.
+
+        Measured: the same search at the default detail returned five rows with
+        current_title and current_company all null, which is a lead list that
+        cannot be filtered by title — the thing it exists for.
+        """
+        f = main.build_routergrowth_people_input({"job_title": "CTO"}, 10)
+
+        self.assertEqual(f["detail"], "full")
+
+    def test_a_small_page_still_fetches_the_floor(self):
+        """The route has no offset, so over-fetching is the only lever.
+
+        A repeat search returns the same top rows and the seen ledger empties
+        them; without a floor a caller asking for 3 would get 3 rows it has
+        already shown and nothing new, forever. The floor costs about a cent.
+        """
+        f = main.build_routergrowth_people_input({"job_title": "CTO"}, 3)
+
+        self.assertEqual(f["limit"], main.ROUTERGROWTH_MIN_FETCH)
+
+    def test_a_large_page_is_capped_at_their_ceiling(self):
+        f = main.build_routergrowth_people_input({"job_title": "CTO"}, 5000)
+
+        self.assertEqual(f["limit"], main.ROUTERGROWTH_MAX_PAGE)
+
+    def test_titles_and_seniority_are_never_sent_together(self):
+        """Their lead database refuses the combination outright.
+
+        A search that sends both falls through to a route costing 15x more, so
+        this is a cost control as much as a correctness one.
+        """
+        f = main.build_routergrowth_people_input(
+            {"job_title": "Account Executive", "seniority": "vp"}, 10)
+
+        self.assertIn("titles", f)
+        self.assertNotIn("seniority", f)
+
+    def test_seniority_alone_is_sent(self):
+        f = main.build_routergrowth_people_input({"seniority": "c_suite"}, 10)
+
+        self.assertEqual(f["seniority"], ["cxo"])
+        self.assertNotIn("titles", f)
+
+    def test_every_canonical_level_has_a_tier_here(self):
+        """No level this app can produce is refused for lack of a mapping.
+
+        _CANONICAL_SENIORITY folds every spelling onto eight levels and
+        _RG_SENIORITY carries all eight, so unlike most legs in this file this
+        one never sits out a search over seniority alone.
+        """
+        for level in set(main._CANONICAL_SENIORITY.values()):
+            self.assertIn(level, main._RG_SENIORITY, level)
+
+    def test_a_word_the_parser_did_not_recognise_is_refused(self):
+        # The refusal guards against unrecognised input rather than a gap in
+        # the map: an unknown enum value matches nobody on their side, which
+        # reads from the outside as "RouterGrowth has no such people".
+        with self.assertRaises(main.ProviderUnsupported):
+            main.build_routergrowth_people_input({"seniority": "wizard"}, 10)
+
+    def test_a_domain_in_the_company_field_is_treated_as_a_domain(self):
+        f = main.build_routergrowth_people_input({"company": "stripe.com"}, 10)
+
+        self.assertEqual(f["company_domains"], ["stripe.com"])
+        self.assertNotIn("companies", f)
+
+    def test_a_company_name_goes_to_companies(self):
+        f = main.build_routergrowth_people_input({"company": "Stripe"}, 10)
+
+        self.assertEqual(f["companies"], ["Stripe"])
+
+    def test_a_headcount_band_is_sent_as_one_contiguous_range(self):
+        # A range with a gap in it goes to a dearer route, so only ever one.
+        f = main.build_routergrowth_people_input(
+            {"job_title": "CTO", "company_size": "51-200"}, 10)
+
+        self.assertEqual(f["company_headcount"], ["51-200"])
+
+    def test_an_open_ended_band_keeps_its_open_end(self):
+        f = main.build_routergrowth_people_input(
+            {"job_title": "CTO", "company_size": "10001+"}, 10)
+
+        self.assertEqual(f["company_headcount"], ["10001+"])
+
+    def test_nothing_to_search_on_steps_aside(self):
+        with self.assertRaises(main.ProviderUnsupported):
+            main.build_routergrowth_people_input({"revenue_min": 100}, 10)
+
+
+class RouterGrowthDomainMatchTests(unittest.TestCase):
+    """Exact employer-domain matching, and why it is exact.
+
+    Their route also matches subdomains, and the subdomain rows measured here
+    were not employees of the company asked for: a search for stripe.com
+    returned rows on buy.stripe.com and donate.stripe.com, one of them carrying
+    current_company "Stacks Software", while every plain stripe.com row in the
+    same search was a real Stripe employee. Accepting subdomains admits exactly
+    the wrong rows into the filter a user is most precise about.
+    """
+
+    def test_the_requested_domain_matches(self):
+        self.assertTrue(main._rg_same_company_domain("stripe.com", "stripe.com"))
+
+    def test_a_subdomain_does_not_match(self):
+        for other in ("buy.stripe.com", "donate.stripe.com"):
+            self.assertFalse(
+                main._rg_same_company_domain("stripe.com", other), other)
+
+    def test_a_different_company_does_not_match(self):
+        self.assertFalse(
+            main._rg_same_company_domain("stripe.com", "stacks.software"))
+
+    def test_a_url_or_www_form_still_matches(self):
+        # domain_host normalises both sides, so a caller's https://www. form
+        # and a row's bare host are the same company.
+        self.assertTrue(
+            main._rg_same_company_domain("https://www.stripe.com/pricing",
+                                         "stripe.com"))
+
+    def test_a_missing_domain_on_either_side_is_not_a_match(self):
+        self.assertFalse(main._rg_same_company_domain("stripe.com", ""))
+        self.assertFalse(main._rg_same_company_domain("", "stripe.com"))
+
+
+class RouterGrowthTransformTests(unittest.TestCase):
+    def test_the_live_row_becomes_our_lead_shape(self):
+        got = main.transform_routergrowth_person(LIVE_RG_PERSON, {})
+
+        self.assertEqual(got["full_name"], "Prantik Mazumdar")
+        self.assertEqual(got["job_title"], "Managing Director")
+        self.assertEqual(got["company_name"], "Stripe")
+        self.assertEqual(got["company_domain"], "stripe.com")
+        self.assertEqual(got["location"], "Singapore")
+        self.assertEqual(got["provider"], "routergrowth")
+
+    def test_no_email_is_ever_read_off_a_search_row(self):
+        """This route is documented not to carry one, and measured not to.
+
+        An email that arrives without a deliverability verdict is what
+        verify_revealed_lead exists to prevent, so even a populated field here
+        is not promoted to business_email.
+        """
+        got = main.transform_routergrowth_person(
+            {**LIVE_RG_PERSON, "email": "someone@stripe.com",
+             "email_status": "valid"}, {})
+
+        self.assertIsNone(got["business_email"])
+
+    def test_a_name_is_split_when_the_parts_are_missing(self):
+        got = main.transform_routergrowth_person(
+            {"name": "Ada Lovelace King", "linkedin_url": "x"}, {})
+
+        self.assertEqual(got["first_name"], "Ada")
+        self.assertEqual(got["last_name"], "Lovelace King")
+
+    def test_the_headline_stands_in_for_a_missing_title(self):
+        got = main.transform_routergrowth_person(
+            {"name": "A", "headline": "Head of Growth at Acme"}, {})
+
+        self.assertEqual(got["job_title"], "Head of Growth at Acme")
+
+    def test_the_ledger_can_identify_the_raw_row(self):
+        """A provider whose rows the ledger cannot read has no ledger at all.
+
+        _profile_url already knows `linkedin_url`, so this is a guard against
+        the transform or the route changing the key.
+        """
+        self.assertEqual(main._profile_url(LIVE_RG_PERSON),
+                         "https://www.linkedin.com/in/prantikmazumdar")
+
+
+class RouterGrowthRunTests(RouterGrowthIsolation):
+    async def test_the_run_body_carries_capability_input_and_a_cost_cap(self):
+        RouterGrowthClient.reset({("POST", "/run"): _rg_run({"people": []})})
+        with _rg(), patch("main.httpx.AsyncClient", RouterGrowthClient):
+            await main.routergrowth_run("people.search", {"limit": 25},
+                                        max_cost="0.09")
+
+        body = RouterGrowthClient.calls[0]["body"]
+        self.assertEqual(body["capability"], "people.search")
+        self.assertEqual(body["input"], {"limit": 25})
+        # max_cost is enforced before the provider is called and excludes
+        # dearer offers, so it is a routing control, not a courtesy.
+        self.assertEqual(body["routing"]["max_cost"], "0.09")
+
+    async def test_every_spending_call_is_idempotent(self):
+        """A retry must replay the original run, not buy it twice."""
+        RouterGrowthClient.reset({("POST", "/run"): _rg_run({"people": []})})
+        with _rg(), patch("main.httpx.AsyncClient", RouterGrowthClient):
+            await main.routergrowth_run("contact.verify", {"email": "a@b.com"},
+                                        max_cost="0.02")
+
+        self.assertIn("Idempotency-Key", RouterGrowthClient.calls[0]["headers"])
+
+    async def test_the_same_question_reuses_its_idempotency_key(self):
+        RouterGrowthClient.reset({("POST", "/run"): _rg_run({"people": []})})
+        with _rg(), patch("main.httpx.AsyncClient", RouterGrowthClient):
+            await main.routergrowth_run("contact.verify", {"email": "a@b.com"},
+                                        max_cost="0.02")
+            await main.routergrowth_run("contact.verify", {"email": "a@b.com"},
+                                        max_cost="0.02")
+            await main.routergrowth_run("contact.verify", {"email": "c@d.com"},
+                                        max_cost="0.02")
+
+        keys = [c["headers"]["Idempotency-Key"]
+                for c in RouterGrowthClient.calls]
+        self.assertEqual(keys[0], keys[1])
+        self.assertNotEqual(keys[0], keys[2])
+
+    async def test_a_blocked_run_is_not_read_as_an_empty_answer(self):
+        """`blocked` is the spend guard refusing before any money moved.
+
+        Reading it as "nobody matched" would turn a budget cap into a silent
+        zero, which is the failure this file keeps having to chase.
+        """
+        RouterGrowthClient.reset({
+            ("POST", "/run"): _rg_run(None, status="blocked", charged=None),
+        })
+        with _rg(), patch("main.httpx.AsyncClient", RouterGrowthClient):
+            ok, result = await main.routergrowth_run(
+                "people.search", {"limit": 25}, max_cost="0.09")
+
+        self.assertFalse(ok)
+        self.assertIsNone(result)
+
+    async def test_an_unfinished_run_is_not_read_as_an_empty_answer(self):
+        RouterGrowthClient.reset({
+            ("POST", "/run"): _rg_run({"people": []}, status="queued"),
+        })
+        with _rg(), patch("main.httpx.AsyncClient", RouterGrowthClient):
+            ok, _ = await main.routergrowth_run("people.search", {"limit": 1},
+                                                max_cost="0.09")
+
+        self.assertFalse(ok)
+
+    async def test_a_202_is_polled_until_it_settles(self):
+        RouterGrowthClient.reset({
+            ("POST", "/run"): (202, {"run_id": "r1", "status": "running",
+                                     "billing": {}}),
+            ("GET", "/runs/r1"): _rg_run({"people": [LIVE_RG_PERSON]})[1:] and
+                                 _rg_run({"people": [LIVE_RG_PERSON]}),
+        })
+        with _rg(), patch("main.httpx.AsyncClient", RouterGrowthClient), \
+                patch.object(main, "ROUTERGROWTH_POLL_SECONDS", 0):
+            ok, result = await main.routergrowth_run(
+                "people.search", {"limit": 1}, max_cost="0.09")
+
+        self.assertTrue(ok)
+        self.assertEqual(len(result["people"]), 1)
+
+    async def test_an_empty_wallet_latches_for_every_capability(self):
+        """One wallet behind all of them, so one 402 has to stop the rest."""
+        RouterGrowthClient.reset({
+            ("POST", "/run"): (402, {"error": {"code": "insufficient_balance",
+                                               "message": "top up"}}),
+        })
+        with _rg(), patch("main.httpx.AsyncClient", RouterGrowthClient):
+            await main.routergrowth_run("contact.verify", {"email": "a@b.com"},
+                                        max_cost="0.02")
+            self.assertTrue(main.provider_out_of_credits("routergrowth"))
+
+            before = len(RouterGrowthClient.calls)
+            ok, _ = await main.routergrowth_run(
+                "people.search", {"limit": 25}, max_cost="0.09")
+
+        self.assertFalse(ok)
+        self.assertEqual(len(RouterGrowthClient.calls), before,
+                         "a latched wallet must not cost another round trip")
+
+    async def test_the_spend_guard_latches_the_same_way(self):
+        # budget_exceeded is the daily cap rather than an empty wallet, but it
+        # means the same thing to a caller: stop asking for now.
+        RouterGrowthClient.reset({
+            ("POST", "/run"): (402, {"error": {"code": "budget_exceeded",
+                                               "message": "daily cap"}}),
+        })
+        with _rg(), patch("main.httpx.AsyncClient", RouterGrowthClient):
+            await main.routergrowth_run("contact.verify", {"email": "a@b.com"},
+                                        max_cost="0.02")
+
+        self.assertTrue(main.provider_out_of_credits("routergrowth"))
+
+    async def test_an_unconfigured_router_never_calls_out(self):
+        with patch.multiple(main.settings, routergrowth_api_key=None), \
+                patch("main.httpx.AsyncClient", RouterGrowthClient):
+            ok, _ = await main.routergrowth_run("contact.verify", {"email": "a"},
+                                                max_cost="0.02")
+
+        self.assertFalse(ok)
+        self.assertEqual(RouterGrowthClient.calls, [])
+
+
+class RouterGrowthVerifyTests(RouterGrowthIsolation):
+    async def test_a_valid_address_is_deliverable_and_sendable(self):
+        RouterGrowthClient.reset({
+            ("POST", "/run"): _rg_run({"email": "support@stripe.com",
+                                       "status": "valid",
+                                       "certainty": "ultra_sure",
+                                       "catch_all": None,
+                                       "mx_provider": "google"}),
+        })
+        with _rg(), patch("main.httpx.AsyncClient", RouterGrowthClient):
+            verdict = await main.routergrowth_verify_email("support@stripe.com")
+
+        self.assertEqual(verdict["status"], "deliverable")
+        self.assertIs(verdict["sendable"], True)
+        self.assertEqual(verdict["checked_by"], "routergrowth")
+        self.assertEqual(verdict["score"], "ultra_sure")
+
+    async def test_an_invalid_address_is_undeliverable(self):
+        RouterGrowthClient.reset({
+            ("POST", "/run"): _rg_run({"status": "invalid"},
+                                      provider="leadmagic",
+                                      charged="0.010938"),
+        })
+        with _rg(), patch("main.httpx.AsyncClient", RouterGrowthClient):
+            verdict = await main.routergrowth_verify_email("no@stripe.com")
+
+        self.assertEqual(verdict["status"], "undeliverable")
+        self.assertIs(verdict["sendable"], False)
+
+    async def test_a_valid_verdict_on_a_catch_all_domain_is_downgraded(self):
+        """A catch-all accepts anything, so "valid" is not evidence of a mailbox.
+
+        Every other verifier in this chain reports catch-all separately; this
+        keeps one meaning for `sendable` across all of them.
+        """
+        RouterGrowthClient.reset({
+            ("POST", "/run"): _rg_run({"status": "valid", "catch_all": True}),
+        })
+        with _rg(), patch("main.httpx.AsyncClient", RouterGrowthClient):
+            verdict = await main.routergrowth_verify_email("a@b.com")
+
+        self.assertEqual(verdict["status"], "risky")
+        self.assertIs(verdict["sendable"], False)
+
+    async def test_a_word_the_map_does_not_carry_is_never_sendable(self):
+        RouterGrowthClient.reset({
+            ("POST", "/run"): _rg_run({"status": "something new"}),
+        })
+        with _rg(), patch("main.httpx.AsyncClient", RouterGrowthClient):
+            verdict = await main.routergrowth_verify_email("a@b.com")
+
+        self.assertEqual(verdict["status"], "unknown")
+        self.assertIsNone(verdict["sendable"])
+
+    async def test_an_empty_wallet_is_reported_as_the_reason(self):
+        RouterGrowthClient.reset({
+            ("POST", "/run"): (402, {"error": {"code": "insufficient_balance"}}),
+        })
+        with _rg(), patch("main.httpx.AsyncClient", RouterGrowthClient):
+            verdict = await main.routergrowth_verify_email("a@b.com")
+
+        self.assertIsNone(verdict["sendable"])
+        self.assertEqual(verdict["reason"], "routergrowth wallet empty")
+
+
+class RouterGrowthSearchTests(RouterGrowthIsolation):
+    async def test_rows_whose_employer_domain_differs_are_dropped(self):
+        """The measured defect: a stripe.com search returning other employers."""
+        RouterGrowthClient.reset({
+            ("POST", "/run"): _rg_run({
+                "people": [
+                    LIVE_RG_PERSON,
+                    {**LIVE_RG_PERSON, "name": "Dan Newbold II",
+                     "current_company": "Stacks Software",
+                     "company_domain": "buy.stripe.com"},
+                ],
+                "total": 2,
+            }),
+        })
+        with _rg(), patch("main.httpx.AsyncClient", RouterGrowthClient):
+            out = await main.routergrowth_person_search(
+                {"company_domain": "stripe.com"}, 10)
+
+        self.assertEqual(len(out["profiles"]), 1)
+        self.assertEqual(out["profiles"][0]["current_company"], "Stripe")
+
+    async def test_no_domain_asked_for_means_no_domain_filtering(self):
+        # The check exists to honour a domain the user named. With none named
+        # it must not quietly drop rows for having an employer.
+        RouterGrowthClient.reset({
+            ("POST", "/run"): _rg_run({"people": [LIVE_RG_PERSON], "total": 1}),
+        })
+        with _rg(), patch("main.httpx.AsyncClient", RouterGrowthClient):
+            out = await main.routergrowth_person_search({"job_title": "CTO"}, 10)
+
+        self.assertEqual(len(out["profiles"]), 1)
+
+    async def test_raw_rows_are_returned_not_transformed_ones(self):
+        """Every other *_person_search here hands back the provider's shape.
+
+        enforce_icp reads a row through transform_for(name, {}) and the merge
+        transforms each row with its own provider's reader, so transforming in
+        the search would run the transform twice and measure the ICP against an
+        already-mapped row.
+        """
+        RouterGrowthClient.reset({
+            ("POST", "/run"): _rg_run({"people": [LIVE_RG_PERSON], "total": 1}),
+        })
+        with _rg(), patch("main.httpx.AsyncClient", RouterGrowthClient):
+            out = await main.routergrowth_person_search({"job_title": "CTO"}, 10)
+
+        self.assertIn("current_title", out["profiles"][0])
+        self.assertNotIn("job_title", out["profiles"][0])
+
+    async def test_a_failed_run_is_an_empty_result_not_a_raise(self):
+        RouterGrowthClient.reset({
+            ("POST", "/run"): _rg_run(None, status="failed", charged=None),
+        })
+        with _rg(), patch("main.httpx.AsyncClient", RouterGrowthClient):
+            out = await main.routergrowth_person_search({"job_title": "CTO"}, 10)
+
+        self.assertEqual(out, {"profiles": [], "total": 0})
+
+
+class RouterGrowthWiringTests(unittest.TestCase):
+    def test_it_is_in_the_chain_ahead_of_the_per_row_legs(self):
+        """Position is the whole cost argument.
+
+        It bills $0.002 a call plus $0.000374 a person and nothing on a miss,
+        so a 25-row page costs about $0.011 where ContactOut's per-row price
+        makes the same page about $0.50. Behind those legs it would never run.
+        """
+        order = list(main.PROVIDER_ORDER)
+        self.assertIn("routergrowth", order)
+        for dearer in ("contactout", "getleads", "fiber", "findymail", "wiza"):
+            self.assertLess(order.index("routergrowth"), order.index(dearer),
+                            dearer)
+
+    def test_its_key_puts_it_in_and_out_of_the_chain(self):
+        with patch.multiple(main.settings, routergrowth_api_key="k"):
+            self.assertTrue(main.provider_configured("routergrowth"))
+        with patch.multiple(main.settings, routergrowth_api_key=None):
+            self.assertFalse(main.provider_configured("routergrowth"))
+
+    def test_only_what_its_rows_can_evidence_is_icp_checkable(self):
+        """Its rows carry no industry string and no headcount.
+
+        Claiming either would make enforce_icp measure a row against a field it
+        cannot see, and a row that cannot be verified is dropped — so an
+        overclaim here empties the leg instead of filtering it.
+        """
+        checkable = main.ICP_CHECKABLE["routergrowth"]
+
+        self.assertIn("location", checkable)
+        self.assertNotIn("industry", checkable)
+        self.assertNotIn("company_size", checkable)
+
+    def test_the_verifier_runs_ahead_of_the_dearer_ones(self):
+        import inspect
+
+        body = inspect.getsource(main.verify_email_address)
+        order = [n for n in ("routergrowth", "fiber", "contactout", "enrichso",
+                             "findymail", "hunter") if f'"{n}"' in body]
+        self.assertEqual(order[0], "routergrowth")
+
+    def test_company_search_is_deliberately_not_wired(self):
+        """Its only filter is free text and the cheapest route mismatches it.
+
+        Measured: "stripe" returned UmbrellaDev, Sinevia Ltd and CumulusGate;
+        "openai" returned DataX Intelligence, Goodfire and SH Coaching. Real
+        companies with populated industry and headcount, so the output reads as
+        legitimate rather than as an error — the worst way for a lead-gen
+        product to be wrong. Crustdata already answers company search here.
+        """
+        import inspect
+
+        body = inspect.getsource(main.company_search)
+        self.assertNotIn("routergrowth", body)

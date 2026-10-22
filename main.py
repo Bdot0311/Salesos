@@ -62,6 +62,10 @@ class Settings(BaseSettings):
     # Apollo, ContactOut and Hunter through a single balance. See the Monid
     # section for which tools are routed through it and which deliberately are
     # not.
+    # RouterGrowth is the second router here. Its capabilities are routed
+    # across several providers with failover inside one call, which is why it
+    # fronts verification and people search rather than sitting behind them.
+    routergrowth_api_key: Optional[str] = None
     monid_api_key: Optional[str] = None
     # Corrections to the Monid tool table, as JSON mapping a logical name to
     # "provider:endpoint". The live catalog could not be reached from the
@@ -216,8 +220,15 @@ TREG_META_VALUE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 #
 # SEARCH_PROVIDER still decides which leg *leads*; this only decides the order
 # of the rest. Set SEARCH_PROVIDER=enrichso to put it first in practice.
-PROVIDER_ORDER = ("enrichso", "bytemine", "crustdata", "moltsets", "getleads",
-                  "fiber", "contactout", "treg", "coldiq", "findymail", "wiza")
+# routergrowth sits second. Its people search bills $0.002 a call plus
+# $0.000374 a person returned and nothing at all on a miss, which makes it the
+# cheapest leg here by a wide margin — a 25-row page costs $0.01135 against
+# roughly $0.50 for the same rows from ContactOut. It goes after enrichso only
+# because enrichso's first rows are free, and ahead of every leg that bills per
+# row returned.
+PROVIDER_ORDER = ("enrichso", "routergrowth", "bytemine", "crustdata",
+                  "moltsets", "getleads", "fiber", "contactout", "treg",
+                  "coldiq", "findymail", "wiza")
 
 
 def provider_configured(name: str) -> bool:
@@ -244,6 +255,8 @@ def provider_configured(name: str) -> bool:
         return bool(settings.contactout_api_key) or monid_configured()
     if name == "monid":
         return monid_configured()
+    if name == "routergrowth":
+        return routergrowth_configured()
     if name == "hunter":
         # Hunter has no key of its own here; it is reached through Monid.
         return monid_configured()
@@ -3901,6 +3914,510 @@ async def fiber_verify_email(email: str) -> dict:
 
 
 # =============================================================================
+# RouterGrowth  (https://api.routergrowth.com/v1)
+# =============================================================================
+#
+# The second router in this file, and the same three verbs as Monid — discover,
+# inspect, run, one prepaid wallet. What makes it worth having alongside Monid
+# is not the catalog but the layer above it: a *capability* is routed across
+# several providers with failover inside one call, and settled on what actually
+# came back.
+#
+# Every figure below was measured against the live gateway with this
+# workspace's own key, not read off a price list.
+#
+# WHY IT EARNS A PLACE, in one table. Per unit, against what this file pays now:
+#
+#   job                 here                        today
+#   ------------------  --------------------------  ---------------------------
+#   verify an address   $0.002, 3-way failover      $0.01-0.0122 (6 legs, by hand)
+#   25-row people list  $0.01135                    ~$0.50 (ContactOut, per row)
+#   find a work email   $0.01869, billed on match   $0.10 (ContactOut reveal)
+#
+# The 25-row figure is the one that matters: $0.002 a call plus $0.000374 a
+# person returned, settled on the people that come back. A miss is free.
+#
+# WHAT IS DELIBERATELY NOT WIRED: company.search. Its only filter is free text,
+# and on the cheapest route (icypeas, the one plain routing picks) the matching
+# is broken — "stripe" returned UmbrellaDev, Sinevia Ltd and CumulusGate;
+# "openai" returned DataX Intelligence, Goodfire and SH Coaching. Those are
+# real companies with populated industry, headcount and location, so the output
+# reads as legitimate, which is worse than an error. Pinning apify fixes the
+# relevance at about 7x the price, and Crustdata already answers company search
+# here for nothing extra, so there is no reason to buy it. Reported to them as
+# fb_01M5GQTG4T9BCQHAQ7V5TA6CD0.
+#
+# TWO THINGS LEARNED THE EXPENSIVE WAY, both encoded below:
+#
+#   detail="full" is not the default. Without it every row comes back with
+#   current_title and current_company null, which makes a lead list useless for
+#   title filtering. Reported as fb_01M5GQTGQVYZWX6Z0QNT6K5P1Q.
+#
+#   company_domains matches subdomains, and the employer on such a row can be a
+#   different company: a search for stripe.com returned a person at
+#   buy.stripe.com whose current_company was "Stacks Software". See
+#   _rg_same_company_domain for what this file does about it.
+
+ROUTERGROWTH_BASE = "https://api.routergrowth.com/v1"
+
+# Sent so a run can be traced back to this app in their dashboard.
+ROUTERGROWTH_CLIENT = "salesos"
+
+# How long one run may wait inline before it answers 202 and has to be polled.
+# Their ceiling is 120; this is chosen to sit inside the search budget.
+ROUTERGROWTH_WAIT_SECONDS = 30
+ROUTERGROWTH_POLL_SECONDS = 2.0
+ROUTERGROWTH_RUN_BUDGET_SECONDS = 45.0
+
+# Hard per-call ceilings, sent as routing.max_cost on every run. They are not
+# decoration: max_cost is enforced before the provider is called, and an offer
+# above it is excluded, so these also bound which routes may run.
+#
+# Each is set a little above the measured price of the route this file wants,
+# and below the next route up, so a cheap search cannot silently escalate onto
+# an expensive one. The measured prices:
+#
+#   contact.verify   icypeas $0.002   findymail $0.00875   leadmagic $0.010938
+#   people.search    icypeas $0.002 + $0.000374/person; apollo $0.042/person;
+#                    apify $0.175 a 25-result page, whatever the limit
+#
+# The verify ceiling deliberately clears leadmagic: a verdict is worth $0.011
+# when the two cheaper verifiers both declined, which is exactly what happened
+# on the invalid address this was tested with.
+ROUTERGROWTH_VERIFY_MAX_COST = "0.02"
+
+# People search: the icypeas route plus its per-person component at the largest
+# page this file asks for, with headroom — but far under apify's $0.175 page,
+# so the waterfall stops at the database rather than escalating 15x on a miss.
+ROUTERGROWTH_PEOPLE_MAX_COST = "0.09"
+
+# Their lead database answers up to 200 a call.
+ROUTERGROWTH_MAX_PAGE = 200
+
+# The floor this leg asks for even when the caller wants fewer. The route has
+# no offset or page parameter at all, so a repeat search returns the same top
+# rows and the seen ledger empties them — over-fetching is the only lever this
+# leg has against that, and at $0.000374 a row it is a cheap one: 25 rows cost
+# $0.01135 against the $0.002 a bare call costs either way.
+ROUTERGROWTH_MIN_FETCH = 25
+
+# Their verdict vocabulary, measured: "valid" on a live mailbox, "invalid" on
+# one that does not exist. The rest are defensive — a word this map does not
+# carry is reported as unknown rather than guessed into a send decision.
+_RG_VERDICT = {
+    "valid": ("deliverable", True),
+    "deliverable": ("deliverable", True),
+    "invalid": ("undeliverable", False),
+    "undeliverable": ("undeliverable", False),
+    "risky": ("risky", False),
+    "catch_all": ("risky", False),
+    "accept_all": ("risky", False),
+}
+
+# Their seniority vocabulary for people.search. Keyed by our canonical levels
+# rather than raw words, for the reason _CO_SENIORITY gives: folding twice in
+# two places is how the spellings drift apart.
+_RG_SENIORITY = {
+    "owner": "owner",
+    "partner": "partner",
+    "c_suite": "cxo",
+    "vp": "vp",
+    "director": "director",
+    "manager": "manager",
+    "senior": "senior",
+    "junior": "entry",
+}
+
+
+def routergrowth_configured() -> bool:
+    """True when the router has a key and can be called at all."""
+    return bool(settings.routergrowth_api_key)
+
+
+async def routergrowth_call(method: str, path: str, *, body: dict = None,
+                            idempotency_key: str = None) -> tuple:
+    """Call RouterGrowth. Returns (status_code, parsed body or None).
+
+    Returns rather than raises on every status. An empty wallet, a rate limit
+    and a blocked run are states of the account, not failures of this request.
+
+    Their error envelope is `{error: {code, message, request_id}}` on every
+    endpoint, and the code is stable, so the code is what gets logged — a
+    request_id is the thing their support asks for.
+    """
+    headers = {
+        "Authorization": f"Bearer {settings.routergrowth_api_key or ''}",
+        "Content-Type": "application/json",
+        "X-RouterGrowth-Client": ROUTERGROWTH_CLIENT,
+    }
+    if idempotency_key:
+        # Makes a retry safe: a replayed key returns the original run and never
+        # bills twice. Worth having on anything that spends money.
+        headers["Idempotency-Key"] = idempotency_key
+
+    printable = json.dumps(body)[:400] if body is not None else ""
+    print(f"RouterGrowth {method} {path}: {printable}")
+    try:
+        async with httpx.AsyncClient(timeout=90.0) as client:
+            resp = await client.request(method, f"{ROUTERGROWTH_BASE}{path}",
+                                        headers=headers, json=body)
+    except httpx.HTTPError as exc:
+        print(f"RouterGrowth {path} unreachable: {exc}")
+        return 0, None
+
+    try:
+        parsed = resp.json()
+    except ValueError:
+        parsed = None
+
+    code = None
+    if isinstance(parsed, dict) and isinstance(parsed.get("error"), dict):
+        code = parsed["error"].get("code")
+        print(f"RouterGrowth {path} error: {resp.status_code} {code} "
+              f"{parsed['error'].get('message') or ''} "
+              f"[{parsed['error'].get('request_id') or ''}]")
+    elif resp.status_code >= 400:
+        print(f"RouterGrowth {path} status: {resp.status_code} "
+              f"{resp.text[:300]}")
+
+    # One wallet behind every capability, so one empty-balance answer has to
+    # stop the others spending a round trip to be told the same thing. Their
+    # spend guard reports the same way, and both mean "do not call again yet".
+    provider_note_exhausted(
+        "routergrowth",
+        code in ("insufficient_balance", "budget_exceeded"),
+        "RouterGrowth wallet balance")
+    return resp.status_code, parsed
+
+
+def routergrowth_log_cost(capability: str, run: dict) -> None:
+    """Say what a run cost, and which provider actually served it.
+
+    Both halves matter. The charge is in dollars on the run itself, which no
+    other provider in this file reports at request time; and the provider is
+    the router's own choice, so without it a cost line cannot be read against
+    a price list.
+    """
+    billing = (run or {}).get("billing") or {}
+    charged = billing.get("charged")
+    if charged is None:
+        return
+    attempts = [a.get("provider") for a in ((run or {}).get("attempts") or [])
+                if isinstance(a, dict)]
+    trail = " <- " + ", ".join(p for p in attempts if p) if len(attempts) > 1 else ""
+    print(f"RouterGrowth {capability} cost: {charged} "
+          f"{billing.get('currency') or 'USD'} via "
+          f"{(run or {}).get('provider') or 'unknown'}{trail}")
+
+
+def routergrowth_result(run: dict) -> tuple:
+    """Unwrap a run into (ok, normalized result).
+
+    `result` is the normalized payload — the whole point of a capability over a
+    raw endpoint — so there is no provider envelope to dig through here. The
+    run's own status is what decides whether to read it: `blocked` is the spend
+    guard refusing before any money moved, and must not be read as "nobody
+    matched".
+    """
+    if not isinstance(run, dict):
+        return False, None
+    state = str(run.get("status") or "").lower()
+    if state == "succeeded":
+        result = run.get("result")
+        return True, result if isinstance(result, dict) else None
+    if state == "blocked":
+        print("RouterGrowth run blocked by the spend guard; nothing charged")
+        return False, None
+    if state in ("failed", "cancelled", "canceled", "expired"):
+        return False, None
+    # A status this code does not know is not assumed to be a success: reading
+    # an unfinished run as an empty one is how a paid call turns into "no such
+    # people".
+    print(f"RouterGrowth run did not finish: status {state or 'unknown'}")
+    return False, None
+
+
+async def routergrowth_run(capability: str, payload: dict, *,
+                           max_cost: str, provider: str = "auto",
+                           strategy: str = "cheapest") -> tuple:
+    """Execute one capability. Returns (ok, normalized result).
+
+    Polls when the run answers 202, bounded by whatever is left of the search
+    budget as well as its own ceiling: a run that outlives the request is money
+    spent on rows nobody receives.
+
+    `strategy` defaults to cheapest rather than their own best_value default.
+    Every capability this file uses has a measured cheapest route that is
+    good enough, and max_cost already excludes the expensive ones — so paying
+    for a "better value" route would be paying for a choice this code has
+    already made.
+    """
+    if not routergrowth_configured():
+        return False, None
+    if provider_out_of_credits("routergrowth"):
+        print(f"RouterGrowth skipped for {capability}: wallet reported empty")
+        return False, None
+
+    body = {
+        "capability": capability,
+        "input": payload,
+        "routing": {"provider": provider, "strategy": strategy,
+                    "max_cost": max_cost, "allow_fallback": provider == "auto"},
+        "wait_seconds": ROUTERGROWTH_WAIT_SECONDS,
+    }
+    # Keyed on the capability and the exact input, so a retry of the same
+    # question replays the original run instead of buying it twice.
+    fingerprint = hashlib.sha256(
+        json.dumps([capability, payload], sort_keys=True,
+                   default=str).encode()).hexdigest()[:32]
+
+    status, run = await routergrowth_call("POST", "/run", body=body,
+                                          idempotency_key=f"salesos-{fingerprint}")
+    if status not in (200, 202) or not isinstance(run, dict):
+        return False, None
+
+    routergrowth_log_cost(capability, run)
+
+    run_id = run.get("run_id")
+    if status == 202 and run_id:
+        left = search_seconds_left()
+        deadline = (ROUTERGROWTH_RUN_BUDGET_SECONDS if left is None
+                    else min(ROUTERGROWTH_RUN_BUDGET_SECONDS, max(0.0, left)))
+        waited = 0.0
+        while waited < deadline:
+            await asyncio.sleep(ROUTERGROWTH_POLL_SECONDS)
+            waited += ROUTERGROWTH_POLL_SECONDS
+            detail_status, detail = await routergrowth_call(
+                "GET", f"/runs/{run_id}")
+            if detail_status != 200 or not isinstance(detail, dict):
+                break
+            run = detail
+            if str(run.get("status") or "").lower() != "running":
+                routergrowth_log_cost(capability, run)
+                break
+        else:
+            print(f"RouterGrowth {capability} still running after "
+                  f"{int(waited)}s; abandoning the wait")
+
+    return routergrowth_result(run)
+
+
+# -----------------------------------------------------------------------------
+# contact.verify
+# -----------------------------------------------------------------------------
+
+async def routergrowth_verify_email(email: str) -> dict:
+    """Verify one address through RouterGrowth, in our shared verdict shape.
+
+    One call runs their own verifier waterfall: measured live, an address that
+    does not exist went icypeas (no match, free) -> findymail (no match, free)
+    -> leadmagic (verdict, $0.010938), and only the provider that answered was
+    charged. An unreachable mail server is free and falls through on their side
+    rather than ours, which is the one thing the six-leg chain in this file
+    cannot do in a single call.
+    """
+    status_result = await routergrowth_run(
+        "contact.verify", {"email": email},
+        max_cost=ROUTERGROWTH_VERIFY_MAX_COST)
+    ok, result = status_result
+    verdict_word = (result or {}).get("status") if ok else None
+    if not verdict_word:
+        reason = ("routergrowth wallet empty"
+                  if provider_out_of_credits("routergrowth")
+                  else "routergrowth returned no verdict")
+        return {"status": "unknown", "sendable": None,
+                "checked_by": "routergrowth", "reason": reason}
+
+    mapped, sendable = _RG_VERDICT.get(str(verdict_word).strip().lower(),
+                                       ("unknown", None))
+    payload = result or {}
+    catch_all = payload.get("catch_all")
+    # A catch-all domain accepts anything, so a "valid" verdict on one is not
+    # evidence of a mailbox. Every other verifier in this chain reports that
+    # separately and this one does too; downgrading here keeps one meaning for
+    # `sendable` across all of them.
+    if mapped == "deliverable" and catch_all is True:
+        mapped, sendable = "risky", False
+
+    company = payload.get("company")
+    return {
+        "status": mapped,
+        "sendable": sendable,
+        "checked_by": "routergrowth",
+        "raw_status": verdict_word,
+        "catch_all": catch_all,
+        "role_based": None,
+        "disposable": None,
+        "free_provider": None,
+        "vendor": payload.get("mx_provider"),
+        "score": payload.get("certainty"),
+        "company_name": company.get("name") if isinstance(company, dict) else None,
+    }
+
+
+# -----------------------------------------------------------------------------
+# people.search
+# -----------------------------------------------------------------------------
+
+def _rg_same_company_domain(requested: str, found: str) -> bool:
+    """Whether a row's employer domain is the domain that was asked for.
+
+    Exact match, and that is a judgement from the data rather than caution.
+    Their route also matches subdomains, and the subdomain rows measured here
+    were not employees of the company asked for: a search for stripe.com
+    returned rows on buy.stripe.com and donate.stripe.com, and one of them
+    carried current_company "Stacks Software". Those are Stripe's own product
+    subdomains, not anybody's employer domain, so a row attributed to one is a
+    mis-attribution in their data — while the plain stripe.com rows in the same
+    search were all plausible Stripe staff.
+
+    Accepting subdomains would therefore admit exactly the rows that are wrong,
+    into the one filter a user is most precise about. A company named by its
+    domain is the least ambiguous thing this app can be asked for, and it is
+    not worth softening to gain rows nobody wanted.
+    """
+    want = (domain_host(requested) or str(requested or "")).strip().lower()
+    got = (domain_host(found) or str(found or "")).strip().lower()
+    if not want or not got:
+        return False
+    return got == want
+
+
+def build_routergrowth_people_input(p: dict, want: int) -> dict:
+    """Translate internal search params into a people.search input.
+
+    Their lead database cannot combine titles with seniority, and a search
+    that tries goes to a route costing 15x more. This file already has the
+    rule that decides between the two — title_supersedes_seniority, written
+    for the same collision on Bytemine and Crustdata — so it is reused rather
+    than restated.
+    """
+    f: dict = {
+        # Measured: without this every row's current_title and current_company
+        # come back null, which makes the rows useless for title filtering.
+        "detail": "full",
+        "limit": max(min(max(want, ROUTERGROWTH_MIN_FETCH),
+                         ROUTERGROWTH_MAX_PAGE), 1),
+    }
+
+    titles = [t.strip() for t in str(p.get("job_title") or "").split(",")
+              if t.strip()]
+    if titles:
+        f["titles"] = titles[:25]
+
+    # Seniority only when no title already states the level, and never
+    # alongside titles: their database refuses the combination outright.
+    if p.get("seniority") and not titles and not title_supersedes_seniority(
+            p.get("job_title"), p["seniority"]):
+        level = _RG_SENIORITY.get(_canonical_seniority(p["seniority"]))
+        if not level:
+            raise ProviderUnsupported("seniority", p["seniority"])
+        f["seniority"] = [level]
+
+    company = p.get("company")
+    domain = p.get("company_domain")
+    if company and not domain and looks_like_domain(company):
+        domain, company = company, None
+    if domain:
+        f["company_domains"] = [domain_host(domain) or domain]
+    elif company:
+        f["companies"] = [str(company)]
+
+    if p.get("industries") or p.get("industry"):
+        # Matched fuzzily on their side, which is why industry stays in
+        # ICP_CHECKABLE: the rows are measured against it locally afterwards.
+        wanted = p.get("industries") or [p.get("industry")]
+        f["industries"] = [str(i) for i in wanted if str(i or "").strip()][:10]
+
+    location = p.get("location") or p.get("company_location")
+    if location:
+        f["locations"] = [str(location)]
+
+    if p.get("company_size"):
+        lo, hi = _size_bounds(str(p["company_size"]))
+        if lo is None and hi is None:
+            raise ProviderUnsupported("company_size", p["company_size"])
+        # Their field takes bands, and a range with a gap in it goes to a
+        # dearer route. One contiguous band is all this ever sends.
+        f["company_headcount"] = [f"{lo}-{hi}" if hi is not None else f"{lo}+"]
+
+    if p.get("keywords"):
+        f["query"] = str(p["keywords"])
+
+    if not any(k in f for k in ("titles", "seniority", "company_domains",
+                                "companies", "industries", "locations",
+                                "query")):
+        raise ProviderUnsupported(
+            "job_title, company, industry, location or keywords",
+            "nothing RouterGrowth can search people by")
+    return f
+
+
+def transform_routergrowth_person(row: dict, search_params: dict = None) -> dict:
+    """One people.search row in this app's lead shape.
+
+    No email is read off these rows even when the field is present: this route
+    is documented not to carry one, the field came back empty on every row
+    measured, and an email that arrives without a deliverability verdict is
+    exactly what verify_revealed_lead exists to prevent.
+    """
+    row = row or {}
+    name = (row.get("name") or "").strip()
+    first = row.get("first_name") or (name.split(" ")[0] if name else None)
+    last = row.get("last_name") or (
+        " ".join(name.split(" ")[1:]) if name and " " in name else None)
+
+    return {
+        "full_name": name or None,
+        "first_name": first,
+        "last_name": last,
+        "job_title": row.get("current_title") or row.get("headline") or None,
+        "seniority": row.get("seniority") or None,
+        "company_name": row.get("current_company") or None,
+        "company_domain": row.get("company_domain") or None,
+        "linkedin_url": row.get("linkedin_url") or None,
+        "location": row.get("location") or None,
+        "business_email": None,
+        "email_status": None,
+        "provider": "routergrowth",
+        "raw_data": row,
+    }
+
+
+async def routergrowth_person_search(params: dict, want: int) -> dict:
+    """Search people. Returns {"profiles": [...], "total": int}. Never raises
+    for provider reasons; a filter it cannot express still refuses.
+    """
+    payload = build_routergrowth_people_input(params, want)
+    ok, result = await routergrowth_run(
+        "people.search", payload, max_cost=ROUTERGROWTH_PEOPLE_MAX_COST)
+    if not ok or not isinstance(result, dict):
+        return {"profiles": [], "total": 0}
+
+    rows = [r for r in (result.get("people") or []) if isinstance(r, dict)]
+
+    # The employer check, applied only when a domain was actually asked for.
+    asked = payload.get("company_domains") or []
+    if asked:
+        kept = [r for r in rows
+                if _rg_same_company_domain(asked[0], r.get("company_domain") or "")]
+        if len(kept) != len(rows):
+            print(f"RouterGrowth: {len(rows) - len(kept)} of {len(rows)} row(s) "
+                  f"named an employer domain other than {asked[0]}")
+        rows = kept
+
+    print(f"RouterGrowth people.search: {len(rows)} row(s), "
+          f"total {result.get('total')}")
+    # Raw rows, deliberately. Every other *_person_search here hands back the
+    # provider's own shape and lets the caller transform: enforce_icp needs to
+    # read a row through transform_for(name, {}), and the merge transforms each
+    # row with its own provider's reader. Transforming in here would run the
+    # transform twice and measure the ICP against an already-mapped row.
+    return {"profiles": rows,
+            "total": int(result.get("total") or len(rows))}
+
+
+# =============================================================================
 # Monid  (https://api.monid.ai)
 # =============================================================================
 #
@@ -6886,7 +7403,8 @@ async def verify_email_address(email: str) -> dict:
 
     verdict = await coldiq_verify_email(email)
 
-    for name, check in (("fiber", fiber_verify_email),
+    for name, check in (("routergrowth", routergrowth_verify_email),
+                        ("fiber", fiber_verify_email),
                         ("contactout", contactout_verify_email),
                         ("enrichso", enrichso_verify_email),
                         ("findymail", findymail_verify_email),
@@ -8002,6 +8520,11 @@ ICP_CHECKABLE = {
     # Its rows carry a real integer employeeCount, city/state/countryName, and
     # a SIC or NAICS industry description — so all three are measurable.
     "enrichso":   frozenset({"industry", "company_size", *_ICP_LOC}),
+    # Its rows carry current_company, company_domain, location and
+    # current_title, but no industry string and no headcount, so only location
+    # can be measured against the ICP from a row. Industry and size are sent as
+    # filters and taken on trust, which is what the refusal path is for.
+    "routergrowth": frozenset({"location", "company_location"}),
     "bytemine":   frozenset({"industry", "company_size"}),
     "crustdata":  frozenset({"industry", "company_size", *_ICP_LOC}),
     "moltsets":   frozenset({"industry", *_ICP_LOC}),
@@ -9635,6 +10158,8 @@ async def walk_search(request: SearchRequest):
             return lambda row: transform_moltsets_profile(row, bound)
         if name == "enrichso":
             return lambda row: transform_enrichso_lead(row, bound)
+        if name == "routergrowth":
+            return lambda row: transform_routergrowth_person(row, bound)
         if name == "getleads":
             return lambda record: transform_getleads_contact(record)
         if name == "treg":
@@ -9844,6 +10369,30 @@ async def walk_search(request: SearchRequest):
                 log_empty_leg("Enrich.so", rows_seen, seen_scope)
 
             return found, total, None
+
+        if name == "routergrowth":
+            # No offset and no page parameter on this route at all, so a repeat
+            # search returns the same top rows and the ledger empties them.
+            # Over-fetching is the only lever against that, and a cheap one
+            # here: the call costs $0.002 either way and each extra row is
+            # $0.000374, so the floor in build_routergrowth_people_input buys
+            # the ledger something to work with for about a cent.
+            wanted = max(params.get("limit", 10), 1)
+            result = await routergrowth_person_search(params, wanted)
+            found = keep_on_icp(result["profiles"])
+            if exclusions:
+                seen = {i for i in (linkedin_identity(u) for u in exclusions) if i}
+                found = [r for r in found
+                         if linkedin_identity(_profile_url(r)) not in seen]
+            if campaign_keys:
+                found = drop_already_seen(found, campaign_keys, suppressed)
+            if seen_scope:
+                found = await record_new_campaign_profiles(seen_scope, found)
+            if not found:
+                log_empty_leg("RouterGrowth", len(result["profiles"]), seen_scope)
+            # Sliced to what was asked for, not to what was fetched: the extra
+            # rows were bought to feed the ledger, not to widen the page.
+            return found[:wanted], result["total"], None
 
         if name == "bytemine":
             result = await bytemine_person_search(
