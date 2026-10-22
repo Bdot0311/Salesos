@@ -9396,3 +9396,305 @@ class RouterGrowthWiringTests(unittest.TestCase):
 
         body = inspect.getsource(main.company_search)
         self.assertNotIn("routergrowth", body)
+
+
+class RouterGrowthNamePartsTests(unittest.TestCase):
+    """contact.find requires both halves of a name."""
+
+    def test_a_full_name_splits(self):
+        self.assertEqual(main._rg_name_parts("Ada Lovelace"),
+                         ("Ada", "Lovelace"))
+
+    def test_a_middle_name_stays_with_the_surname(self):
+        self.assertEqual(main._rg_name_parts("Ada Byron King"),
+                         ("Ada", "Byron King"))
+
+    def test_a_mononym_is_not_something_it_can_be_asked(self):
+        # Sending an empty last_name spends a lookup on a request their schema
+        # rejects, so the question is never put.
+        for name in ("Prince", "", "   ", None):
+            self.assertEqual(main._rg_name_parts(name), (None, None), name)
+
+
+class RouterGrowthRevealTests(RouterGrowthIsolation):
+    class Req:
+        def __init__(self, **kw):
+            self.full_name = kw.get("full_name")
+            self.company_domain = kw.get("company_domain")
+            self.linkedin_url = kw.get("linkedin_url")
+            self.company = kw.get("company")
+            self.email = kw.get("email")
+            self.want_phone = kw.get("want_phone", False)
+
+    async def test_a_found_email_comes_back_with_its_status(self):
+        RouterGrowthClient.reset({
+            ("POST", "/run"): _rg_run({"email": "p@stripe.com",
+                                       "status": "valid",
+                                       "mx_provider": "google",
+                                       "company": {"name": "Stripe"}},
+                                      charged="0.01869"),
+        })
+        with _rg(), patch("main.httpx.AsyncClient", RouterGrowthClient):
+            got = await main.routergrowth_find_email("Prantik Mazumdar",
+                                                     "stripe.com")
+
+        self.assertEqual(got["email"], "p@stripe.com")
+        self.assertEqual(got["email_status"], "valid")
+        self.assertEqual(got["company_name"], "Stripe")
+
+    async def test_a_miss_is_an_empty_dict_not_a_raise(self):
+        """Measured live: a miss tried three routes and charged $0."""
+        RouterGrowthClient.reset({
+            ("POST", "/run"): (200, {"run_id": "r", "status": "no_match",
+                                     "billing": {"charged": "0"},
+                                     "error": {"code": "no_match",
+                                               "message": "No result matched"}}),
+        })
+        with _rg(), patch("main.httpx.AsyncClient", RouterGrowthClient):
+            got = await main.routergrowth_find_email("Zz Nobody", "stripe.com")
+
+        self.assertEqual(got, {})
+
+    async def test_a_mononym_never_reaches_the_gateway(self):
+        with _rg(), patch("main.httpx.AsyncClient", RouterGrowthClient):
+            got = await main.routergrowth_find_email("Prince", "stripe.com")
+
+        self.assertEqual(got, {})
+        self.assertEqual(RouterGrowthClient.calls, [])
+
+    async def test_no_domain_never_reaches_the_gateway(self):
+        with _rg(), patch("main.httpx.AsyncClient", RouterGrowthClient):
+            got = await main.routergrowth_find_email("Ada Lovelace", "")
+
+        self.assertEqual(got, {})
+        self.assertEqual(RouterGrowthClient.calls, [])
+
+    async def test_a_phone_is_never_bought_unless_it_was_asked_for(self):
+        """The dearest thing this app can buy: $0.21875 against $0.01869.
+
+        A page of leads that silently asked for phones would cost about twelve
+        times one that did not, so the default path must not reach for it.
+        """
+        RouterGrowthClient.reset({
+            ("POST", "/run"): _rg_run({"email": "p@stripe.com",
+                                       "status": "valid"}),
+        })
+        with _rg(), patch("main.httpx.AsyncClient", RouterGrowthClient):
+            await main.routergrowth_reveal(
+                self.Req(full_name="Ada Lovelace", company_domain="stripe.com"))
+
+        sent = [c["body"]["capability"] for c in RouterGrowthClient.calls]
+        self.assertEqual(sent, ["contact.find"])
+
+    async def test_an_asked_for_phone_is_bought_once(self):
+        def answer(seen):
+            if seen == 1:
+                return _rg_run({"email": "p@stripe.com", "status": "valid"})
+            return _rg_run({"phone": "+15550000", "type": "mobile",
+                            "confidence": "high"}, charged="0.21875")
+
+        RouterGrowthClient.reset({("POST", "/run"): answer})
+        with _rg(), patch("main.httpx.AsyncClient", RouterGrowthClient):
+            got = await main.routergrowth_reveal(
+                self.Req(full_name="Ada Lovelace", company_domain="stripe.com",
+                         want_phone=True))
+
+        sent = [c["body"]["capability"] for c in RouterGrowthClient.calls]
+        self.assertEqual(sent, ["contact.find", "contact.phone"])
+        self.assertEqual(got["phone"], "+15550000")
+
+    async def test_the_phone_cap_pins_it_to_the_cheapest_finder(self):
+        """Their waterfall is $0.21875 -> $0.378 -> $0.8575.
+
+        max_cost admits a route by its own quote, so without this cap one
+        reveal could cost more than forty email lookups.
+        """
+        RouterGrowthClient.reset({
+            ("POST", "/run"): _rg_run({"phone": "+1"}, charged="0.21875"),
+        })
+        with _rg(), patch("main.httpx.AsyncClient", RouterGrowthClient):
+            await main.routergrowth_find_phone(email="a@b.com")
+
+        cap = RouterGrowthClient.calls[0]["body"]["routing"]["max_cost"]
+        self.assertEqual(cap, main.ROUTERGROWTH_PHONE_MAX_COST)
+        self.assertLess(float(cap), 0.378)
+
+    async def test_the_email_cap_still_allows_a_failover(self):
+        # icypeas $0.01869 -> apollo $0.042 -> leadmagic $0.04375, and a miss
+        # is free either way, so stopping at the cheapest would forgo matches
+        # for nothing saved.
+        self.assertGreater(float(main.ROUTERGROWTH_FIND_MAX_COST), 0.04375)
+
+    async def test_a_phone_with_no_identifier_is_never_asked_for(self):
+        with _rg(), patch("main.httpx.AsyncClient", RouterGrowthClient):
+            got = await main.routergrowth_find_phone()
+
+        self.assertEqual(got, {})
+        self.assertEqual(RouterGrowthClient.calls, [])
+
+
+class RouterGrowthCompanyEnrichTests(RouterGrowthIsolation):
+    def test_the_live_payload_becomes_our_company_shape(self):
+        # Shape measured against the live gateway for stripe.com.
+        got = main.transform_routergrowth_company({
+            "company": {"name": "Stripe", "domain": "stripe.com",
+                        "linkedin_url": "https://linkedin.com/company/stripe"},
+            "industry": "Technology, Information and Internet",
+            "employee_count": 16694,
+            "founded": 2010,
+            "location": {"city": "South San Francisco",
+                         "country": "United States"},
+        })
+
+        self.assertEqual(got["company_name"], "Stripe")
+        self.assertEqual(got["company_domain"], "stripe.com")
+        self.assertEqual(got["employee_count"], 16694)
+        self.assertEqual(got["founded_year"], 2010)
+        self.assertEqual(got["location"],
+                         "South San Francisco, United States")
+        self.assertEqual(got["provider"], "routergrowth")
+
+    def test_a_flat_payload_reads_too(self):
+        # Their result lifts firmographics to the top level and nests only the
+        # identity, so neither shape is assumed.
+        got = main.transform_routergrowth_company(
+            {"name": "Acme", "domain": "acme.com", "industry": "Software"})
+
+        self.assertEqual(got["company_name"], "Acme")
+        self.assertEqual(got["industry"], "Software")
+
+    async def test_a_lookup_without_a_domain_is_never_asked(self):
+        # Their schema requires the domain; a LinkedIn URL alone is not a
+        # question this capability answers.
+        with _rg(), patch("main.httpx.AsyncClient", RouterGrowthClient):
+            got = await main.routergrowth_company_enrich(
+                linkedin_url="https://linkedin.com/company/stripe")
+
+        self.assertEqual(got, {})
+        self.assertEqual(RouterGrowthClient.calls, [])
+
+
+class RouterGrowthSignalTests(RouterGrowthIsolation):
+    async def test_neither_signal_is_bought_unless_asked_for(self):
+        with _rg(), patch("main.httpx.AsyncClient", RouterGrowthClient):
+            got = await main.routergrowth_company_signals("stripe.com")
+
+        self.assertEqual(got, {})
+        self.assertEqual(RouterGrowthClient.calls, [])
+
+    async def test_jobs_and_technologies_are_asked_for_separately(self):
+        def answer(seen):
+            if seen == 1:
+                return _rg_run({"jobs": [{"title": "GTM Engineer"}]},
+                               charged="0.03675")
+            return _rg_run({"technologies": [{"name": "Next.js"}]},
+                           charged="0.021")
+
+        RouterGrowthClient.reset({("POST", "/run"): answer})
+        with _rg(), patch("main.httpx.AsyncClient", RouterGrowthClient):
+            got = await main.routergrowth_company_signals(
+                "stripe.com", jobs=True, technologies=True)
+
+        sent = [c["body"]["capability"] for c in RouterGrowthClient.calls]
+        self.assertEqual(sent, ["company.jobs", "company.technologies"])
+        self.assertEqual(got["open_jobs_count"], 1)
+        self.assertEqual(got["technologies"], [{"name": "Next.js"}])
+
+    async def test_the_signal_cap_clears_the_measured_price_not_the_headline(self):
+        """discover quotes company.jobs from $0.0035; it charged $0.03675.
+
+        A starting_price is the cheapest offer that *could* run, not the one
+        that will, so a cap written off the headline would refuse the only live
+        route and the signal would never work.
+        """
+        self.assertGreater(float(main.ROUTERGROWTH_SIGNAL_MAX_COST), 0.03675)
+
+    async def test_a_no_match_signal_is_simply_absent(self):
+        RouterGrowthClient.reset({
+            ("POST", "/run"): (200, {"run_id": "r", "status": "no_match",
+                                     "billing": {"charged": "0"}}),
+        })
+        with _rg(), patch("main.httpx.AsyncClient", RouterGrowthClient):
+            got = await main.routergrowth_company_signals("x.com", jobs=True)
+
+        self.assertEqual(got, {})
+
+
+class RouterGrowthMissIsNotAnErrorTests(RouterGrowthIsolation):
+    def test_a_no_match_run_is_not_read_as_a_failure(self):
+        """A free miss must not read as something broken.
+
+        Measured: a contact.find miss arrives as HTTP 200 carrying an `error`
+        node with code no_match, having tried every route the cap allowed and
+        charged nothing. Logging that as an error is how a normal empty result
+        starts looking like an outage — which is exactly what the company
+        search message did in this file.
+        """
+        ok, result = main.routergrowth_result(
+            {"status": "no_match", "billing": {"charged": "0"}})
+
+        self.assertFalse(ok)
+        self.assertIsNone(result)
+
+
+class RouterGrowthRevealChainTests(unittest.TestCase):
+    def test_the_reveal_leg_sits_ahead_of_every_leg_that_bills_on_a_miss(self):
+        """Price order, with one exception that is about precision.
+
+        contact.find is charged only on a match, so trying it on a lead that
+        will miss costs nothing — it belongs ahead of ColdIQ, ContactOut,
+        Findymail and Wiza. It sits *behind* the Bytemine PID unlock and the
+        Crustdata LinkedIn lookup on purpose: those resolve the exact record
+        that was shown, where a name-and-domain lookup could land on a
+        different person of the same name at the same company.
+        """
+        import inspect
+
+        body = inspect.getsource(main.reveal_lead)
+        at = {}
+        for leg in ("bytemine", "crustdata", "routergrowth", "coldiq",
+                    "contactout", "findymail"):
+            marker = f'"{leg}" in chain'
+            self.assertIn(marker, body, leg)
+            at[leg] = body.index(marker)
+
+        for precise in ("bytemine", "crustdata"):
+            self.assertLess(at[precise], at["routergrowth"], precise)
+        for dearer in ("coldiq", "contactout", "findymail"):
+            self.assertGreater(at[dearer], at["routergrowth"], dearer)
+
+    def test_the_phone_opt_in_defaults_to_off(self):
+        self.assertIs(main.EnrichRequest(email="a@b.com").want_phone, False)
+
+    def test_the_phone_opt_in_accepts_the_shorthands_callers_send(self):
+        for key in ("want_phone", "include_phone", "phone"):
+            got = main.EnrichRequest(**{"email": "a@b.com", key: True})
+            self.assertIs(got.want_phone, True, key)
+
+
+class CompanyEnrichChainTests(unittest.TestCase):
+    def test_it_no_longer_depends_on_one_provider(self):
+        """It had Wiza alone, and Wiza is what stopped answering.
+
+        The same single-provider shape took /company/search down; this
+        endpoint had it too.
+        """
+        import inspect
+
+        body = inspect.getsource(main.company_enrich)
+        self.assertIn("routergrowth_company_enrich", body)
+        self.assertIn("wiza_company_enrich", body)
+
+    def test_a_legacy_cached_row_still_reads(self):
+        """Rows cached before the provider envelope hold a bare Wiza payload.
+
+        Reading one as an envelope would hand back a company with every field
+        empty — a silent blank rather than an error.
+        """
+        import inspect
+
+        body = inspect.getsource(main.company_enrich)
+        self.assertIn('"_provider" not in entry', body)
+        # And the cache key changed with the shape, so old and new rows cannot
+        # be confused for one another in the first place.
+        self.assertIn("company_enrich_v2", body)

@@ -4073,7 +4073,14 @@ async def routergrowth_call(method: str, path: str, *, body: dict = None,
     code = None
     if isinstance(parsed, dict) and isinstance(parsed.get("error"), dict):
         code = parsed["error"].get("code")
-        print(f"RouterGrowth {path} error: {resp.status_code} {code} "
+        # `no_match` arrives as an error node on a 200, and it is not one: the
+        # waterfall asked every route it was allowed to and nobody matched,
+        # which is free and is a real answer. Logging it as an error is how a
+        # normal empty result starts looking like an outage — the exact
+        # confusion the company-search message caused in this file already.
+        label = "no match" if code == "no_match" and resp.status_code == 200 \
+            else "error"
+        print(f"RouterGrowth {path} {label}: {resp.status_code} {code} "
               f"{parsed['error'].get('message') or ''} "
               f"[{parsed['error'].get('request_id') or ''}]")
     elif resp.status_code >= 400:
@@ -4127,6 +4134,12 @@ def routergrowth_result(run: dict) -> tuple:
         return True, result if isinstance(result, dict) else None
     if state == "blocked":
         print("RouterGrowth run blocked by the spend guard; nothing charged")
+        return False, None
+    if state == "no_match":
+        # Terminal, free, and a real answer: every route the cost cap allowed
+        # was tried and nobody matched. Distinguished from a failure so a miss
+        # never reads as something broken.
+        print("RouterGrowth: nobody matched; nothing charged")
         return False, None
     if state in ("failed", "cancelled", "canceled", "expired"):
         return False, None
@@ -4415,6 +4428,233 @@ async def routergrowth_person_search(params: dict, want: int) -> dict:
     # transform twice and measure the ICP against an already-mapped row.
     return {"profiles": rows,
             "total": int(result.get("total") or len(rows))}
+
+
+
+# -----------------------------------------------------------------------------
+# contact.find, contact.phone, company.enrich and the two signals
+# -----------------------------------------------------------------------------
+#
+# What turns a search row into something you can actually send to is the
+# reveal, and that is where this router is furthest ahead. Measured prices,
+# against what this file pays today:
+#
+#   a work email    $0.01869, billed only on a match   $0.10 (ContactOut)
+#   a phone number  $0.21875, billed only on a hit     a Wiza credit
+#   firmographics   $0.007088                          2 Wiza credits
+#
+# "Billed only on a match" is doing real work here. Every other reveal leg in
+# this file costs something whether or not it finds the person, which is why
+# they are ordered by how likely they are to answer. This one can be tried on
+# a lead that will miss, for free.
+
+# contact.phone's waterfall is leadmagic $0.21875 -> apollo $0.378 ->
+# findymail $0.8575, and max_cost admits a route by its own quote. This cap
+# therefore pins it to the cheapest finder: a phone number is worth $0.22 to
+# this product, not $0.86, and without the cap a single reveal could cost more
+# than forty email lookups.
+ROUTERGROWTH_PHONE_MAX_COST = "0.25"
+
+# contact.find's routes are icypeas $0.01869 -> apollo $0.042 ->
+# leadmagic $0.04375 -> findymail $0.08575. The cap clears the first three:
+# an address that icypeas misses is still worth $0.044, and a miss is free
+# either way, so there is no reason to stop the waterfall at the cheapest.
+ROUTERGROWTH_FIND_MAX_COST = "0.05"
+
+ROUTERGROWTH_ENRICH_MAX_COST = "0.05"
+
+# company.jobs and company.technologies are per-company lookups, not filters,
+# so they can only ever be opt-in enrichment — a search cannot use them to
+# narrow a result set without paying per candidate.
+#
+# The cap is set off the MEASURED prices, which is the point: discover quotes
+# company.jobs from $0.0035, and the route that actually served it charged
+# $0.03675 — ten times the headline. A starting_price is the cheapest offer
+# that could run, not the one that will, so a cap written from the headline
+# would have refused the only live route. company.technologies charged $0.021,
+# matching its inspect price.
+ROUTERGROWTH_SIGNAL_MAX_COST = "0.05"
+
+
+def _rg_name_parts(full_name: str) -> tuple:
+    """(first, last) from a single name string, or (None, None).
+
+    contact.find requires both halves, so a mononym is not something it can be
+    asked about: sending an empty last_name would spend a lookup on a request
+    their schema rejects.
+    """
+    parts = [p for p in str(full_name or "").strip().split() if p]
+    if len(parts) < 2:
+        return None, None
+    return parts[0], " ".join(parts[1:])
+
+
+async def routergrowth_find_email(full_name: str, company_domain: str) -> dict:
+    """Find one work email. Returns {} when nothing was found.
+
+    A miss is free, so this is worth asking even for a lead the other legs
+    would not bother with.
+    """
+    first, last = _rg_name_parts(full_name)
+    host = domain_host(company_domain or "") or (company_domain or "")
+    if not (first and last and host):
+        return {}
+
+    ok, result = await routergrowth_run(
+        "contact.find",
+        {"first_name": first, "last_name": last, "company_domain": host},
+        max_cost=ROUTERGROWTH_FIND_MAX_COST)
+    email = (result or {}).get("email") if ok else None
+    if not email:
+        return {}
+
+    company = (result or {}).get("company") or {}
+    return {
+        "email": email,
+        # Their own deliverability word for the address they just found, which
+        # is why a lead revealed here still goes through verify_revealed_lead:
+        # one meaning for `sendable` across every provider, set in one place.
+        "email_status": (result or {}).get("status"),
+        "employment_verified": (result or {}).get("employment_verified"),
+        "company_name": company.get("name") if isinstance(company, dict) else None,
+        "mx_provider": (result or {}).get("mx_provider"),
+    }
+
+
+async def routergrowth_find_phone(email: str = None,
+                                  profile_url: str = None) -> dict:
+    """Find one phone number. Returns {} when nothing was found.
+
+    Never called unless the caller asked for a phone. At $0.21875 it is nearly
+    twelve times an email lookup, so it is the one reveal in this file that is
+    opt-in rather than part of the default path — a search that quietly added
+    it would multiply the cost of a page of leads.
+    """
+    payload = {}
+    if email:
+        payload["email"] = email
+    if profile_url:
+        payload["profile_url"] = profile_url
+    if not payload:
+        return {}
+
+    ok, result = await routergrowth_run("contact.phone", payload,
+                                        max_cost=ROUTERGROWTH_PHONE_MAX_COST)
+    phone = (result or {}).get("phone") if ok else None
+    if not phone:
+        return {}
+    return {"phone": phone,
+            "phone_type": (result or {}).get("type"),
+            "phone_confidence": (result or {}).get("confidence")}
+
+
+async def routergrowth_company_enrich(domain: str = None,
+                                      linkedin_url: str = None) -> dict:
+    """Firmographics for one company. Returns {} when it was not found."""
+    payload = {}
+    host = domain_host(domain or "") or (domain or "")
+    if host:
+        payload["domain"] = host
+    if linkedin_url:
+        payload["linkedin_url"] = linkedin_url
+    # Their schema requires the domain; a LinkedIn URL alone is not something
+    # this capability answers, so it is not asked.
+    if not payload.get("domain"):
+        return {}
+
+    ok, result = await routergrowth_run("company.enrich", payload,
+                                        max_cost=ROUTERGROWTH_ENRICH_MAX_COST)
+    return result if (ok and isinstance(result, dict)) else {}
+
+
+def transform_routergrowth_company(result: dict) -> dict:
+    """One company.enrich result in the shape /company/enrich returns.
+
+    Their payload nests the identity under `company` and lifts the
+    firmographics to the top level, so both are read rather than assuming one
+    shape.
+    """
+    result = result or {}
+    company = result.get("company") if isinstance(result.get("company"), dict) else {}
+    name = company.get("name") or result.get("name")
+    domain = company.get("domain") or result.get("domain")
+    location = result.get("location")
+    if isinstance(location, dict):
+        location = ", ".join(str(v) for v in
+                             (location.get("city"), location.get("country"))
+                             if v) or None
+
+    return {
+        "company_name": name,
+        "company_domain": domain_host(domain or "") or domain or None,
+        "industry": result.get("industry"),
+        "employee_count": result.get("employee_count"),
+        "employee_range": result.get("employee_range"),
+        "founded_year": result.get("founded"),
+        "annual_revenue": result.get("revenue"),
+        "funding": result.get("funding"),
+        "location": location,
+        "specialties": result.get("specialties"),
+        "competitors": result.get("competitors"),
+        "company_linkedin_url": company.get("linkedin_url")
+            or result.get("linkedin_url"),
+        "provider": "routergrowth",
+    }
+
+
+async def routergrowth_company_signals(domain: str, *, jobs: bool = False,
+                                       technologies: bool = False) -> dict:
+    """Hiring and technology signals for one company, each opt-in.
+
+    These are the two things this app has never been able to answer. Every
+    search leg here refuses a `technologies` filter outright, and nothing in
+    the file could say what a company is hiring for.
+
+    They stay opt-in because of what they are: per-company lookups, not
+    filters. Using either to narrow a search would mean paying for a lookup on
+    every candidate before knowing whether it qualifies, which is the opposite
+    of how the rest of this chain spends money.
+    """
+    host = domain_host(domain or "") or (domain or "")
+    if not host:
+        return {}
+
+    signals: dict = {}
+    if jobs:
+        ok, result = await routergrowth_run(
+            "company.jobs", {"domain": host},
+            max_cost=ROUTERGROWTH_SIGNAL_MAX_COST)
+        if ok and isinstance(result, dict):
+            openings = result.get("jobs")
+            signals["open_jobs"] = openings if isinstance(openings, list) else []
+            signals["open_jobs_count"] = (len(signals["open_jobs"])
+                                          if isinstance(openings, list) else None)
+    if technologies:
+        ok, result = await routergrowth_run(
+            "company.technologies", {"domain": host},
+            max_cost=ROUTERGROWTH_SIGNAL_MAX_COST)
+        if ok and isinstance(result, dict):
+            stack = (result.get("technologies") or result.get("stack"))
+            signals["technologies"] = stack if isinstance(stack, list) else []
+    return signals
+
+
+async def routergrowth_reveal(request) -> dict:
+    """Reveal one lead through RouterGrowth. Returns {} when nothing was found.
+
+    Email first, and a phone only when the caller asked: see
+    routergrowth_find_phone for why that one is not free to add.
+    """
+    contact = await routergrowth_find_email(request.full_name,
+                                            request.company_domain)
+    if not contact:
+        return {}
+
+    if getattr(request, "want_phone", False):
+        phone = await routergrowth_find_phone(
+            email=contact.get("email"), profile_url=request.linkedin_url)
+        contact.update(phone)
+    return contact
 
 
 # =============================================================================
@@ -9260,6 +9500,14 @@ class EnrichRequest(BaseModel):
     # resolve to a different person the way a name lookup can.
     bytemine_pid: Optional[str] = Field(
         default=None, validation_alias=AliasChoices("bytemine_pid", "pid"))
+    # Opt-in, because a phone is the dearest thing this app can buy: through
+    # RouterGrowth the cheapest finder is $0.21875 against $0.01869 for an
+    # email, so a page of leads that silently asked for phones would cost
+    # about twelve times one that did not. Providers that return a phone
+    # alongside the email they were already being paid for still do.
+    want_phone: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("want_phone", "include_phone", "phone"))
 
     model_config = {"populate_by_name": True}
 
@@ -9469,6 +9717,38 @@ async def reveal_lead(request: EnrichRequest):
     # LinkedIn URL or the name + company its search hands back. Reached whether
     # or not the lead came from ColdIQ — a reveal is about the person, not about
     # which index found them.
+    # RouterGrowth sits ahead of every leg that bills whether or not it finds
+    # the person: contact.find is charged only on a match, so trying it on a
+    # lead that will miss costs nothing. It sits *behind* the Bytemine PID
+    # unlock and the Crustdata LinkedIn lookup on purpose — those resolve the
+    # exact record that was shown, where a name-and-domain lookup could in
+    # principle land on a different person of the same name at the same
+    # company. Precision first, then price.
+    if "routergrowth" in chain and request.full_name and request.company_domain:
+        contact = await routergrowth_reveal(request)
+        if contact.get("email"):
+            lead = await verify_revealed_lead({
+                "contact_name": request.full_name,
+                "business_email": contact["email"],
+                "company_name": contact.get("company_name") or request.company,
+                "company_domain": request.company_domain,
+                "phone": contact.get("phone"),
+                "phone_type": classify_phone_type(contact.get("phone_type")),
+                "linkedin_url": request.linkedin_url,
+                # Their own word on whether the person still works there.
+                # Carried rather than acted on: this file flags a lead, it
+                # does not drop one.
+                "employment_verified": contact.get("employment_verified"),
+                "provider": "routergrowth",
+            }, "routergrowth")
+            return {
+                "success": True,
+                "provider": "routergrowth",
+                "enrichment_status": "complete",
+                "email_verification": lead["email_verification"],
+                "lead": lead,
+            }
+
     if "coldiq" in chain and (
         request.linkedin_url
         or request.email
@@ -11246,13 +11526,25 @@ class CompanyEnrichRequest(BaseModel):
 
 
 @app.post("/company/enrich")
-async def company_enrich(request: CompanyEnrichRequest):
+async def company_enrich(request: CompanyEnrichRequest, jobs: bool = False,
+                         technologies: bool = False):
     """
     Enrich / look up a single company by domain, name, or LinkedIn.
 
     This is the "domain search" — pass a company_domain (e.g. "stripe.com")
     and get back firmographics: industry, size, revenue, funding, location and
-    social profiles. Cache-first; each live lookup costs 2 Wiza API credits.
+    social profiles.
+
+    Two providers, cheapest first. RouterGrowth answers for $0.007088 and is
+    charged only when the company is found; Wiza costs 2 credits and is what
+    this endpoint used to have on its own — which mattered when Wiza stopped
+    answering and took /company/search down with it. RouterGrowth needs a
+    domain, so a lookup by name or LinkedIn alone still goes to Wiza.
+
+    `?jobs=true` and `?technologies=true` add signals this app has never been
+    able to answer: what a company is hiring for, and what it runs. Both are
+    opt-in because both are per-company lookups that cost money, and neither
+    can narrow a search — see routergrowth_company_signals.
     """
     payload = {k: v for k, v in request.model_dump().items() if v}
     if not payload:
@@ -11261,21 +11553,58 @@ async def company_enrich(request: CompanyEnrichRequest):
             detail="Provide one of: company_domain, company_name, company_linkedin_id, company_linkedin_slug",
         )
 
-    async def fetcher():
-        company = await wiza_company_enrich(payload)
-        return [company] if company else []
+    trace: list = []
 
-    raw, from_cache = await cached_or_fetch("company_enrich", payload, fetcher)
+    async def fetcher():
+        host = domain_host(request.company_domain or "") or request.company_domain
+        if routergrowth_configured() and host:
+            found = await routergrowth_company_enrich(
+                domain=host, linkedin_url=request.company_linkedin_slug)
+            if found:
+                trace.append({"provider": "routergrowth", "status": "ok"})
+                return [{"_provider": "routergrowth", "_raw": found}]
+            trace.append({"provider": "routergrowth", "status": "no match"})
+
+        if provider_configured("wiza"):
+            company = await wiza_company_enrich(payload)
+            if company:
+                trace.append({"provider": "wiza", "status": "ok"})
+                return [{"_provider": "wiza", "_raw": company}]
+            trace.append({"provider": "wiza", "status": "no match"})
+        return []
+
+    raw, from_cache = await cached_or_fetch("company_enrich_v2", payload, fetcher)
 
     if not raw:
         raise HTTPException(status_code=404, detail="No company data found")
+
+    entry = raw[0]
+    # Older cached rows predate the envelope and hold a bare Wiza payload.
+    # Reading them as one would hand back a company with every field empty.
+    if not isinstance(entry, dict) or "_provider" not in entry:
+        entry = {"_provider": "wiza", "_raw": entry}
+
+    served = entry.get("_provider")
+    body = entry.get("_raw") or {}
+    company = (transform_routergrowth_company(body) if served == "routergrowth"
+               else transform_wiza_company(body))
+
+    signals = {}
+    if jobs or technologies:
+        host = company.get("company_domain") or domain_host(
+            request.company_domain or "") or request.company_domain
+        signals = await routergrowth_company_signals(
+            host or "", jobs=jobs, technologies=technologies)
+        company.update(signals)
 
     return {
         "success": True,
         "source": "cache" if from_cache else "api",
         "from_cache": from_cache,
-        "company": transform_wiza_company(raw[0]),
-        "data": raw[0],
+        "provider": served,
+        "providers_tried": None if from_cache else trace,
+        "company": company,
+        "data": body,
     }
 
 
