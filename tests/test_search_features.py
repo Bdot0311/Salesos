@@ -760,9 +760,14 @@ class ProviderFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.count, 2)
         self.assertEqual(response.provider, "bytemine+crustdata")
 
-    async def test_a_later_leg_is_asked_only_for_the_shortfall(self):
-        # Several of these bill per record returned, so a leg topping up a page
-        # must not re-request the whole page.
+    async def test_a_later_leg_is_asked_for_its_share_not_the_whole_page(self):
+        """Several of these bill per record returned.
+
+        A leg topping up a page must never re-request the whole page, and it
+        is no longer asked for the entire shortfall either: the shortfall is
+        split across the legs still to come, so each one contributes instead of
+        the next one taking everything that is left.
+        """
         asked: list = []
 
         async def crustdata(params, limit, **kwargs):
@@ -778,7 +783,10 @@ class ProviderFallbackTests(unittest.IsolatedAsyncioTestCase):
                               "total": 2, "next_cursor": None}},
             )
 
-        self.assertEqual(asked, [3])
+        # Three configured legs, five wanted, two already in hand: the
+        # shortfall of three is split between crustdata and wiza.
+        self.assertEqual(asked, [2])
+        self.assertLess(asked[0], 5, "never the whole page")
 
     async def test_a_provider_with_nothing_does_not_decide_the_search(self):
         response, calls = await self.run_search(
@@ -9698,3 +9706,163 @@ class CompanyEnrichChainTests(unittest.TestCase):
         # And the cache key changed with the shape, so old and new rows cannot
         # be confused for one another in the first place.
         self.assertIn("company_enrich_v2", body)
+
+
+class EveryLegContributesTests(unittest.IsolatedAsyncioTestCase):
+    """The page is shared across the chain, not taken by whoever is first.
+
+    The defect this covers ran in production for weeks. The walk asked the
+    first leg for the whole page and stopped the moment it was full, so with
+    SEARCH_PROVIDER=bytemine and a limit of 10, Bytemine returned ten rows and
+    the other ten legs were never called. Every search was one index's answer
+    and the chain existed on paper only.
+    """
+
+    def _rows(self, provider, n):
+        """Rows carrying enough identity to survive the cross-provider dedupe.
+
+        _dedupe_key falls back to name plus company when it finds no LinkedIn
+        URL or email, and each provider's transform reads different raw keys —
+        so every plausible spelling is populated, uniquely per row. Without
+        that the fakes collapse into each other and a page that really was
+        drawn from three legs reads as one.
+        """
+        return [{"pid": f"{provider}-{i}",
+                 "first_name": f"{provider.title()}{i}",
+                 "last_name": f"Person{i}",
+                 "full_name": f"{provider.title()}{i} Person{i}",
+                 "name": f"{provider.title()}{i} Person{i}",
+                 "email": f"{provider}{i}@example.test",
+                 "company_name": f"{provider.title()} Co {i}",
+                 "linkedin": f"https://www.linkedin.com/in/{provider}-{i}",
+                 "linkedin_url": f"https://www.linkedin.com/in/{provider}-{i}"}
+                for i in range(n)]
+
+    async def _search(self, limit, supply):
+        """Run a search where each stubbed leg returns whatever it is asked for.
+
+        `supply` caps how many rows each leg actually has, so a leg can be made
+        to under-deliver and hand its share on.
+        """
+        asked: dict = {}
+
+        def stub(name):
+            async def run(params, want, **kwargs):
+                asked.setdefault(name, []).append(want)
+                rows = self._rows(name, min(want, supply.get(name, want)))
+                return {"profiles": rows, "total": len(rows),
+                        "next_cursor": None}
+            return run
+
+        async def no_cache(_hash, ttl_seconds=None):
+            return None
+
+        async def no_store(*args, **kwargs):
+            return None
+
+        # Three legs that take the same (params, want) shape. Wiza is left
+        # out and unconfigured on purpose: fetch_from_wiza takes no `want` at
+        # all, so it cannot show whether a share was honoured.
+        patches = [
+            patch.multiple(main.settings, bytemine_api_key="b",
+                           crustdata_api_key="c", enrichso_api_key="e",
+                           wiza_api_key=None, search_provider="bytemine"),
+            patch.object(main, "cache_lookup", no_cache),
+            patch.object(main, "cache_store", no_store),
+            patch.object(main, "bytemine_person_search", stub("bytemine")),
+            patch.object(main, "crustdata_person_search", stub("crustdata")),
+            patch.object(main, "enrichso_person_search", stub("enrichso")),
+        ]
+        for p in patches:
+            p.start()
+        try:
+            response = await main.search_leads(
+                main.SearchRequest(job_title="VP of Sales", location="CA",
+                                   limit=limit))
+        finally:
+            for p in patches:
+                p.stop()
+        return response, asked
+
+    async def test_the_first_leg_no_longer_takes_the_whole_page(self):
+        """The regression itself: a leg that could fill the page does not.
+
+        Bytemine here has more rows than the page needs, which is exactly the
+        case that used to end the search at the first provider.
+        """
+        _, asked = await self._search(9, supply={})
+
+        self.assertLess(asked["bytemine"][0], 9,
+                        "the first leg must not be asked for the whole page")
+        self.assertIn("crustdata", asked)
+        self.assertIn("enrichso", asked)
+
+    async def test_every_configured_leg_is_asked(self):
+        _, asked = await self._search(9, supply={})
+
+        self.assertEqual(sorted(asked), ["bytemine", "crustdata", "enrichso"])
+
+    async def test_the_shares_add_up_to_the_page(self):
+        """Allocation, not the merge.
+
+        What each leg is asked for is this change's contract. How many rows
+        survive afterwards is the dedupe's business, and synthetic rows from
+        three fake providers collapse into each other in ways real ones do
+        not — asserting on the final count here would be testing the fakes.
+        """
+        response, asked = await self._search(9, supply={})
+
+        self.assertEqual(sum(a[0] for a in asked.values()), 9)
+        contributed = {a["provider"]: a.get("count")
+                       for a in response.provider_attempts
+                       if a.get("outcome") == "results"}
+        self.assertEqual(contributed,
+                         {"bytemine": 3, "enrichso": 3, "crustdata": 3})
+
+    async def test_a_leg_with_nothing_hands_its_share_to_the_next(self):
+        """Self-correcting: an empty leg must not cost the page its rows."""
+        # Chain order is bytemine, enrichso, crustdata — the first two are
+        # emptied so the last one carries the whole page.
+        _, asked = await self._search(9, supply={"bytemine": 0, "enrichso": 0})
+
+        self.assertEqual(asked["bytemine"][0], 3)
+        self.assertEqual(asked["enrichso"][0], 5)
+        self.assertEqual(asked["crustdata"][0], 9)
+
+    async def test_a_leg_that_under_delivers_passes_the_remainder_on(self):
+        _, asked = await self._search(9, supply={"bytemine": 1})
+
+        self.assertEqual(asked["bytemine"][0], 3)
+        # Eight still missing across the two legs left: four each.
+        self.assertEqual(asked["enrichso"][0], 4)
+        self.assertEqual(asked["crustdata"][0], 4)
+
+    async def test_the_page_is_never_overfilled(self):
+        response, asked = await self._search(5, supply={})
+
+        self.assertLessEqual(response.count, 5)
+        self.assertLessEqual(sum(a[0] for a in asked.values()), 5)
+
+    async def test_a_page_smaller_than_the_chain_still_reaches_several_legs(self):
+        """A limit of 2 across three legs cannot reach all of them.
+
+        Each leg is asked for at least one, so the page fills at the second and
+        the walk stops — which is the one case where stopping early is right:
+        the page is genuinely complete.
+        """
+        response, asked = await self._search(2, supply={})
+
+        self.assertEqual(response.count, 2)
+        self.assertEqual(len(asked), 2)
+
+    async def test_the_merged_page_draws_on_more_than_one_provider(self):
+        """What the user actually sees: a page sourced from several indexes.
+
+        merge_provider_results already round-robins, so this only ever failed
+        because one leg supplied everything.
+        """
+        response, _ = await self._search(9, supply={})
+
+        contributing = {a["provider"] for a in response.provider_attempts
+                        if a.get("outcome") == "results"}
+        self.assertEqual(contributing, {"bytemine", "enrichso", "crustdata"})
