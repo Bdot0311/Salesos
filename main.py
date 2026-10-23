@@ -11112,6 +11112,33 @@ async def walk_search(request: SearchRequest):
     wanted = max(int(params.get("limit") or 10), 1)
     collected = 0
 
+    # Every configured leg gets a share of the page, rather than the first one
+    # that can fill it taking the lot.
+    #
+    # It used to ask each leg for the whole shortfall and stop the moment the
+    # page was full, which in production meant exactly one provider ran: with
+    # SEARCH_PROVIDER=bytemine and a limit of 10, Bytemine returned ten rows
+    # and the other ten legs were never called. Every search was one index's
+    # answer, and the chain existed on paper only.
+    #
+    # The share is recomputed at each leg from what is still missing and how
+    # many legs are left, so it self-corrects: a leg that returns nothing hands
+    # its share to the ones behind it, and a leg that fills its share leaves
+    # the rest of the chain something to do. If every leg delivers, the page
+    # completes exactly as the last one is asked.
+    #
+    # This is close to cost-neutral where it matters. The legs billed per row
+    # returned — ContactOut, GetLeads, Fiber, Findymail — charge for the same
+    # number of rows whether they come from one provider or six; what spreads
+    # them adds is each leg's per-call base, which is cents at most. What it
+    # buys is a page drawn from several indexes instead of whichever one
+    # happens to be first.
+    def share_for(position: int, collected: int) -> int:
+        """This leg's slice of what the page is still missing."""
+        shortfall = wanted - collected
+        legs_left = max(len(chain) - position, 1)
+        return max(1, -(-shortfall // legs_left))
+
     for position, name in enumerate(chain):
         # A leg that has not started yet is the cheapest thing to give up. The
         # gateway will abandon the whole request shortly after this, taking the
@@ -11133,7 +11160,8 @@ async def walk_search(request: SearchRequest):
         try:
             for _ in range(len(ICP_ENFORCEABLE) + 1):
                 try:
-                    outcome = await run_provider(name, wanted - collected,
+                    outcome = await run_provider(name,
+                                                 share_for(position, collected),
                                                  frozenset(skip_fields))
                     break
                 except ProviderUnsupported as unsupported:
@@ -11181,15 +11209,24 @@ async def walk_search(request: SearchRequest):
             buckets.append({"provider": name, "profiles": found,
                             "total": provider_total, "next_cursor": provider_cursor})
         collected += len(found)
+        # Only a page that is already full ends the walk, and a leg can only
+        # overfill it by returning more than its share. Reaching the target is
+        # not itself a reason to stop asking: that was the old behaviour, and
+        # it is why the chain never ran past its first leg.
         if collected >= wanted:
+            if position + 1 < len(chain):
+                print(f"{name} completed the page at {collected}/{wanted} — "
+                      f"{len(chain) - position - 1} leg(s) not needed")
             break
         if found and position + 1 < len(chain):
-            print(f"{name} filled {collected}/{wanted} — continuing the chain "
-                  f"for {wanted - collected} more")
+            print(f"{name} contributed {len(found)} ({collected}/{wanted}) — "
+                  f"next leg is asked for "
+                  f"{share_for(position + 1, collected)}")
         elif found:
             # The last leg. "Continuing the chain" here was a line the logs told
             # you on every partial Wiza page, with nothing left to continue to.
-            print(f"{name} filled {collected}/{wanted} — end of the chain")
+            print(f"{name} contributed {len(found)} ({collected}/{wanted}) — "
+                  "end of the chain")
 
     # Nothing ran at all. Distinguish the two ways that happens: every provider
     # refused the filter, or every provider errored. An empty success would
