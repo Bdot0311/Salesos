@@ -88,6 +88,16 @@ class Settings(BaseSettings):
     # the router catalog. Falls back to BILLING_ADMIN_KEY, so a deployment that
     # already set one is protected without adding a variable.
     admin_api_key: Optional[str] = None
+    # Keys accepted on the product endpoints, comma-separated so a new one can
+    # be rotated in alongside the old without a window where neither works.
+    #
+    # UNSET MEANS OPEN, and that is deliberate — see require_api_access. It is
+    # the opposite default from the operator endpoints, for a reason explained
+    # there.
+    api_access_keys: Optional[str] = None
+    # Browser origins allowed to call this API, comma-separated. Unset keeps
+    # the wildcard, but without credentials — see the CORS block.
+    cors_allowed_origins: Optional[str] = None
     search_provider: str = "bytemine"
     # ICP parsing is rule-based by default (no API credits needed). Set
     # USE_LLM_PARSER=true (with ANTHROPIC_API_KEY) to also run the LLM and let it
@@ -9199,10 +9209,30 @@ app = FastAPI(
     version="6.0.0"
 )
 
+# Browser origins allowed to call this API.
+#
+# It was allow_origins=["*"] with allow_credentials=True, which is not the
+# permissive-but-harmless setting it looks like. Starlette cannot send a
+# literal "*" alongside credentials — the spec forbids it — so it echoes the
+# requesting Origin back instead. The effect is not a wildcard: it is every
+# origin individually allowed, *with* credentials, so any page on the web
+# could make credentialed requests to this API and read the replies.
+#
+# Unset, this now keeps the wildcard but drops credentials, which is the form
+# the spec actually permits and which no longer blesses arbitrary origins.
+# Setting CORS_ALLOWED_ORIGINS to the frontend's origins narrows it to those
+# and restores credentials for them.
+#
+# Worth being honest about the limit: CORS is enforced by browsers and by
+# nothing else. It stops a hostile page from reading this API in someone's
+# browser; it does not stop a direct request from curl or a script. The thing
+# that stops that is require_api_access.
+_cors_origins = [o.strip() for o in (settings.cors_allowed_origins or "").split(",")
+                 if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=_cors_origins or ["*"],
+    allow_credentials=bool(_cors_origins),
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -9283,6 +9313,56 @@ def require_billing_admin(provided: Optional[str]) -> None:
         raise HTTPException(status_code=503, detail="Billing administration is not configured")
     if not provided or not hmac.compare_digest(provided, settings.billing_admin_key):
         raise HTTPException(status_code=401, detail="Invalid billing admin key")
+
+
+def _accepted_api_keys() -> list:
+    """The client keys currently accepted, in configuration order."""
+    raw = settings.api_access_keys or ""
+    return [k.strip() for k in raw.split(",") if k.strip()]
+
+
+def require_api_access(provided: Optional[str],
+                       bearer: Optional[str] = None) -> None:
+    """Gate a product endpoint on a client key, when one is configured.
+
+    UNSET MEANS OPEN, which is the opposite of require_operator, and the
+    difference is deliberate rather than an inconsistency.
+
+    The operator endpoints had no legitimate caller — the frontend never
+    touched them — so locking them by default broke nothing and closed a live
+    leak of the contact database. These endpoints are the product: the
+    frontend calls every one of them. Defaulting them closed would take the
+    app down the moment this deployed, and an outage is not a security
+    improvement.
+
+    So enforcement turns on when API_ACCESS_KEYS is set, which lets the key be
+    added to Railway and to the frontend together, with no window where the
+    app is broken. Until then these stay as open as they are today — and what
+    that costs is worth stating plainly: anyone who knows the URL can spend
+    the account's provider credits through /search and /enrich.
+
+    Several keys are accepted at once so one can be rotated out while the
+    other is still live.
+    """
+    accepted = _accepted_api_keys()
+    if not accepted:
+        return
+
+    candidates = []
+    if provided:
+        candidates.append(provided)
+    if bearer and bearer.lower().startswith("bearer "):
+        candidates.append(bearer[7:].strip())
+
+    for candidate in candidates:
+        for key in accepted:
+            # compare_digest on every pair rather than returning on the first
+            # match, so the time taken does not depend on which key matched.
+            if hmac.compare_digest(candidate, key):
+                return
+    raise HTTPException(
+        status_code=401,
+        detail="Missing or invalid API key. Send it as X-API-Key.")
 
 
 def require_operator(provided: Optional[str]) -> None:
@@ -9459,7 +9539,11 @@ VERIFY_DEADLINE_SECONDS = 90
 
 
 @app.post("/verify")
-async def verify_emails(request: VerifyRequest):
+async def verify_emails(
+    request: VerifyRequest,
+    x_api_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+):
     """Verify addresses through the same waterfall a reveal uses.
 
     Returns `{"results": {address: verdict}}` — keyed, not positional. ColdIQ's
@@ -9472,6 +9556,7 @@ async def verify_emails(request: VerifyRequest):
     rather than as clean — the caller decides what to do with an unproven
     mailbox, and it should get to decide knowing that is what it has.
     """
+    require_api_access(x_api_key, authorization)
     addresses = list(request.emails or [])
     if request.email:
         addresses.append(request.email)
@@ -9605,13 +9690,18 @@ def enrich_identity_key(request: EnrichRequest) -> str:
 
 
 @app.post("/enrich")
-async def enrich_lead(request: EnrichRequest):
+async def enrich_lead(
+    request: EnrichRequest,
+    x_api_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+):
     """Reveal one lead once, and remember the answer.
 
     Concurrent duplicates share the first reveal; a repeat minutes later is
     served from the reveal ledger. Both are the same question, and every
     provider on this path bills per answer.
     """
+    require_api_access(x_api_key, authorization)
     key = enrich_identity_key(request)
 
     stored = await cache_lookup(key, REVEAL_CACHE_TTL_SECONDS)
@@ -10121,7 +10211,11 @@ Return only the JSON object, no explanation, no markdown fences."""
 
 
 @app.post("/parse-icp")
-async def parse_icp(request: ICPParseRequest):
+async def parse_icp(
+    request: ICPParseRequest,
+    x_api_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+):
     """Parse a plain-English ICP description into structured Wiza search filters.
 
     Rule-based by default — deterministic, instant, and free (no API credits).
@@ -10129,6 +10223,7 @@ async def parse_icp(request: ICPParseRequest):
     and fills any fields the rules didn't capture; if it errors (e.g. no credits)
     the rule-based result is used unchanged.
     """
+    require_api_access(x_api_key, authorization)
     filters = heuristic_parse_icp(request.text)
 
     if settings.use_llm_parser and settings.anthropic_api_key:
@@ -10374,7 +10469,11 @@ _search_locks: dict[str, list] = {}
 
 
 @app.post("/search", response_model=SearchResponse)
-async def search_leads(request: SearchRequest):
+async def search_leads(
+    request: SearchRequest,
+    x_api_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+):
     """Answer duplicate in-flight searches once, and share the answer.
 
     The waiter is handed the first request's response rather than running its
@@ -10387,6 +10486,7 @@ async def search_leads(request: SearchRequest):
     The entry lives only while a request is in flight or waiting on it, so this
     is a duplicate window, not a second cache.
     """
+    require_api_access(x_api_key, authorization)
     key = hashlib.sha256(
         json.dumps(request.model_dump(), sort_keys=True, default=str).encode()
     ).hexdigest()
@@ -11349,7 +11449,11 @@ async def walk_search(request: SearchRequest):
 # =============================================================================
 
 @app.post("/prospects/preview")
-async def prospects_preview(request: SearchRequest):
+async def prospects_preview(
+    request: SearchRequest,
+    x_api_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+):
     """
     Fast contact preview via Wiza /prospects/search.
 
@@ -11357,6 +11461,7 @@ async def prospects_preview(request: SearchRequest):
     profiles — instantly and without spending email/enrichment credits. Use
     this to size an audience before committing to a full /search enrichment.
     """
+    require_api_access(x_api_key, authorization)
     params = await resolve_search_params(request)
     prov = active_provider()
     size = max(min(request.limit or 10, 30), 0)
@@ -11404,7 +11509,13 @@ async def prospects_preview(request: SearchRequest):
 # =============================================================================
 
 @app.post("/company/search")
-async def company_search(request: SearchRequest, enrich: bool = True, enrich_limit: int = 25):
+async def company_search(
+    request: SearchRequest,
+    enrich: bool = True,
+    enrich_limit: int = 25,
+    x_api_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+):
     """
     Search for companies (not just people) via Wiza /prospects/search.
 
@@ -11417,6 +11528,7 @@ async def company_search(request: SearchRequest, enrich: bool = True, enrich_lim
     That costs 2 API credits per company, capped at `enrich_limit` companies
     (top matches first). Pass `?enrich=false` to skip enrichment (0 credits).
     """
+    require_api_access(x_api_key, authorization)
     params = await resolve_search_params(request)
     prov = active_provider()
     # Pull the max preview window so we can dedupe as many companies as possible
@@ -11603,8 +11715,13 @@ class CompanyEnrichRequest(BaseModel):
 
 
 @app.post("/company/enrich")
-async def company_enrich(request: CompanyEnrichRequest, jobs: bool = False,
-                         technologies: bool = False):
+async def company_enrich(
+    request: CompanyEnrichRequest,
+    jobs: bool = False,
+    technologies: bool = False,
+    x_api_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+):
     """
     Enrich / look up a single company by domain, name, or LinkedIn.
 
@@ -11623,6 +11740,7 @@ async def company_enrich(request: CompanyEnrichRequest, jobs: bool = False,
     opt-in because both are per-company lookups that cost money, and neither
     can narrow a search — see routergrowth_company_signals.
     """
+    require_api_access(x_api_key, authorization)
     payload = {k: v for k, v in request.model_dump().items() if v}
     if not payload:
         raise HTTPException(
