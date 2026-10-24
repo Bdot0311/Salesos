@@ -84,6 +84,10 @@ class Settings(BaseSettings):
     # intentionally separate from TREG_TOKEN so callers never receive treg's
     # credential or team-level balance details.
     billing_admin_key: Optional[str] = None
+    # Gates the operator endpoints: the cache dumps, the diagnostics probes and
+    # the router catalog. Falls back to BILLING_ADMIN_KEY, so a deployment that
+    # already set one is protected without adding a variable.
+    admin_api_key: Optional[str] = None
     search_provider: str = "bytemine"
     # ICP parsing is rule-based by default (no API credits needed). Set
     # USE_LLM_PARSER=true (with ANTHROPIC_API_KEY) to also run the LLM and let it
@@ -9281,6 +9285,42 @@ def require_billing_admin(provided: Optional[str]) -> None:
         raise HTTPException(status_code=401, detail="Invalid billing admin key")
 
 
+def require_operator(provided: Optional[str]) -> None:
+    """Gate an operator-only endpoint on the admin key.
+
+    Fails CLOSED. With no key configured these endpoints answer 503 rather
+    than serving whoever asks, and that is the point: they were public, and an
+    unset environment variable must not be the thing that keeps them public.
+
+    They are operator tools — the frontend calls none of them — so locking
+    them costs the product nothing. What leaving them open cost was concrete,
+    and was measured against the live service rather than imagined:
+
+      GET /debug returned 1,222 cached searches to an unauthenticated caller.
+      Every cached lead in them carries full_name, work_email, personal_emails,
+      mobile_phone, phone_numbers, birth_date, education and experience. That
+      is the whole contact database, served to anyone who knows the URL.
+
+      GET /monid/catalog returned the account's email address, username,
+      workspace id, API-key fingerprint and key scopes.
+
+      DELETE /cache, DELETE /cache/empty and DELETE /campaigns/{id}/seen let
+      any caller destroy the cache and the repeat-lead ledgers.
+
+      GET and POST /diagnostics/provider-filters run real provider searches,
+      so an unauthenticated caller could spend the account's credits at will.
+    """
+    expected = settings.admin_api_key or settings.billing_admin_key
+    if not expected:
+        raise HTTPException(
+            status_code=503,
+            detail=("Operator endpoints are disabled. Set ADMIN_API_KEY (or "
+                    "BILLING_ADMIN_KEY) and send it in the X-Admin-Key "
+                    "header."))
+    if not provided or not hmac.compare_digest(provided, expected):
+        raise HTTPException(status_code=401, detail="Invalid admin key")
+
+
 def require_treg_billing_config() -> None:
     if not settings.treg_token or not settings.treg_org_id:
         raise HTTPException(status_code=503, detail="Treg billing is not configured")
@@ -11661,8 +11701,12 @@ def _is_crustdata_profile(value: dict) -> bool:
 
 
 @app.delete("/campaigns/{campaign_id}/seen")
-async def clear_campaign_seen(campaign_id: str):
+async def clear_campaign_seen(
+    campaign_id: str,
+    x_admin_key: Optional[str] = Header(default=None),
+):
     """Reset a campaign's dedupe ledger so its leads may be surfaced again."""
+    require_operator(x_admin_key)
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", campaign_id):
         raise HTTPException(status_code=422, detail="Invalid campaign_id")
     async with async_session() as session:
@@ -11673,7 +11717,8 @@ async def clear_campaign_seen(campaign_id: str):
     return {"campaign_id": campaign_id, "deleted": result.rowcount or 0}
 
 @app.delete("/cache")
-async def clear_cache():
+async def clear_cache(x_admin_key: Optional[str] = Header(default=None)):
+    require_operator(x_admin_key)
     async with async_session() as session:
         await session.execute(CachedSearch.__table__.delete())
         await session.commit()
@@ -11681,7 +11726,8 @@ async def clear_cache():
 
 
 @app.delete("/cache/empty")
-async def clear_empty_cache():
+async def clear_empty_cache(x_admin_key: Optional[str] = Header(default=None)):
+    require_operator(x_admin_key)
     async with async_session() as session:
         all_cached = (await session.execute(select(CachedSearch))).scalars().all()
         deleted = sum(1 for c in all_cached if len(_cached_items(json.loads(c.results))) == 0)
@@ -11693,7 +11739,8 @@ async def clear_empty_cache():
 
 
 @app.get("/cache/stats")
-async def cache_stats():
+async def cache_stats(x_admin_key: Optional[str] = Header(default=None)):
+    require_operator(x_admin_key)
     async with async_session() as session:
         from sqlalchemy import func, desc
         count = (await session.execute(select(func.count()).select_from(CachedSearch))).scalar()
@@ -11716,8 +11763,9 @@ async def cache_stats():
 
 
 @app.get("/cache/all")
-async def get_all_cached_leads():
+async def get_all_cached_leads(x_admin_key: Optional[str] = Header(default=None)):
     """Retrieve all cached leads (fallback when Wiza credits are exhausted)."""
+    require_operator(x_admin_key)
     async with async_session() as session:
         all_cached = (await session.execute(
             select(CachedSearch).order_by(CachedSearch.created_at.desc())
@@ -11747,7 +11795,11 @@ async def get_all_cached_leads():
 
 
 @app.get("/cache/search/{search_hash}")
-async def get_cached_search(search_hash: str):
+async def get_cached_search(
+    search_hash: str,
+    x_admin_key: Optional[str] = Header(default=None),
+):
+    require_operator(x_admin_key)
     async with async_session() as session:
         cached = (await session.execute(
             select(CachedSearch).where(CachedSearch.search_hash == search_hash)
@@ -11772,7 +11824,8 @@ async def get_cached_search(search_hash: str):
 
 
 @app.get("/debug")
-async def debug_info():
+async def debug_info(x_admin_key: Optional[str] = Header(default=None)):
+    require_operator(x_admin_key)
     async with async_session() as session:
         all_cached = (await session.execute(select(CachedSearch))).scalars().all()
         return {
@@ -11900,7 +11953,11 @@ def _monid_said(payload) -> Optional[str]:
 
 
 @app.get("/monid/catalog")
-async def monid_catalog(query: str = None, limit: int = 10):
+async def monid_catalog(
+    query: str = None,
+    limit: int = 10,
+    x_admin_key: Optional[str] = Header(default=None),
+):
     """What the Monid gateway actually holds, read off the gateway itself.
 
     This exists because the tool table in this file could not be verified
@@ -11919,6 +11976,7 @@ async def monid_catalog(query: str = None, limit: int = 10):
     `inspect` and `discover` are both free, per their own pricing, so this
     costs nothing to run.
     """
+    require_operator(x_admin_key)
     if not monid_configured():
         return {"configured": False,
                 "detail": "MONID_API_KEY is not set, so the gateway cannot be "
@@ -12043,6 +12101,7 @@ async def monid_catalog(query: str = None, limit: int = 10):
 
 @app.get("/diagnostics/provider-filters")
 async def diagnose_provider_filters_from_url(
+    x_admin_key: Optional[str] = Header(default=None),
     query: str = None,
     job_title: str = None,
     industry: str = None,
@@ -12057,14 +12116,19 @@ async def diagnose_provider_filters_from_url(
     diagnose anything: this is meant to be pasted into a URL bar by whoever is
     watching the logs, without a terminal or an HTTP client in the way.
     """
+    require_operator(x_admin_key)
+    # Already authorised above; the delegate re-checks the same key.
     return await diagnose_provider_filters(SearchRequest(
         query=query, job_title=job_title, industry=industry,
         company_size=company_size, location=location, seniority=seniority,
-        keywords=keywords))
+        keywords=keywords), x_admin_key)
 
 
 @app.post("/diagnostics/provider-filters")
-async def diagnose_provider_filters(request: SearchRequest):
+async def diagnose_provider_filters(
+    request: SearchRequest,
+    x_admin_key: Optional[str] = Header(default=None),
+):
     """Find which filter empties a provider's search.
 
     Send the ICP that returns nothing. Each provider is searched with the first
@@ -12075,6 +12139,7 @@ async def diagnose_provider_filters(request: SearchRequest):
     the whole integration rather than one field, which is just as useful to
     know and is not something the request body can tell us.
     """
+    require_operator(x_admin_key)
     params = await resolve_search_params(request)
     present = [f for f in DIAGNOSTIC_FILTER_ORDER if params.get(f)]
     if not present:
@@ -12219,12 +12284,16 @@ async def probe_crustdata_shape(filters: dict) -> dict:
 
 
 @app.get("/diagnostics/provider-shapes")
-async def diagnose_provider_shapes(job_title: str = "Founder"):
+async def diagnose_provider_shapes(
+    job_title: str = "Founder",
+    x_admin_key: Optional[str] = Header(default=None),
+):
     """Vary the request shape, not the ICP, and report what each one finds.
 
     Reachable from a browser for the same reason the filter probe is: the
     person who needs the answer is the one reading the logs.
     """
+    require_operator(x_admin_key)
     report: dict = {}
 
     if provider_configured("bytemine"):

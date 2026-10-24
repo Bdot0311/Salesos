@@ -4525,7 +4525,11 @@ class ProviderFilterDiagnosticTests(unittest.IsolatedAsyncioTestCase):
         for p in patches:
             p.start()
         try:
-            return await main.diagnose_provider_filters(request)
+            # The diagnostics endpoints are operator-only now: they run real
+            # provider searches, so an unauthenticated caller could spend the
+            # account's credits. The probe harness authorises itself.
+            with patch.multiple(main.settings, admin_api_key="op-key"):
+                return await main.diagnose_provider_filters(request, "op-key")
         finally:
             for p in patches:
                 p.stop()
@@ -4610,8 +4614,10 @@ class ProviderFilterDiagnosticTests(unittest.IsolatedAsyncioTestCase):
         for p in patches:
             p.start()
         try:
-            report = await main.diagnose_provider_filters_from_url(
-                job_title="Founder", industry="computer software")
+            with patch.multiple(main.settings, admin_api_key="op-key"):
+                report = await main.diagnose_provider_filters_from_url(
+                    "op-key", job_title="Founder",
+                    industry="computer software")
         finally:
             for p in patches:
                 p.stop()
@@ -4704,7 +4710,9 @@ class ProviderShapeProbeTests(unittest.IsolatedAsyncioTestCase):
         for p in patches:
             p.start()
         try:
-            return await main.diagnose_provider_shapes()
+            with patch.multiple(main.settings, admin_api_key="op-key"):
+                return await main.diagnose_provider_shapes(
+                    x_admin_key="op-key")
         finally:
             for p in patches:
                 p.stop()
@@ -9866,3 +9874,119 @@ class EveryLegContributesTests(unittest.IsolatedAsyncioTestCase):
         contributing = {a["provider"] for a in response.provider_attempts
                         if a.get("outcome") == "results"}
         self.assertEqual(contributing, {"bytemine", "enrichso", "crustdata"})
+
+
+class OperatorEndpointsAreGatedTests(unittest.IsolatedAsyncioTestCase):
+    """The operator endpoints were public. These are what they exposed.
+
+    Measured against the live service, unauthenticated:
+
+      GET /debug returned 1,222 cached searches. Every cached lead carries
+      full_name, work_email, personal_emails, mobile_phone, phone_numbers,
+      birth_date, education and experience — the whole contact database.
+
+      GET /monid/catalog returned the account's email, username, workspace id,
+      API-key fingerprint and key scopes.
+
+      DELETE /cache, /cache/empty and /campaigns/{id}/seen let any caller
+      destroy the cache and the repeat-lead ledgers.
+
+      /diagnostics/provider-filters runs real provider searches, so a caller
+      could spend the account's credits at will.
+
+    None of them is product surface: the frontend calls none of them.
+    """
+
+    OPERATOR_ENDPOINTS = (
+        "debug_info", "cache_stats", "get_all_cached_leads",
+        "get_cached_search", "clear_cache", "clear_empty_cache",
+        "clear_campaign_seen", "monid_catalog",
+        "diagnose_provider_filters", "diagnose_provider_filters_from_url",
+        "diagnose_provider_shapes",
+    )
+
+    def test_every_operator_endpoint_asks_for_the_key(self):
+        """Source inspection, so a newly added one cannot quietly skip it."""
+        import inspect
+
+        for name in self.OPERATOR_ENDPOINTS:
+            fn = getattr(main, name)
+            source = inspect.getsource(fn)
+            self.assertIn("x_admin_key", source, name)
+            self.assertIn("require_operator(x_admin_key)", source, name)
+
+    def test_the_key_is_compared_in_constant_time(self):
+        import inspect
+
+        source = inspect.getsource(main.require_operator)
+        self.assertIn("hmac.compare_digest", source)
+        # A plain == would leak the key a byte at a time to a patient caller.
+        self.assertNotIn("provided ==", source)
+
+    def test_no_key_configured_closes_the_endpoint_rather_than_opening_it(self):
+        """Fails closed, which is the whole point.
+
+        An unset environment variable must not be the thing that keeps these
+        public — that is how they came to be public in the first place.
+        """
+        with patch.multiple(main.settings, admin_api_key=None,
+                            billing_admin_key=None):
+            with self.assertRaises(HTTPException) as caught:
+                main.require_operator("anything")
+
+        self.assertEqual(caught.exception.status_code, 503)
+        self.assertIn("ADMIN_API_KEY", caught.exception.detail)
+
+    def test_a_missing_or_wrong_key_is_rejected(self):
+        with patch.multiple(main.settings, admin_api_key="right",
+                            billing_admin_key=None):
+            for provided in (None, "", "wrong", "righ", "rightt"):
+                with self.assertRaises(HTTPException) as caught:
+                    main.require_operator(provided)
+                self.assertEqual(caught.exception.status_code, 401, provided)
+
+    def test_the_right_key_is_accepted(self):
+        with patch.multiple(main.settings, admin_api_key="right",
+                            billing_admin_key=None):
+            self.assertIsNone(main.require_operator("right"))
+
+    def test_the_billing_key_still_works_as_a_fallback(self):
+        # So a deployment that already set BILLING_ADMIN_KEY is protected
+        # without having to add a second variable first.
+        with patch.multiple(main.settings, admin_api_key=None,
+                            billing_admin_key="billing"):
+            self.assertIsNone(main.require_operator("billing"))
+
+    async def test_the_debug_dump_refuses_an_unauthenticated_caller(self):
+        """End to end on the endpoint that leaked the contact database."""
+        with patch.multiple(main.settings, admin_api_key="op",
+                            billing_admin_key=None):
+            with self.assertRaises(HTTPException) as caught:
+                await main.debug_info(x_admin_key=None)
+
+        self.assertEqual(caught.exception.status_code, 401)
+
+    async def test_the_cache_cannot_be_wiped_by_an_unauthenticated_caller(self):
+        with patch.multiple(main.settings, admin_api_key="op",
+                            billing_admin_key=None):
+            for call in (main.clear_cache(x_admin_key=None),
+                         main.clear_empty_cache(x_admin_key=None)):
+                with self.assertRaises(HTTPException) as caught:
+                    await call
+                self.assertEqual(caught.exception.status_code, 401)
+
+    def test_the_product_endpoints_are_deliberately_not_gated(self):
+        """The frontend calls these, so gating them here would break the app.
+
+        That they remain open is a known exposure, not an oversight: anyone
+        who knows the URL can spend the account's provider credits through
+        them. Closing it needs a key in the frontend too, which is a
+        coordinated change rather than one this test should force.
+        """
+        import inspect
+
+        for name in ("search_leads", "enrich_lead", "verify_emails",
+                     "company_search", "company_enrich"):
+            fn = getattr(main, name)
+            self.assertNotIn("require_operator",
+                             inspect.getsource(fn), name)
