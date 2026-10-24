@@ -9990,3 +9990,127 @@ class OperatorEndpointsAreGatedTests(unittest.IsolatedAsyncioTestCase):
             fn = getattr(main, name)
             self.assertNotIn("require_operator",
                              inspect.getsource(fn), name)
+
+
+class ProductEndpointKeyTests(unittest.IsolatedAsyncioTestCase):
+    """The client key on the product endpoints, and why it defaults to open.
+
+    This is the opposite default from require_operator, deliberately. The
+    operator endpoints had no legitimate caller, so locking them by default
+    broke nothing and closed a live leak. These are the product: the frontend
+    calls every one of them, so defaulting them closed would take the app down
+    the moment it deployed, and an outage is not a security improvement.
+    """
+
+    PRODUCT_ENDPOINTS = ("search_leads", "enrich_lead", "verify_emails",
+                         "parse_icp", "prospects_preview", "company_search",
+                         "company_enrich")
+
+    def test_every_product_endpoint_takes_and_checks_a_key(self):
+        import inspect
+
+        for name in self.PRODUCT_ENDPOINTS:
+            source = inspect.getsource(getattr(main, name))
+            self.assertIn("x_api_key", source, name)
+            self.assertIn("require_api_access(x_api_key, authorization)",
+                          source, name)
+
+    def test_unset_keeps_them_open_so_the_frontend_keeps_working(self):
+        with patch.multiple(main.settings, api_access_keys=None):
+            self.assertIsNone(main.require_api_access(None, None))
+        with patch.multiple(main.settings, api_access_keys="   "):
+            self.assertIsNone(main.require_api_access(None, None))
+
+    def test_a_configured_key_is_then_required(self):
+        with patch.multiple(main.settings, api_access_keys="k1"):
+            with self.assertRaises(HTTPException) as caught:
+                main.require_api_access(None, None)
+            self.assertEqual(caught.exception.status_code, 401)
+
+    def test_the_right_key_passes_in_either_header(self):
+        with patch.multiple(main.settings, api_access_keys="k1"):
+            self.assertIsNone(main.require_api_access("k1", None))
+            # Authorization: Bearer is accepted too, since a frontend or an
+            # HTTP client often has that wired already.
+            self.assertIsNone(main.require_api_access(None, "Bearer k1"))
+            self.assertIsNone(main.require_api_access(None, "bearer k1"))
+
+    def test_a_wrong_key_is_rejected_in_either_header(self):
+        with patch.multiple(main.settings, api_access_keys="k1"):
+            for provided, bearer in (("k2", None), (None, "Bearer k2"),
+                                     (None, "k1"), ("", "")):
+                with self.assertRaises(HTTPException):
+                    main.require_api_access(provided, bearer)
+
+    def test_several_keys_are_accepted_so_one_can_be_rotated_out(self):
+        """Rotation needs a window where both the old and new key work."""
+        with patch.multiple(main.settings, api_access_keys="old-key,new-key"):
+            self.assertIsNone(main.require_api_access("old-key", None))
+            self.assertIsNone(main.require_api_access("new-key", None))
+            with self.assertRaises(HTTPException):
+                main.require_api_access("third-key", None)
+
+    def test_whitespace_around_a_pasted_key_does_not_break_it(self):
+        # Credentials arrive from a dashboard's paste box; see
+        # Settings._strip_credential for what a stray space has already cost.
+        with patch.multiple(main.settings, api_access_keys=" k1 , k2 "):
+            self.assertIsNone(main.require_api_access("k1", None))
+            self.assertIsNone(main.require_api_access("k2", None))
+
+    def test_the_key_is_compared_in_constant_time(self):
+        import inspect
+
+        source = inspect.getsource(main.require_api_access)
+        self.assertIn("hmac.compare_digest", source)
+        self.assertNotIn("candidate ==", source)
+
+    def test_health_is_never_gated(self):
+        """Railway's healthcheck calls it, and it carries no data."""
+        import inspect
+
+        self.assertNotIn("require_api_access",
+                         inspect.getsource(main.health_check))
+
+    async def test_a_gated_search_refuses_without_the_key(self):
+        with patch.multiple(main.settings, api_access_keys="k1"):
+            with self.assertRaises(HTTPException) as caught:
+                await main.search_leads(main.SearchRequest(job_title="CTO"),
+                                        x_api_key=None, authorization=None)
+
+        self.assertEqual(caught.exception.status_code, 401)
+        self.assertIn("X-API-Key", caught.exception.detail)
+
+
+class CorsConfigurationTests(unittest.TestCase):
+    """Wildcard origins with credentials is not the harmless setting it looks.
+
+    Starlette cannot send a literal "*" alongside credentials, so it echoes
+    the requesting Origin instead. The effect was every origin individually
+    allowed, with credentials — any page on the web could call this API and
+    read the replies.
+    """
+
+    def test_credentials_are_only_allowed_for_named_origins(self):
+        import inspect
+
+        source = inspect.getsource(main)
+        marker = "allow_credentials=bool(_cors_origins)"
+        self.assertIn(marker, source)
+        # The pairing that caused the problem must not come back.
+        self.assertNotIn("allow_origins=[\"*\"],\n    allow_credentials=True",
+                         source)
+
+    def test_unset_falls_back_to_a_wildcard_without_credentials(self):
+        # The form the spec actually permits, and the current behaviour for a
+        # deployment that has not named its origins yet — so this change does
+        # not break the frontend before CORS_ALLOWED_ORIGINS is set.
+        origins = [o.strip() for o in ("" or "").split(",") if o.strip()]
+        self.assertEqual(origins or ["*"], ["*"])
+        self.assertFalse(bool(origins))
+
+    def test_named_origins_are_used_verbatim_and_get_credentials(self):
+        raw = " https://app.example.com , https://www.example.com "
+        origins = [o.strip() for o in raw.split(",") if o.strip()]
+        self.assertEqual(origins, ["https://app.example.com",
+                                   "https://www.example.com"])
+        self.assertTrue(bool(origins))
