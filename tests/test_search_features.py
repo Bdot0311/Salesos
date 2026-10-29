@@ -193,6 +193,20 @@ class ProviderStateTests(unittest.TestCase):
             self.assertEqual(provider, "wiza")
             self.assertTrue(degraded)
 
+    def test_a_configured_provider_that_is_not_leading_is_not_degraded(self):
+        # The chain has no designated leader, so "not first" is not a fault:
+        # Wiza is named, Wiza runs, just after the legs above it. Reporting
+        # that as degraded would fire on every instance that names anything
+        # other than whatever happens to sit at the top of PROVIDER_ORDER.
+        with patch.object(main.settings, "search_provider", "wiza"), \
+             patch.object(main.settings, "bytemine_api_key", "b"), \
+             patch.object(main.settings, "crustdata_api_key", None), \
+             patch.object(main.settings, "wiza_api_key", "w"):
+            provider, degraded = main.provider_state()
+            self.assertEqual(provider, "bytemine")
+            self.assertFalse(degraded)
+            self.assertIn("wiza", main.provider_chain())
+
     def test_deliberate_wiza_is_not_treated_as_degraded(self):
         # Choosing Wiza on purpose keeps the full enrichment workflow; only the
         # accidental fallback is routed to the credit-free preview.
@@ -248,13 +262,24 @@ class ProviderChainTests(unittest.TestCase):
         self.assertEqual(
             self.chain(bytemine_api_key=None, crustdata_api_key=None), ["wiza"])
 
-    def test_search_provider_pins_the_lead_and_the_rest_still_follow(self):
-        # Pinning one provider must not discard the others: they are what makes
-        # a failure recoverable.
-        self.assertEqual(self.chain(search_provider="wiza"),
-                         ["wiza", "bytemine", "crustdata"])
-        self.assertEqual(self.chain(search_provider="crustdata"),
-                         ["crustdata", "bytemine", "wiza"])
+    def test_search_provider_does_not_reorder_the_waterfall(self):
+        # No provider is designated. SEARCH_PROVIDER used to hoist its own to
+        # the front, which handed the cost order to an environment variable —
+        # and because the field defaults to "bytemine", every search led with
+        # Bytemine even where nobody had set it, skipping the cheaper legs
+        # above it in PROVIDER_ORDER. Naming a provider now changes nothing
+        # about who runs or in what order.
+        for named in ("wiza", "crustdata", "bytemine", "nonesuch", ""):
+            self.assertEqual(self.chain(search_provider=named),
+                             ["bytemine", "crustdata", "wiza"],
+                             f"SEARCH_PROVIDER={named!r} reordered the chain")
+
+    def test_the_chain_follows_provider_order_exactly(self):
+        # One order, declared in one place. A chain that disagreed with
+        # PROVIDER_ORDER would mean something else was reordering it.
+        chain = self.chain()
+        self.assertEqual(
+            chain, [p for p in main.PROVIDER_ORDER if p in set(chain)])
 
     def test_an_unknown_provider_name_does_not_empty_the_chain(self):
         self.assertEqual(self.chain(search_provider="nonesuch"),
@@ -9746,6 +9771,21 @@ class EveryLegContributesTests(unittest.IsolatedAsyncioTestCase):
                  "linkedin_url": f"https://www.linkedin.com/in/{provider}-{i}"}
                 for i in range(n)]
 
+    # The keys the stubbed legs stand on. Held here so _chain_order and
+    # _search configure exactly the same three providers.
+    _KEYS = {"bytemine_api_key": "b", "crustdata_api_key": "c",
+             "enrichso_api_key": "e", "wiza_api_key": None}
+
+    def _chain_order(self):
+        """The order these three legs are actually walked in.
+
+        Read rather than assumed: these tests are about how a share moves down
+        the chain, and PROVIDER_ORDER is free to change which provider sits in
+        which slot without that being a regression.
+        """
+        with patch.multiple(main.settings, **self._KEYS):
+            return main.provider_chain()
+
     async def _search(self, limit, supply):
         """Run a search where each stubbed leg returns whatever it is asked for.
 
@@ -9772,9 +9812,11 @@ class EveryLegContributesTests(unittest.IsolatedAsyncioTestCase):
         # out and unconfigured on purpose: fetch_from_wiza takes no `want` at
         # all, so it cannot show whether a share was honoured.
         patches = [
-            patch.multiple(main.settings, bytemine_api_key="b",
-                           crustdata_api_key="c", enrichso_api_key="e",
-                           wiza_api_key=None, search_provider="bytemine"),
+            # SEARCH_PROVIDER names Bytemine and is expected to change
+            # nothing: the chain still walks PROVIDER_ORDER, which is why
+            # _chain_order does not bother setting it.
+            patch.multiple(main.settings, search_provider="bytemine",
+                           **self._KEYS),
             patch.object(main, "cache_lookup", no_cache),
             patch.object(main, "cache_store", no_store),
             patch.object(main, "bytemine_person_search", stub("bytemine")),
@@ -9795,15 +9837,16 @@ class EveryLegContributesTests(unittest.IsolatedAsyncioTestCase):
     async def test_the_first_leg_no_longer_takes_the_whole_page(self):
         """The regression itself: a leg that could fill the page does not.
 
-        Bytemine here has more rows than the page needs, which is exactly the
+        Every leg here has more rows than the page needs, which is exactly the
         case that used to end the search at the first provider.
         """
+        order = self._chain_order()
         _, asked = await self._search(9, supply={})
 
-        self.assertLess(asked["bytemine"][0], 9,
+        self.assertLess(asked[order[0]][0], 9,
                         "the first leg must not be asked for the whole page")
-        self.assertIn("crustdata", asked)
-        self.assertIn("enrichso", asked)
+        for leg in order[1:]:
+            self.assertIn(leg, asked)
 
     async def test_every_configured_leg_is_asked(self):
         _, asked = await self._search(9, supply={})
@@ -9829,21 +9872,24 @@ class EveryLegContributesTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_leg_with_nothing_hands_its_share_to_the_next(self):
         """Self-correcting: an empty leg must not cost the page its rows."""
-        # Chain order is bytemine, enrichso, crustdata — the first two are
-        # emptied so the last one carries the whole page.
-        _, asked = await self._search(9, supply={"bytemine": 0, "enrichso": 0})
+        # The first two legs are emptied, so the last one is left carrying the
+        # whole page: a third, then half of what is still missing, then all of
+        # it.
+        first, second, third = self._chain_order()
+        _, asked = await self._search(9, supply={first: 0, second: 0})
 
-        self.assertEqual(asked["bytemine"][0], 3)
-        self.assertEqual(asked["enrichso"][0], 5)
-        self.assertEqual(asked["crustdata"][0], 9)
+        self.assertEqual(asked[first][0], 3)
+        self.assertEqual(asked[second][0], 5)
+        self.assertEqual(asked[third][0], 9)
 
     async def test_a_leg_that_under_delivers_passes_the_remainder_on(self):
-        _, asked = await self._search(9, supply={"bytemine": 1})
+        first, second, third = self._chain_order()
+        _, asked = await self._search(9, supply={first: 1})
 
-        self.assertEqual(asked["bytemine"][0], 3)
+        self.assertEqual(asked[first][0], 3)
         # Eight still missing across the two legs left: four each.
-        self.assertEqual(asked["enrichso"][0], 4)
-        self.assertEqual(asked["crustdata"][0], 4)
+        self.assertEqual(asked[second][0], 4)
+        self.assertEqual(asked[third][0], 4)
 
     async def test_the_page_is_never_overfilled(self):
         response, asked = await self._search(5, supply={})

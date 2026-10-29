@@ -37,15 +37,14 @@ class Settings(BaseSettings):
     database_url: str
     wiza_api_key: Optional[str] = None
     anthropic_api_key: Optional[str] = None
-    # Prospecting data providers, tried in order: Bytemine, then Crustdata, then
-    # Wiza. A provider is only in the chain if its key is configured, so adding a
-    # key is all it takes to put one in front. SEARCH_PROVIDER pins whichever
-    # provider should be tried first; the others still follow it as fallbacks.
+    # Prospecting data providers. Every one with a key configured is walked,
+    # in PROVIDER_ORDER — see provider_chain. Adding a key adds a leg; removing
+    # one drops that leg and nothing else.
     #
-    # The order is by capability, not preference. Bytemine and Crustdata both
-    # return masked/flagged contacts from search and charge on reveal, which
-    # matches how the app bills. Wiza's list workflow returns enriched contacts
-    # and spends an email credit per search, so it sits last.
+    # The order lives in PROVIDER_ORDER and nowhere else, and it is by cost and
+    # capability rather than preference: legs that return masked contacts and
+    # charge on reveal come first, because that is how the app bills, and Wiza
+    # sits last because its list workflow spends an email credit per search.
     bytemine_api_key: Optional[str] = None
     coldiq_api_key: Optional[str] = None
     getleads_api_key: Optional[str] = None
@@ -232,8 +231,8 @@ TREG_META_VALUE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 # month and 1 credit a row after that, which is cheaper per row than every leg
 # below it. Rows come back masked, so a reveal is still a separate call.
 #
-# SEARCH_PROVIDER still decides which leg *leads*; this only decides the order
-# of the rest. Set SEARCH_PROVIDER=enrichso to put it first in practice.
+# This tuple is the whole order. SEARCH_PROVIDER does not reorder it — see
+# provider_chain for what that variable used to do and why it stopped.
 # routergrowth sits second. Its people search bills $0.002 a call plus
 # $0.000374 a person returned and nothing at all on a miss, which makes it the
 # cheapest leg here by a wide margin — a 25-row page costs $0.01135 against
@@ -284,17 +283,24 @@ def provider_configured(name: str) -> bool:
 
 
 def provider_chain() -> list[str]:
-    """Providers to try for one search, in order.
+    """Providers to try for one search, in PROVIDER_ORDER.
 
-    SEARCH_PROVIDER pins which one leads; the rest follow as fallbacks in
-    PROVIDER_ORDER. Only configured providers appear, so an unset key removes a
-    provider from the chain rather than breaking the request — and a chain of
-    one behaves exactly like the single-provider setup this replaced.
+    Every configured provider is walked, in one order, decided in one place.
+    No provider is designated: an unset key removes a leg rather than breaking
+    the request, and a chain of one behaves exactly like the single-provider
+    setup this replaced.
+
+    SEARCH_PROVIDER deliberately does not reorder this. It used to hoist its
+    provider to the front, which meant the cost order PROVIDER_ORDER documents
+    was decided by an environment variable instead — and since the field
+    defaults to "bytemine", every search led with Bytemine even on a Railway
+    instance where nobody had set it. That skipped the two cheapest legs in the
+    chain: enrichso, whose first 50 filter combinations a month are free, and
+    routergrowth, at roughly a fortieth of ContactOut per row. The variable is
+    still read, but only to report in /health that a provider someone asked for
+    has no key — see provider_state.
     """
-    preferred = (settings.search_provider or PROVIDER_ORDER[0]).strip().lower()
-    ordered = [preferred] + [p for p in PROVIDER_ORDER if p != preferred]
-    chain = [p for p in ordered if p in PROVIDER_ORDER and provider_configured(p)]
-    return chain
+    return [p for p in PROVIDER_ORDER if provider_configured(p)]
 
 
 def linkedin_identity(url) -> Optional[str]:
@@ -411,25 +417,25 @@ def decode_cursors(cursor: Optional[str], chain: list) -> dict:
 
 
 def provider_state() -> tuple[str, bool]:
-    """(provider, degraded) — the provider that leads the chain.
+    """(provider, degraded) — the leg that leads the chain, and whether a
+    provider someone asked for is absent from it.
 
-    `degraded` means the provider SEARCH_PROVIDER asked for is not the one that
-    will run, because its key is missing. That distinguishes an accident from
-    someone deliberately setting SEARCH_PROVIDER=wiza, and the two must not
-    behave alike. Wiza's list
-    workflow returns already-enriched contacts and spends an email credit per
-    search, so a silent degradation would bill every search to the Wiza account
-    while the app charges the user nothing — searching is free now, the credit
-    is spent on reveal. The degraded path therefore searches through Wiza's
-    preview endpoint, which spends no credits and returns identity + company +
-    LinkedIn URL, leaving the reveal to /enrich exactly as Crustdata does.
+    `degraded` means the provider SEARCH_PROVIDER names is not in the chain at
+    all, because its key is missing. That is worth reporting: a key that lapses
+    removes a leg silently, and the only other way to notice is to read the
+    logs or wonder why results thinned out.
+
+    It is deliberately not "the provider asked for is not leading". In a
+    waterfall every configured leg runs, so a provider that is present but not
+    first is doing its job, not degrading. Under the old hoist the two readings
+    could not disagree — a configured preferred provider was always the head —
+    so this is the same signal, stated in terms that survive the chain no
+    longer having a designated leader.
     """
     chain = provider_chain()
     preferred = (settings.search_provider or PROVIDER_ORDER[0]).strip().lower()
     head = chain[0] if chain else "none"
-    # Degraded means the provider that was asked for is not the one that will
-    # run, which for Wiza changes what a search costs — see the note above.
-    return head, head != preferred
+    return head, preferred not in chain
 
 
 def active_provider() -> str:
@@ -9256,14 +9262,19 @@ async def attach_treg_billing_context(request: Request, call_next):
 
 @app.on_event("startup")
 async def startup():
+    chain = provider_chain()
     prov, degraded = provider_state()
     if degraded:
-        print("WARNING: SEARCH_PROVIDER=crustdata but CRUSTDATA_API_KEY is unset.")
-        print("Falling back to Wiza's credit-free preview search: results are capped")
-        print("at 30 per page and carry no firmographics beyond company/industry.")
-        print("Set CRUSTDATA_API_KEY to restore full search.")
+        preferred = (settings.search_provider or PROVIDER_ORDER[0]).strip().lower()
+        print(f"WARNING: SEARCH_PROVIDER={preferred} but no API key is configured "
+              f"for it, so it is not in the chain at all.")
+        print("Set its key to put that leg back, or leave SEARCH_PROVIDER unset — "
+              "it no longer decides the order.")
+    if chain:
+        print(f"Search chain ({len(chain)}): {', '.join(chain)}")
     else:
-        print(f"Search provider: {prov}")
+        print("WARNING: no provider has a key configured; searches will return "
+              "nothing until one is set.")
 
     try:
         await init_db()
